@@ -354,20 +354,14 @@ class PersonalizedResNet(ResNet):
 
 
 @ENCODER_REGISTRY.register()
-class PersonalizedResNet18(PersonalizedResNet):
+class ResNet18(ResNet):
     def __init__(self, args, num_classes=10, **kwargs):
         super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, **kwargs)
 
 
-def ResNet34(num_classes=10, l2_norm=False):
-    return ResNet(BasicBlock, [3, 4, 6, 3], num_classes=num_classes, l2_norm=l2_norm)
-
-
-def ResNet101(num_classes=10, l2_norm=False):
-    return ResNet(Bottleneck, [3, 4, 23, 3], num_classes=num_classes, l2_norm=l2_norm)
-
-
-def ResNet152(num_classes=10, l2_norm=False):
-    return ResNet(Bottleneck, [3, 8, 36, 3], num_classes=num_classes, l2_norm=l2_norm)
+@ENCODER_REGISTRY.register()
+class PersonalizedResNet18(PersonalizedResNet):
+    def __init__(self, args, num_classes=10, **kwargs):
+        super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, **kwargs)
 
 

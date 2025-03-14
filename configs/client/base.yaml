@@ -1,2 +1,23 @@
+# ## Client ##
+# type: Client
 ## Client ##
 type: Client
+
+# Enable Personalized Training
+personalization:
+  enable: True  # Set to False to disable personalization
+  freeze_backbone: True  # Only fine-tune client-specific layers
+  adaptive_layer_freezing: True  # Enable dynamic layer freezing based on client updates
+
+# Adaptive Learning Rate per Client
+adaptive_lr:
+  enable: True  # Set to False to disable adaptive learning rate
+  base_lr: 0.01
+  min_lr: 0.001
+  max_lr: 0.05
+  strategy: "gradient_variance"  # Options: "gradient_variance", "meta_learning", "reinforcement_learning"
+
+# Client Trust Score Filtering
+trust_filtering:
+  enable: True  # Set to False to disable trust-based filtering
+  trust_threshold: 0.5  # Minimum trust score for participation in aggregation

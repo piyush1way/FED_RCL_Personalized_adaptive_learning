@@ -39,12 +39,8 @@ from utils.registry import Registry
 import models
 
 ENCODER_REGISTRY = Registry("ENCODER")
-ENCODER_REGISTRY.__doc__ = """
-Registry for encoder
-"""
 
 __all__ = ['get_model', 'build_encoder']
-
 
 def build_encoder(args):
     """
@@ -67,8 +63,8 @@ def build_encoder(args):
 
     return encoder
 
-
-#  Register Personalized FedRCL Model
+#  Check if 'PersonalizedResNet18' is already registered before adding it
 from models.resnet import PersonalizedResNet18
 
-ENCODER_REGISTRY.register(PersonalizedResNet18)
+if 'PersonalizedResNet18' not in ENCODER_REGISTRY._obj_map:
+    ENCODER_REGISTRY.register(PersonalizedResNet18)

@@ -1,0 +1,6 @@
+## Personalized ResNet Model ##
+name: "personalized_resnet18"
+pretrained: False
+l2_norm: False
+use_bn_layer: False
+last_feature_dim: 512

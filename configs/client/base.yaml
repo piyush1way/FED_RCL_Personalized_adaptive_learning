@@ -1,7 +1,7 @@
 # ## Client ##
 # type: Client
 ## Client ##
-type: Client
+type: RCLClient  
 
 # Enable Personalized Training
 personalization:

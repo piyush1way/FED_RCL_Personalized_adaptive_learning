@@ -43,28 +43,20 @@ ENCODER_REGISTRY = Registry("ENCODER")
 __all__ = ['get_model', 'build_encoder']
 
 def build_encoder(args):
-    """
-    Builds an encoder model based on the provided arguments.
-
-    Args:
-        args: Configuration arguments for model selection.
-
-    Returns:
-        An instance of the selected encoder model.
-    """
     num_classes = get_numclasses(args)
-
+    
     if args.verbose:
         print(ENCODER_REGISTRY)
 
-    print(f"=> Creating model '{args.model.name}, pretrained={args.model.pretrained}'")
+    print(f"=> Creating model '{args.model.name}', pretrained={args.model.pretrained}")
 
     encoder = ENCODER_REGISTRY.get(args.model.name)(args, num_classes, **args.model) if len(args.model.name) > 0 else None
 
     return encoder
 
-#  Check if 'PersonalizedResNet18' is already registered before adding it
-from models.resnet import PersonalizedResNet18
+# 🔹 Register models explicitly
+from models.resnet import ResNet18, PersonalizedResNet18
 
-if 'PersonalizedResNet18' not in ENCODER_REGISTRY._obj_map:
-    ENCODER_REGISTRY.register(PersonalizedResNet18)
+ENCODER_REGISTRY.register(ResNet18)
+ENCODER_REGISTRY.register(PersonalizedResNet18)
+

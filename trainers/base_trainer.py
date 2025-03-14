@@ -311,8 +311,6 @@
 
 from pathlib import Path
 from typing import Dict, List, Type
-from argparse import Namespace
-from collections import defaultdict
 import torch
 import torch.nn as nn
 import copy
@@ -321,15 +319,13 @@ import logging
 import time
 import gc
 import wandb
-import matplotlib.pyplot as plt
 from trainers.build import TRAINER_REGISTRY
 from servers import Server
 from clients import Client
-from utils import DatasetSplitSubset, get_dataset, initalize_random_seed, save_checkpoint
-from utils.logging_utils import AverageMeter
+from utils import DatasetSplitSubset, get_dataset, save_checkpoint
+from utils.logging_utils import MultiMetricLogger
 from torch.utils.data import DataLoader
 from omegaconf import DictConfig
-
 
 logger = logging.getLogger(__name__)
 
@@ -354,7 +350,7 @@ class Trainer:
         self.exp_path = self.checkpoint_path / self.args.dataset.name / str(self.args.split.mode) / self.args.exp_name
         logger.info(f"Exp path : {self.exp_path}")
 
-        ### Training config
+        # Training Config
         trainer_args = self.args.trainer
         self.num_clients = trainer_args.num_clients
         self.participation_rate = trainer_args.participation_rate
@@ -380,9 +376,8 @@ class Trainer:
             shuffle=False,
             num_workers=args.num_workers,
         )
-        self.eval_device = self.device
-        self.evaler = evaler_type(test_loader=test_loader, device=self.eval_device, args=args)
-        logger.info(f"Trainer: {self.__class__}, client: {client_type}, server: {server.__class__}, evaler: {evaler_type}")
+        self.evaler = evaler_type(test_loader=test_loader, device=self.device, args=args)
+        self.metric_logger = MultiMetricLogger()
 
         self.start_round = 0
         if self.args.get("load_model_path"):
@@ -398,23 +393,20 @@ class Trainer:
             self.lr_update(epoch=epoch)
             global_state_dict = copy.deepcopy(self.model.state_dict())
 
-            # Select clients
+            # Select Clients
             selected_client_ids = np.random.choice(range(self.num_clients), M, replace=False) \
                 if self.participation_rate < 1.0 else range(len(self.clients))
             logger.info(f"Global epoch {epoch}, Selected clients: {selected_client_ids}")
 
             current_lr = self.lr
-            local_weights = defaultdict(list)
-            local_deltas = defaultdict(list)
-            local_loss_dicts = defaultdict(list)
-            trust_scores = {}
+            local_weights, local_deltas, trust_scores = {}, {}, {}
 
             if self.args.server.get("FedACG"):
                 assert self.args.server.momentum > 0
                 self.model = copy.deepcopy(self.server.FedACG_lookahead(copy.deepcopy(self.model)))
                 global_state_dict = copy.deepcopy(self.model.state_dict())
 
-            start = time.time()
+            start_time = time.time()
             for client_idx in selected_client_ids:
                 client = self.clients[client_idx]
                 local_dataset = DatasetSplitSubset(
@@ -437,37 +429,30 @@ class Trainer:
                 # Local Training
                 local_state_dict, local_loss_dict = client.local_train(global_epoch=epoch)
 
-                # Compute trust score
+                # Compute Trust Score
                 trust_scores[client_idx] = self.compute_trust_score(local_state_dict, global_state_dict)
-
-                for loss_key in local_loss_dict:
-                    local_loss_dicts[loss_key].append(local_loss_dict[loss_key])
 
                 if trust_scores[client_idx] > self.args.trainer.trust_threshold:
                     for param_key in local_state_dict:
-                        local_weights[param_key].append(local_state_dict[param_key])
-                        local_deltas[param_key].append(local_state_dict[param_key] - global_state_dict[param_key])
+                        local_weights.setdefault(param_key, []).append(local_state_dict[param_key])
+                        local_deltas.setdefault(param_key, []).append(local_state_dict[param_key] - global_state_dict[param_key])
 
-            logger.info(f"Global epoch {epoch}, Train End. Total Time: {time.time() - start:.2f}s")
+            logger.info(f"Global epoch {epoch}, Train End. Time: {time.time() - start_time:.2f}s")
 
-            # Server Aggregation (only with trusted clients)
+            # Server Aggregation (using only trusted clients)
             updated_global_state_dict = self.server.aggregate(
                 local_weights, local_deltas, [cid for cid in selected_client_ids if trust_scores[cid] > self.args.trainer.trust_threshold],
                 copy.deepcopy(global_state_dict), current_lr
             )
             self.model.load_state_dict(updated_global_state_dict)
 
-            # Logging
-            wandb_dict = {loss_key: np.mean(local_loss_dicts[loss_key]) for loss_key in local_loss_dicts}
-            wandb_dict["lr"] = self.lr
-
+            # Evaluate and Log Metrics
             if self.args.eval.freq > 0 and epoch % self.args.eval.freq == 0:
                 self.evaluate(epoch=epoch)
 
             if (self.args.save_freq > 0 and (epoch + 1) % self.args.save_freq == 0) or (epoch + 1 == self.global_rounds):
                 self.save_model(epoch=epoch)
 
-            self.wandb_log(wandb_dict, step=epoch)
             gc.collect()
 
         return
@@ -478,10 +463,11 @@ class Trainer:
         return torch.exp(-norm_diff).item()  # Higher norm difference = Lower trust
 
     def lr_update(self, epoch: int) -> None:
-        self.lr = self.args.trainer.local_lr * (self.local_lr_decay) ** (epoch)
-        return
+        """Update learning rate."""
+        self.lr = self.args.trainer.local_lr * (self.local_lr_decay) ** epoch
 
     def save_model(self, epoch: int = -1, suffix: str = "") -> None:
+        """Save model checkpoint."""
         model_path = self.exp_path / self.args.output_model_path
         model_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -495,21 +481,26 @@ class Trainer:
         print(f"Saved model at {model_path}")
 
     def load_model(self) -> None:
+        """Load model checkpoint."""
         if self.args.get("load_model_path"):
             saved_dict = torch.load(self.args.load_model_path)
             self.model.load_state_dict(saved_dict["model_state_dict"], strict=False)
             self.start_round = saved_dict["epoch"] + 1
             logger.warning(f"Loaded model from {self.args.load_model_path}, epoch {saved_dict['epoch']}")
 
-    def wandb_log(self, log: Dict, step: int = None):
-        if self.args.wandb:
-            wandb.log(log, step=step)
-
     def evaluate(self, epoch: int) -> Dict:
+        """Evaluate global and personalized model accuracy."""
         results = self.evaler.eval(model=copy.deepcopy(self.model), epoch=epoch)
-        acc = results["acc"]
-        logger.warning(f"[Epoch {epoch}] Test Accuracy: {acc:.2f}%")
-        self.wandb_log({f"acc/{self.args.dataset.name}": acc}, step=epoch)
-        return {"acc": acc}
+        acc_global = results["acc_global"]
+        acc_personalized = results["acc_personalized"]
+
+        logger.warning(f"[Epoch {epoch}] Global Accuracy: {acc_global:.2f}% | Personalized Accuracy: {acc_personalized:.2f}%")
+
+        self.metric_logger.update("Global Accuracy", acc_global)
+        self.metric_logger.update("Personalized Accuracy", acc_personalized)
+        self.metric_logger.log()
+
+        return {"acc_global": acc_global, "acc_personalized": acc_personalized}
+
 
 

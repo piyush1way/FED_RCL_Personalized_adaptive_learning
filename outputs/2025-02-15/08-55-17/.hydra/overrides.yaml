@@ -1,0 +1,5 @@
+- client=fedrcl
+- dataset=cifar10
+- trainer.num_clients=100
+- trainer.participation_rate=0.03
+- split.alpha=0.3

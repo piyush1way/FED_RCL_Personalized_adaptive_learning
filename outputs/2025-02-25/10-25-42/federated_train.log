@@ -1,0 +1,24 @@
+[2025-02-25 10:25:46,806][trainers.base_trainer][INFO] - Exp path : checkpoints\CIFAR10\dirichlet0.3\base
+[2025-02-25 10:25:47,605][trainers.base_trainer][INFO] - Trainer: <class 'trainers.base_trainer.Trainer'>, client: <class 'clients.rcl_client.RCLClient'>, server: <class 'servers.base.Server'>, evaler: <class 'evalers.base_evaler.Evaler'>
+[2025-02-25 10:26:13,311][trainers.base_trainer][INFO] - Global epoch 0, Selected client : [2 8 4]
+[2025-02-25 10:26:18,175][clients.rcl_client][WARNING] - Class counts : [1242 1241 1019  805  478  133   35   24   12   11]
+[2025-02-25 10:43:16,672][clients.rcl_client][INFO] - [C2] End. Time: 1015.75s, Loss: 2.343,
+[2025-02-25 10:43:20,621][clients.rcl_client][WARNING] - Class counts : [1964 1885  880   84   76   75   24   12]
+[2025-02-25 11:07:19,106][clients.rcl_client][INFO] - [C8] End. Time: 1437.13s, Loss: 2.020,
+[2025-02-25 11:07:21,461][clients.rcl_client][WARNING] - Class counts : [1445 1094  672  574  462  412  150  136   42   13]
+[2025-02-25 11:22:14,988][clients.rcl_client][INFO] - [C4] End. Time: 892.23s, Loss: 2.807,
+[2025-02-25 11:22:15,542][trainers.base_trainer][INFO] - Global epoch 0, Train End. Total Time: 3362.23s
+[2025-02-25 11:22:53,435][trainers.base_trainer][WARNING] - [Epoch 0] Test Accuracy: 10.00%
+[2025-02-25 11:22:53,655][trainers.base_trainer][INFO] - Global epoch 1, Selected client : [3 5 1]
+[2025-02-25 11:37:40,482][clients.rcl_client][INFO] - [C3] End. Time: 883.83s, Loss: 2.552,
+[2025-02-25 11:52:18,529][clients.rcl_client][INFO] - [C5] End. Time: 874.40s, Loss: 2.659,
+[2025-02-25 12:07:03,183][clients.rcl_client][INFO] - [C1] End. Time: 881.10s, Loss: 2.032,
+[2025-02-25 12:07:03,588][trainers.base_trainer][INFO] - Global epoch 1, Train End. Total Time: 2649.92s
+[2025-02-25 12:07:43,933][trainers.base_trainer][WARNING] - [Epoch 1] Test Accuracy: 20.14%
+[2025-02-25 12:07:44,151][trainers.base_trainer][INFO] - Global epoch 2, Selected client : [2 3 8]
+[2025-02-25 12:22:32,532][clients.rcl_client][INFO] - [C2] End. Time: 885.25s, Loss: 2.907,
+[2025-02-25 12:43:47,308][clients.rcl_client][INFO] - [C3] End. Time: 1269.15s, Loss: 2.554,
+[2025-02-25 13:10:44,441][clients.rcl_client][INFO] - [C8] End. Time: 1602.77s, Loss: 2.570,
+[2025-02-25 13:10:45,692][trainers.base_trainer][INFO] - Global epoch 2, Train End. Total Time: 3781.53s
+[2025-02-25 13:12:04,529][trainers.base_trainer][WARNING] - [Epoch 2] Test Accuracy: 19.57%
+[2025-02-25 13:12:04,892][trainers.base_trainer][INFO] - Global epoch 3, Selected client : [6 1 9]

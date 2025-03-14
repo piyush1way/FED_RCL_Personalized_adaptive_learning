@@ -1,0 +1,106 @@
+wandb: false
+seed: 0
+enable_benchmark: true
+use_amp: true
+multiprocessing: false
+main_gpu: '0'
+num_workers: 0
+pin_memory: true
+refactoring: true
+verbose: false
+remark: ''
+checkpoint_path: ./checkpoints
+exp_name: base
+output_model_path: res18.pt
+save_freq: 1000
+batch_size: 2
+save_test: false
+load_model_path: false
+wandb_resume_id: false
+project: FedRCL
+log_dir: ./checkpoints
+split:
+  mode: dirichlet
+  alpha: 0.3
+  class_per_client: 0
+  unbalanced: false
+  overlap_ratio: 0.0
+  create_client_dataset: false
+optimizer:
+  name: sgd
+  momentum: 0.0
+  wd: 0.001
+eval:
+  freq: 1
+  batch_size: 2
+analysis: false
+dataset_paths:
+  cifar10: data/cifar-10-batches-py
+  cifar100: data/cifar-100-python
+  tiny_imagenet: data/tiny-imagenet-200
+trainer:
+  epochs: 10
+  type: Trainer
+  num_clients: 100
+  participation_rate: 0.05
+  local_lr_decay: 0.998
+  local_lr: 0.1
+  local_epochs: 5
+  global_lr: 1.0
+  global_rounds: 1000
+client:
+  type: RCLClient
+  ce_loss:
+    weight: 1
+  prox_loss:
+    weight: 0
+  rcl_loss:
+    loss_type: supervised
+    topk_pos: 1
+    topk_neg: 2
+    temp: 0.05
+    pairs:
+    - name: scl
+      pos: nn
+      neg: nn
+      weight: 1
+      loss_type: supervised
+    - name: penalty
+      pos: nn
+      neg: nn
+      weight: 1
+      loss_type: unsupervised
+      neg_sample_type: intra_class_thresholding
+      threshold: 0.7
+    weight: 1
+    branch_level:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    feature_relu: false
+  feature_align_loss:
+    weight: 0
+    align_type: cosine
+evaler:
+  type: Evaler
+  freq: 1
+  retrieval_freq: 10
+  batch_size: 128
+  landscape_freq: 0
+dataset:
+  name: CIFAR10
+  path: ./data
+  client_path: ./client_data
+  num_instances: 0
+  download: true
+server:
+  type: Server
+  momentum: -1
+model:
+  name: ResNet18_base
+  pretrained: false
+  l2_norm: false
+  use_bn_layer: false
+  last_feature_dim: 512

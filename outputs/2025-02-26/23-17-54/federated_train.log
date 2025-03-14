@@ -1,0 +1,12 @@
+[2025-02-26 23:17:57,406][trainers.base_trainer][INFO] - Exp path : checkpoints\CIFAR10\dirichlet0.3\base
+[2025-02-26 23:17:58,030][trainers.base_trainer][INFO] - Trainer: <class 'trainers.base_trainer.Trainer'>, client: <class 'clients.rcl_client.RCLClient'>, server: <class 'servers.base.Server'>, evaler: <class 'evalers.base_evaler.Evaler'>
+[2025-02-26 23:18:15,154][trainers.base_trainer][INFO] - Global epoch 0, Selected client : [2 8 4]
+[2025-02-26 23:18:16,806][clients.rcl_client][WARNING] - Class counts : [1242 1241 1019  805  478  133   35   24   12   11]
+[2025-02-26 23:36:24,640][clients.rcl_client][INFO] - [C2] End. Time: 1085.72s, Loss: 2.276,
+[2025-02-26 23:36:27,353][clients.rcl_client][WARNING] - Class counts : [1964 1885  880   84   76   75   24   12]
+[2025-02-27 00:12:47,061][clients.rcl_client][INFO] - [C8] End. Time: 2176.92s, Loss: 1.973,
+[2025-02-27 00:12:52,164][clients.rcl_client][WARNING] - Class counts : [1445 1094  672  574  462  412  150  136   42   13]
+[2025-02-27 00:52:18,890][clients.rcl_client][INFO] - [C4] End. Time: 2361.59s, Loss: 2.466,
+[2025-02-27 00:52:20,248][trainers.base_trainer][INFO] - Global epoch 0, Train End. Total Time: 5645.09s
+[2025-02-27 00:54:29,151][trainers.base_trainer][WARNING] - [Epoch 0] Test Accuracy: 10.00%
+[2025-02-27 00:54:30,571][trainers.base_trainer][INFO] - Global epoch 1, Selected client : [3 5 1]

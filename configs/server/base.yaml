@@ -1,0 +1,8 @@
+# server:
+#   type: ServerAdam
+#   name: ServerAdam
+#   momentum: 0.9
+#   beta: 0.99
+#   tau: 0.001
+server:
+  type: Server

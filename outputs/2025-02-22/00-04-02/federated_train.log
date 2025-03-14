@@ -1,0 +1,2 @@
+[2025-02-22 00:04:06,491][trainers.base_trainer][INFO] - Exp path : checkpoints\CIFAR10\dirichlet0.3\base
+[2025-02-22 00:04:30,987][trainers.base_trainer][INFO] - Trainer: <class 'trainers.base_trainer.Trainer'>, client: <class 'clients.rcl_client.RCLClient'>, server: <class 'servers.base.Server'>, evaler: <class 'evalers.base_evaler.Evaler'>

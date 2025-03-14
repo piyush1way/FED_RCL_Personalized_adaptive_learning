@@ -1,0 +1,4 @@
+[2025-02-21 23:39:40,121][trainers.base_trainer][INFO] - Exp path : checkpoints\CIFAR10\dirichlet0.3\base
+[2025-02-21 23:40:07,981][trainers.base_trainer][INFO] - Trainer: <class 'trainers.base_trainer.Trainer'>, client: <class 'clients.rcl_client.RCLClient'>, server: <class 'servers.base.Server'>, evaler: <class 'evalers.base_evaler.Evaler'>
+[2025-02-21 23:40:37,065][trainers.base_trainer][INFO] - Global epoch 0, Selected client : [26 86  2 55 75]
+[2025-02-21 23:40:37,675][clients.rcl_client][WARNING] - Class counts : [159 116 102  41  30  20  16   8   5   3]

@@ -360,7 +360,8 @@ class Trainer:
 
         # Initialize Clients
         self.clients: List[Client] = [
-            client_type(self.args, client_index=c, model=copy.deepcopy(self.model))
+            # client_type(self.args, client_index=c, model=copy.deepcopy(self.model))
+            client_type(self.args, client_index=c, model=copy.deepcopy(self.model), adaptive_lr=self.args.client.get("adaptive_lr", {}))
             for c in range(self.num_clients)
         ]
         self.server = server

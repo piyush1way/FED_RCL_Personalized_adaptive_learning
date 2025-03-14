@@ -292,22 +292,20 @@ class RCLClient(Client):
         self.global_model = copy.deepcopy(model)
 
         # Adaptive Learning Rate
-        # self.adaptive_lr = args.client.adaptive_lr.enable
         self.adaptive_lr = getattr(args.client, "adaptive_lr", {}).get("enable", False)
         self.adaptive_lr_config = getattr(args.client, "adaptive_lr", {})
-        self.base_lr = args.client.adaptive_lr.base_lr
-        self.min_lr = args.client.adaptive_lr.min_lr
-        self.max_lr = args.client.adaptive_lr.max_lr
-        self.lr_strategy = args.client.adaptive_lr.strategy
+        self.base_lr = self.adaptive_lr_config.get("base_lr", 0.01)
+        self.min_lr = self.adaptive_lr_config.get("min_lr", 0.001)
+        self.max_lr = self.adaptive_lr_config.get("max_lr", 0.05)
+        self.lr_strategy = self.adaptive_lr_config.get("strategy", "gradient_variance")
 
         # Trust Filtering
-        self.trust_threshold = args.client.trust_filtering.trust_threshold
-        self.enable_trust_filtering = args.client.trust_filtering.enable
+        self.trust_threshold = getattr(args.client.trust_filtering, "trust_threshold", 0.5)
+        self.enable_trust_filtering = getattr(args.client.trust_filtering, "enable", False)
 
+        # Loss function
         self.criterion = nn.CrossEntropyLoss()
         self.global_epoch = 0
-
-        return
 
     def setup(self, state_dict, device, local_dataset, global_epoch, local_lr, trainer, **kwargs):
         """Initialize client model, dataset, and optimizer"""
@@ -319,7 +317,7 @@ class RCLClient(Client):
             param.requires_grad = False
 
         # Personalization: Only fine-tune the classification layer
-        if self.args.client.personalization.enable:
+        if getattr(self.args.client.personalization, "enable", False):
             self.model.freeze_backbone()
 
         self.device = device
@@ -330,8 +328,14 @@ class RCLClient(Client):
         train_sampler = RandomClasswiseSampler(local_dataset, num_instances=self.args.dataset.num_instances) \
             if self.args.dataset.num_instances > 0 else None
 
-        self.loader = DataLoader(local_dataset, batch_size=self.args.batch_size, sampler=train_sampler, shuffle=train_sampler is None,
-                                 num_workers=self.args.num_workers, pin_memory=self.args.pin_memory)
+        self.loader = DataLoader(
+            local_dataset,
+            batch_size=self.args.batch_size,
+            sampler=train_sampler,
+            shuffle=train_sampler is None,
+            num_workers=self.args.num_workers,
+            pin_memory=self.args.pin_memory
+        )
 
         # Optimizer & Scheduler
         self.optimizer = torch.optim.SGD(
@@ -412,6 +416,3 @@ class RCLClient(Client):
         gc.collect()
 
         return self.model.state_dict(), {"loss": float(loss_meter.avg), "trust_score": trust_score}
-
-    
-

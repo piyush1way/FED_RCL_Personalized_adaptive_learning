@@ -360,8 +360,7 @@ class Trainer:
 
         # Initialize Clients
         self.clients: List[Client] = [
-            # client_type(self.args, client_index=c, model=copy.deepcopy(self.model))
-            client_type(self.args, client_index=c, model=copy.deepcopy(self.model), adaptive_lr=self.args.client.get("adaptive_lr", {}))
+            client_type(self.args, client_index=c, model=copy.deepcopy(self.model))
             for c in range(self.num_clients)
         ]
         self.server = server
@@ -502,6 +501,3 @@ class Trainer:
         self.metric_logger.log()
 
         return {"acc_global": acc_global, "acc_personalized": acc_personalized}
-
-
-

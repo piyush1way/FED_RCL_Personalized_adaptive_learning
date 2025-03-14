@@ -292,7 +292,8 @@ class RCLClient(Client):
         self.global_model = copy.deepcopy(model)
 
         # Adaptive Learning Rate
-        self.adaptive_lr = args.client.adaptive_lr.enable
+        # self.adaptive_lr = args.client.adaptive_lr.enable
+        self.adaptive_lr = getattr(args.client, "adaptive_lr", {}).get("enable", False)
         self.base_lr = args.client.adaptive_lr.base_lr
         self.min_lr = args.client.adaptive_lr.min_lr
         self.max_lr = args.client.adaptive_lr.max_lr

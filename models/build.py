@@ -34,32 +34,6 @@
 #     encoder = ENCODER_REGISTRY.get(args.model.name)(args, num_classes, **args.model) if len(args.model.name) > 0 else None
 
 #     return encoder
-# from utils import get_numclasses
-# from utils.registry import Registry
-# import models
-
-# ENCODER_REGISTRY = Registry("ENCODER")
-
-# __all__ = ['get_model', 'build_encoder']
-
-# def build_encoder(args):
-#     num_classes = get_numclasses(args)
-    
-#     if args.verbose:
-#         print(ENCODER_REGISTRY)
-
-#     print(f"=> Creating model '{args.model.name}', pretrained={args.model.pretrained}")
-
-#     encoder = ENCODER_REGISTRY.get(args.model.name)(args, num_classes, **args.model) if len(args.model.name) > 0 else None
-
-#     return encoder
-
-# # 🔹 Register models explicitly
-# from models.resnet import ResNet18, PersonalizedResNet18
-
-# ENCODER_REGISTRY.register(ResNet18)
-# ENCODER_REGISTRY.register(PersonalizedResNet18)
-
 from utils import get_numclasses
 from utils.registry import Registry
 import models
@@ -70,7 +44,7 @@ __all__ = ['get_model', 'build_encoder']
 
 def build_encoder(args):
     num_classes = get_numclasses(args)
-
+    
     if args.verbose:
         print(ENCODER_REGISTRY)
 
@@ -80,6 +54,11 @@ def build_encoder(args):
 
     return encoder
 
-# 🔹 Ensure Proper Import of ResNet18 and PersonalizedResNet18
+# 🔹 Register models explicitly
 from models.resnet import ResNet18, PersonalizedResNet18
+
+ENCODER_REGISTRY.register(ResNet18)
+ENCODER_REGISTRY.register(PersonalizedResNet18)
+
+
 

@@ -111,27 +111,20 @@
 #         return model_dict
 
 import copy
-import time
 import torch
-import torch.multiprocessing as mp
 import numpy as np
-from sklearn.manifold import TSNE
 from utils import *
-from utils.metrics import evaluate
-from models import build_encoder
-from typing import Dict, List
 from servers.build import SERVER_REGISTRY
 
 @SERVER_REGISTRY.register()
 class Server():
     def __init__(self, args):
         self.args = args
-        return
-    
+
     def aggregate(self, local_weights, local_deltas, client_ids, model_dict, current_lr, trust_scores):
         """
-        Aggregates client updates using Federated Averaging (FedAvg).
-        Clients with lower trust scores contribute less to the global update.
+        Trust-based Federated Averaging (FedAvg).
+        Clients with higher trust scores contribute more to the global update.
 
         Args:
             local_weights: Dict of client weight updates.
@@ -145,13 +138,16 @@ class Server():
             Updated global model state.
         """
         avg_weights = {}
-        trusted_clients = [cid for cid in client_ids if trust_scores[cid] > self.args.trainer.trust_threshold]
-        if len(trusted_clients) == 0:
-            trusted_clients = client_ids  # If all are below threshold, aggregate all
-        
+        trust_sum = sum(trust_scores[cid] for cid in client_ids)
+
+        if trust_sum == 0:
+            # If all trust scores are 0, use equal averaging to avoid division by zero
+            trust_scores = {cid: 1.0 for cid in client_ids}
+            trust_sum = len(client_ids)
+
         for param_key in local_weights:
-            stacked_weights = torch.stack([local_weights[param_key][i] for i, cid in enumerate(client_ids) if cid in trusted_clients], dim=0)
-            avg_weights[param_key] = torch.mean(stacked_weights, dim=0)
+            weighted_sum = sum(local_weights[param_key][i] * trust_scores[cid] for i, cid in enumerate(client_ids))
+            avg_weights[param_key] = weighted_sum / trust_sum
 
         return avg_weights
 
@@ -160,36 +156,36 @@ class Server():
 class ServerM(Server):    
     def set_momentum(self, model):
         """Initialize momentum terms for the server."""
-        global_delta = {key: torch.zeros_like(val) for key, val in model.state_dict().items()}
-        global_momentum = {key: torch.zeros_like(val) for key, val in model.state_dict().items()}
-        self.global_delta = global_delta
-        self.global_momentum = global_momentum
+        self.global_delta = {key: torch.zeros_like(val) for key, val in model.state_dict().items()}
+        self.global_momentum = {key: torch.zeros_like(val) for key, val in model.state_dict().items()}
 
     @torch.no_grad()
     def FedACG_lookahead(self, model):
         """Applies momentum-based lookahead for FedACG."""
         sending_model_dict = copy.deepcopy(model.state_dict())
-        for key in self.global_momentum.keys():
+        for key in self.global_momentum:
             sending_model_dict[key] += self.args.server.momentum * self.global_momentum[key]
         model.load_state_dict(sending_model_dict)
         return copy.deepcopy(model)
-    
+
     def aggregate(self, local_weights, local_deltas, client_ids, model_dict, current_lr, trust_scores):
-        trusted_clients = [cid for cid in client_ids if trust_scores[cid] > self.args.trainer.trust_threshold]
-        if len(trusted_clients) == 0:
-            trusted_clients = client_ids
-        
+        trust_sum = sum(trust_scores[cid] for cid in client_ids)
+        if trust_sum == 0:
+            trust_scores = {cid: 1.0 for cid in client_ids}
+            trust_sum = len(client_ids)
+
         avg_weights = {}
         for param_key in local_weights:
-            stacked_weights = torch.stack([local_weights[param_key][i] for i, cid in enumerate(client_ids) if cid in trusted_clients], dim=0)
-            avg_weights[param_key] = torch.mean(stacked_weights, dim=0)
-        
+            weighted_sum = sum(local_weights[param_key][i] * trust_scores[cid] for i, cid in enumerate(client_ids))
+            avg_weights[param_key] = weighted_sum / trust_sum
+
         if self.args.server.momentum > 0:
             if not self.args.server.get('FedACG'): 
                 for param_key in avg_weights:
                     avg_weights[param_key] += self.args.server.momentum * self.global_momentum[param_key]
+
             for param_key in local_deltas:
-                self.global_delta[param_key] = torch.mean(torch.stack(local_deltas[param_key], dim=0), dim=0)
+                self.global_delta[param_key] = sum(local_deltas[param_key][i] * trust_scores[cid] for i, cid in enumerate(client_ids)) / trust_sum
                 self.global_momentum[param_key] = self.args.server.momentum * self.global_momentum[param_key] + self.global_delta[param_key]
         
         return avg_weights
@@ -199,32 +195,28 @@ class ServerM(Server):
 class ServerAdam(Server):    
     def set_momentum(self, model):
         """Initialize momentum and adaptive learning terms for Adam-based aggregation."""
-        global_delta = {key: torch.zeros_like(val) for key, val in model.state_dict().items()}
-        global_momentum = {key: torch.zeros_like(val) for key, val in model.state_dict().items()}
-        global_v = {key: torch.zeros_like(val) + (self.args.server.tau * self.args.server.tau) for key, val in model.state_dict().items()}
-        
-        self.global_delta = global_delta
-        self.global_momentum = global_momentum
-        self.global_v = global_v
+        self.global_delta = {key: torch.zeros_like(val) for key, val in model.state_dict().items()}
+        self.global_momentum = {key: torch.zeros_like(val) for key, val in model.state_dict().items()}
+        self.global_v = {key: torch.zeros_like(val) + (self.args.server.tau ** 2) for key, val in model.state_dict().items()}
 
     def aggregate(self, local_weights, local_deltas, client_ids, model_dict, current_lr, trust_scores):
-        trusted_clients = [cid for cid in client_ids if trust_scores[cid] > self.args.trainer.trust_threshold]
-        if len(trusted_clients) == 0:
-            trusted_clients = client_ids
+        trust_sum = sum(trust_scores[cid] for cid in client_ids)
+        if trust_sum == 0:
+            trust_scores = {cid: 1.0 for cid in client_ids}
+            trust_sum = len(client_ids)
 
         server_lr = self.args.trainer.global_lr
         avg_weights = {}
 
         for param_key in local_deltas:
-            stacked_deltas = torch.stack([local_deltas[param_key][i] for i, cid in enumerate(client_ids) if cid in trusted_clients], dim=0)
-            self.global_delta[param_key] = torch.mean(stacked_deltas, dim=0)
-            self.global_momentum[param_key] = (self.args.server.momentum * self.global_momentum[param_key] +
-                                               (1 - self.args.server.momentum) * self.global_delta[param_key])
-            self.global_v[param_key] = (self.args.server.beta * self.global_v[param_key] +
-                                        (1 - self.args.server.beta) * (self.global_delta[param_key] ** 2))
+            weighted_deltas = sum(local_deltas[param_key][i] * trust_scores[cid] for i, cid in enumerate(client_ids)) / trust_sum
+            self.global_delta[param_key] = weighted_deltas
+            self.global_momentum[param_key] = self.args.server.momentum * self.global_momentum[param_key] + (1 - self.args.server.momentum) * self.global_delta[param_key]
+            self.global_v[param_key] = self.args.server.beta * self.global_v[param_key] + (1 - self.args.server.beta) * (self.global_delta[param_key] ** 2)
 
         for param_key in model_dict.keys():
             avg_weights[param_key] = model_dict[param_key] + server_lr * self.global_momentum[param_key] / (torch.sqrt(self.global_v[param_key]) + self.args.server.tau)
         
         return avg_weights
+
 

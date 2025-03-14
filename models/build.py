@@ -76,9 +76,4 @@ if "ResNet18" not in ENCODER_REGISTRY._obj_map:
     ENCODER_REGISTRY.register(ResNet18)
 
 if "personalized_resnet18" not in ENCODER_REGISTRY._obj_map:
-    ENCODER_REGISTRY.register(PersonalizedResNet18, name="personalized_resnet18")  # Ensure correct name
-
-
-
-
-
+    ENCODER_REGISTRY._obj_map["personalized_resnet18"] = PersonalizedResNet18  # Manual registration

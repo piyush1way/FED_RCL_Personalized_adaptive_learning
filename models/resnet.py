@@ -201,6 +201,8 @@
 
 # def ResNet152(num_classes=10, l2_norm=False):
 #     return ResNet(Bottleneck, [3, 8, 36, 3], num_classes=num_classes, l2_norm=l2_norm)
+
+
 '''ResNet in PyTorch.
 For Pre-activation ResNet, see 'preact_resnet.py'.
 Reference:
@@ -225,15 +227,44 @@ class BasicBlock(nn.Module):
         self.bn2 = nn.GroupNorm(2, planes) if not use_bn_layer else nn.BatchNorm2d(planes) 
 
         self.downsample = nn.Sequential()
-        if stride != 1 or in_planes != self.expansion*planes:
+        if stride != 1 or in_planes != self.expansion * planes:
             self.downsample = nn.Sequential(
-                Conv2d(in_planes, self.expansion*planes, kernel_size=1, stride=stride, bias=False),
-                nn.GroupNorm(2, self.expansion*planes) if not use_bn_layer else nn.BatchNorm2d(planes)
+                Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                nn.GroupNorm(2, self.expansion * planes) if not use_bn_layer else nn.BatchNorm2d(planes)
             )
 
     def forward(self, x: torch.Tensor, no_relu: bool = False) -> torch.Tensor:
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
+        out += self.downsample(x)
+        if not no_relu:
+            out = F.relu(out)
+        return out
+
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, in_planes, planes, stride=1, use_bn_layer=False, Conv2d=nn.Conv2d):
+        super(Bottleneck, self).__init__()
+        self.conv1 = Conv2d(in_planes, planes, kernel_size=1, bias=False)
+        self.bn1 = nn.GroupNorm(2, planes) if not use_bn_layer else nn.BatchNorm2d(planes)
+        self.conv2 = Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.GroupNorm(2, planes) if not use_bn_layer else nn.BatchNorm2d(planes)
+        self.conv3 = Conv2d(planes, self.expansion * planes, kernel_size=1, bias=False)
+        self.bn3 = nn.GroupNorm(2, self.expansion * planes) if not use_bn_layer else nn.BatchNorm2d(planes)
+
+        self.downsample = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.downsample = nn.Sequential(
+                Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                nn.GroupNorm(2, self.expansion * planes) if not use_bn_layer else nn.BatchNorm2d(planes)
+            )
+
+    def forward(self, x: torch.Tensor, no_relu: bool = False) -> torch.Tensor:
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = F.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
         out += self.downsample(x)
         if not no_relu:
             out = F.relu(out)
@@ -246,9 +277,7 @@ class ResNet(nn.Module):
         super(ResNet, self).__init__()
         self.l2_norm = l2_norm
         self.in_planes = 64
-        conv1_kernel_size = 3
-        if use_pretrained:
-            conv1_kernel_size = 7
+        conv1_kernel_size = 3 if not use_pretrained else 7
 
         Conv2d = self.get_conv()
         self.conv1 = Conv2d(3, 64, kernel_size=conv1_kernel_size, stride=1, padding=1, bias=False)
@@ -259,14 +288,14 @@ class ResNet(nn.Module):
         self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2, use_bn_layer=use_bn_layer)
         self.layer4 = self._make_layer(block, last_feature_dim, num_blocks[3], stride=2, use_bn_layer=use_bn_layer)
 
-        self.num_layers = 6  # layer0 to layer5 (fc)
+        self.num_layers = 6
         self.fc = nn.Linear(last_feature_dim * block.expansion, num_classes)
 
     def get_conv(self):
         return nn.Conv2d
     
     def _make_layer(self, block, planes, num_blocks, stride, use_bn_layer=False):
-        strides = [stride] + [1]*(num_blocks-1)
+        strides = [stride] + [1] * (num_blocks - 1)
         layers = []
         for stride in strides:
             layers.append(block(self.in_planes, planes, stride, use_bn_layer=use_bn_layer, Conv2d=self.get_conv()))
@@ -294,13 +323,11 @@ class PersonalizedResNet(ResNet):
     def __init__(self, block, num_blocks, num_classes=10, last_feature_dim=512, l2_norm=False, **kwargs):
         super().__init__(block, num_blocks, num_classes, last_feature_dim=last_feature_dim, l2_norm=l2_norm, **kwargs)
         
-        # Shared backbone (Global model)
         self.shared_backbone = nn.Sequential(
             self.conv1, self.bn1, nn.ReLU(), 
             self.layer1, self.layer2, self.layer3, self.layer4
         )
         
-        # Personalized head (Client-specific layer)
         self.personalized_head = nn.Linear(last_feature_dim * block.expansion, num_classes)
     
     def forward(self, x, return_feature=False):
@@ -308,7 +335,6 @@ class PersonalizedResNet(ResNet):
         out = F.adaptive_avg_pool2d(out, 1)
         out = out.view(out.size(0), -1)
 
-        # Apply personalized classification layer
         logit = self.personalized_head(out)
         
         if return_feature:
@@ -327,7 +353,6 @@ class PersonalizedResNet(ResNet):
             param.requires_grad = True
 
 
-#  Registering Personalized FedRCL Model
 @ENCODER_REGISTRY.register()
 class PersonalizedResNet18(PersonalizedResNet):
     def __init__(self, args, num_classes=10, **kwargs):
@@ -344,4 +369,5 @@ def ResNet101(num_classes=10, l2_norm=False):
 
 def ResNet152(num_classes=10, l2_norm=False):
     return ResNet(Bottleneck, [3, 8, 36, 3], num_classes=num_classes, l2_norm=l2_norm)
+
 

@@ -75,8 +75,9 @@ from models.resnet import ResNet18, PersonalizedResNet18
 if "ResNet18" not in ENCODER_REGISTRY._obj_map:
     ENCODER_REGISTRY.register(ResNet18)
 
-if "PersonalizedResNet18" not in ENCODER_REGISTRY._obj_map:
+if "personalized_resnet18" not in ENCODER_REGISTRY._obj_map:
     ENCODER_REGISTRY.register(PersonalizedResNet18, name="personalized_resnet18")  # Ensure correct name
+
 
 
 

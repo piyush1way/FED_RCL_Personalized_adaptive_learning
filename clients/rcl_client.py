@@ -294,6 +294,7 @@ class RCLClient(Client):
         # Adaptive Learning Rate
         # self.adaptive_lr = args.client.adaptive_lr.enable
         self.adaptive_lr = getattr(args.client, "adaptive_lr", {}).get("enable", False)
+        self.adaptive_lr_config = getattr(args.client, "adaptive_lr", {})
         self.base_lr = args.client.adaptive_lr.base_lr
         self.min_lr = args.client.adaptive_lr.min_lr
         self.max_lr = args.client.adaptive_lr.max_lr

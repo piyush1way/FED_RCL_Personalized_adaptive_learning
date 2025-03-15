@@ -1,13 +1,3 @@
-# ## Trainer ##
-# type: Trainer
-# num_clients: 100
-# participation_rate: 0.05
-# # batch_size: 50
-# local_lr_decay: 0.998
-# local_lr: 0.1
-# local_epochs: 5
-# global_lr: 1.0
-# global_rounds: 500
 ## Trainer ##
 type: Trainer
 num_clients: 100
@@ -22,19 +12,21 @@ local_epochs: 5
 
 # Adaptive Learning Rate
 adaptive_lr:
-  enable: True  # Set to False to disable adaptive learning rates
+  enable: True
   base_lr: 0.01
   min_lr: 0.001
   max_lr: 0.05
-  strategy: "gradient_variance"  # Options: "gradient_variance", "meta_learning", "reinforcement_learning"
+  strategy: "gradient_variance"
 
 # Personalization Settings
 personalization:
-  enable: True  # Enable personalized layers
-  freeze_backbone: True  # Only train client-specific layers
-  adaptive_layer_freezing: True  # Dynamically freeze layers based on client performance
+  enable: True
+  freeze_backbone: True
+  adaptive_layer_freezing: True
 
 # Trust-Based Client Filtering
 trust_filtering:
-  enable: True  # Set to False to disable client trust filtering
-  trust_threshold: 0.5  # Minimum trust score to include a client in aggregation
+  enable: True
+
+# Move `trust_threshold` here!
+trust_threshold: 0.5  # Minimum trust score to include a client in aggregation

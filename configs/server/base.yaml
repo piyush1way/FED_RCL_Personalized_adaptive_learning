@@ -1,36 +1,8 @@
-# # server:
-# #   type: ServerAdam
-# #   name: ServerAdam
-# #   momentum: 0.9
-# #   beta: 0.99
-# #   tau: 0.001
-# server:
-#   type: Server
-
-# server:
-#   type: Server  # Can be "Server", "ServerM" (momentum-based), or "ServerAdam"
-#   aggregation: FedAvg  # Choose from: FedAvg, FedACG, FedAdam
-
-#   # Trust Score Settings (for filtering low-quality clients)
-#   trust_threshold: 0.5  # Clients with trust scores below this value will be ignored
-#   enable_trust_filtering: True  # Set to False to disable client filtering
-
-#   # Momentum-based aggregation (FedACG, FedAvgM)
-#   momentum: 0.9  # Used only if aggregation method requires it
-
-#   # Adaptive Learning Rate for FedAdam
-#   beta: 0.99  # Smoothing factor for adaptive learning rates (FedAdam only)
-#   tau: 1e-3  # Small constant for numerical stability (FedAdam only)
-
-server:
-  type: Server  # Can be "Server", "ServerM" (momentum-based), or "ServerAdam"
-  aggregation: FedAvg  # Choose from: FedAvg, FedACG, FedAdam
-  momentum: 0.0  # Set to 0.0 by default, increase to enable momentum-based aggregation
-
-  # Trust Score Settings (for filtering low-quality clients)
-  trust_threshold: 0.5  # Clients with trust scores below this value will be ignored
-  enable_trust_filtering: True  # Set to False to disable client filtering
-
-  # Adaptive Learning Rate for FedAdam
-  beta: 0.99  # Smoothing factor for adaptive learning rates (FedAdam only)
-  tau: 1e-3  # Small constant for numerical stability (FedAdam only)
+type: Server
+name: Server
+momentum: 0.0
+aggregation: FedAvg
+trust_threshold: 0.5
+enable_trust_filtering: True
+beta: 0.99
+tau: 1e-3

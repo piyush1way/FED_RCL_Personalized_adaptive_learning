@@ -29,7 +29,9 @@ def build_encoder(args):
 
     encoder_class = ENCODER_REGISTRY.get(args.model.name)
     if encoder_class is None:
-        raise ValueError(f"Model '{args.model.name}' not found in ENCODER_REGISTRY. Available models: {list(ENCODER_REGISTRY._obj_map.keys())}")
+        raise ValueError(
+            f"Model '{args.model.name}' not found in ENCODER_REGISTRY. Available models: {list(ENCODER_REGISTRY._obj_map.keys())}"
+        )
 
     return encoder_class(args, num_classes, **args.model)
 
@@ -37,9 +39,6 @@ def build_encoder(args):
 # Import ResNet models for registration
 from models.resnet import ResNet18, PersonalizedResNet18
 
-# Register models safely to avoid duplicates
-if "ResNet18" not in ENCODER_REGISTRY._obj_map:
-    ENCODER_REGISTRY.register(ResNet18)
-
-if "PersonalizedResNet18" not in ENCODER_REGISTRY._obj_map:
-    ENCODER_REGISTRY.register(PersonalizedResNet18)
+# Register models safely
+ENCODER_REGISTRY.register(ResNet18)
+ENCODER_REGISTRY.register(PersonalizedResNet18, "personalized_resnet18")  # Ensure correct key

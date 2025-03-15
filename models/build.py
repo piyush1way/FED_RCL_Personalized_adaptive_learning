@@ -37,12 +37,12 @@ def build_encoder(args):
     return encoder_class(args, num_classes, **args.model)
 
 
-# ✅ Import and register models
+# ✅ Import models
 from models.resnet import ResNet18, PersonalizedResNet18
 
 # ✅ Register models only if they are not already registered
 if "ResNet18" not in ENCODER_REGISTRY._obj_map:
     ENCODER_REGISTRY.register(ResNet18)
 
-if "personalized_resnet18" not in ENCODER_REGISTRY._obj_map:
+if "PersonalizedResNet18" not in ENCODER_REGISTRY._obj_map:
     ENCODER_REGISTRY.register(PersonalizedResNet18)

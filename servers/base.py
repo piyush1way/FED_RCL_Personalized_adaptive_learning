@@ -120,34 +120,39 @@ from servers.build import SERVER_REGISTRY
 class Server():
     def __init__(self, args):
         self.args = args
+        # Initialize trust filtering settings
+        self.trust_threshold = getattr(args.server, "trust_threshold", 0.5)
+        self.enable_trust_filtering = getattr(args.server, "enable_trust_filtering", True)
 
     def aggregate(self, local_weights, local_deltas, client_ids, model_dict, current_lr, trust_scores):
         """
         Trust-based Federated Averaging (FedAvg).
         Clients with higher trust scores contribute more to the global update.
-
-        Args:
-            local_weights: Dict of client weight updates.
-            local_deltas: Dict of client model deltas.
-            client_ids: List of selected client IDs.
-            model_dict: Current global model state.
-            current_lr: Learning rate for server updates.
-            trust_scores: Trust scores for each client.
-
-        Returns:
-            Updated global model state.
         """
         avg_weights = {}
-        trust_sum = sum(trust_scores[cid] for cid in client_ids)
+        
+        # Apply trust filtering if enabled
+        if self.enable_trust_filtering:
+            trusted_clients = [cid for cid in client_ids if trust_scores[cid] > self.trust_threshold]
+            if not trusted_clients:  # If no clients meet threshold, use all clients
+                trusted_clients = client_ids
+        else:
+            trusted_clients = client_ids
 
-        if trust_sum == 0:
-            # If all trust scores are 0, use equal averaging to avoid division by zero
-            trust_scores = {cid: 1.0 for cid in client_ids}
-            trust_sum = len(client_ids)
+        # Calculate trust-weighted average
+        trust_sum = sum(trust_scores[cid] for cid in trusted_clients)
+        if trust_sum == 0:  # Avoid division by zero
+            weights = {cid: 1.0/len(trusted_clients) for cid in trusted_clients}
+        else:
+            weights = {cid: trust_scores[cid]/trust_sum for cid in trusted_clients}
 
         for param_key in local_weights:
-            weighted_sum = sum(local_weights[param_key][i] * trust_scores[cid] for i, cid in enumerate(client_ids))
-            avg_weights[param_key] = weighted_sum / trust_sum
+            weighted_sum = sum(
+                local_weights[param_key][i] * weights[cid] 
+                for i, cid in enumerate(client_ids) 
+                if cid in trusted_clients
+            )
+            avg_weights[param_key] = weighted_sum
 
         return avg_weights
 

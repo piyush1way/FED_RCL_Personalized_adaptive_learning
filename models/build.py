@@ -39,5 +39,9 @@ def build_encoder(args):
 # Import ResNet models for registration
 from models.resnet import ResNet18, PersonalizedResNet18
 
-# Register only PersonalizedResNet18 since ResNet18 is already registered via decorator
-ENCODER_REGISTRY.register(PersonalizedResNet18, "personalized_resnet18")  # Ensure correct key
+# Register models safely to avoid duplicates
+if "ResNet18" not in ENCODER_REGISTRY._obj_map:
+    ENCODER_REGISTRY.register(ResNet18)
+
+if "personalized_resnet18" not in ENCODER_REGISTRY._obj_map:
+    ENCODER_REGISTRY.register(PersonalizedResNet18)

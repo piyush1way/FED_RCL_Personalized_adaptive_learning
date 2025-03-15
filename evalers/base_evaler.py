@@ -142,7 +142,7 @@ from torch.utils.data import DataLoader
 logger = logging.getLogger(__name__)
 
 @EVALER_REGISTRY.register()
-class Evaler():
+class Evaler:
     def __init__(
         self,
         test_loader: DataLoader,
@@ -198,17 +198,32 @@ class Evaler():
             for images, labels in self.test_loader:
                 images, labels = images.to(device), labels.to(device)
 
-                # Evaluate both global and personalized model outputs
+                # Evaluate global model outputs
                 global_results = model(images)
-                personalized_results = model.forward_classifier(global_results["feature"])
+                if not isinstance(global_results, dict):
+                    raise ValueError("Model output must be a dictionary containing 'feature' and 'logit' keys.")
 
+                # Ensure global_results contains 'feature' and 'logit' keys
+                if "feature" not in global_results or "logit" not in global_results:
+                    raise KeyError("Model output must contain 'feature' and 'logit' keys.")
+
+                # Evaluate personalized model outputs
+                if hasattr(model, 'forward_classifier'):
+                    personalized_results = model.forward_classifier(global_results["feature"])
+                else:
+                    # Fallback to using the global model's logits if personalized classifier is not available
+                    personalized_results = global_results["logit"]
+
+                # Compute predictions
                 _, predicted_global = torch.max(global_results["logit"].data, 1)
                 _, predicted_personalized = torch.max(personalized_results.data, 1)
 
+                # Update metrics
                 total += labels.size(0)
                 correct_global += (predicted_global == labels).sum().item()
                 correct_personalized += (predicted_personalized == labels).sum().item()
 
+                # Update class-wise metrics
                 bin_labels = labels.bincount()
                 class_total[: bin_labels.size(0)] += bin_labels.cpu()
 
@@ -218,19 +233,24 @@ class Evaler():
                 class_correct_global[: bin_corrects_global.size(0)] += bin_corrects_global.cpu()
                 class_correct_personalized[: bin_corrects_personalized.size(0)] += bin_corrects_personalized.cpu()
 
+                # Compute loss
                 this_loss = self.criterion(global_results["logit"], labels)
                 loss += this_loss.sum().cpu()
 
+                # Update class-wise loss
                 for class_idx, bin_label in enumerate(bin_labels):
                     class_loss[class_idx] += this_loss[(labels.cpu() == class_idx)].sum().cpu()
 
+                # Store logits and labels for additional metrics
                 logits_all.append(global_results["logit"].data.cpu())
                 labels_all.append(labels.cpu())
 
+        # Concatenate logits and labels
         logits_all = torch.cat(logits_all)
         labels_all = torch.cat(labels_all)
         scores = F.softmax(logits_all, 1)
 
+        # Compute metrics
         acc_global = 100.0 * correct_global / float(total)
         acc_personalized = 100.0 * correct_personalized / float(total)
         class_acc_global = 100.0 * class_correct_global / class_total
@@ -238,7 +258,7 @@ class Evaler():
         loss = loss / float(total)
         class_loss = class_loss / class_total
 
-        model.train()
+        # Prepare results dictionary
         results = {
             "acc_global": acc_global,
             "acc_personalized": acc_personalized,
@@ -248,6 +268,6 @@ class Evaler():
             "class_loss": class_loss,
         }
 
+        # Log results
         logger.info(f"[Epoch {epoch}] Global Test Accuracy: {acc_global:.2f}% | Personalized Test Accuracy: {acc_personalized:.2f}%")
         return results
-

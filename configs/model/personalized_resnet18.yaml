@@ -1,5 +1,5 @@
 ## Personalized ResNet Model ##
-name: "personalized_resnet18"
+name: "PersonalizedResNet18"  # Match the registered name
 pretrained: False
 l2_norm: False
 use_bn_layer: False

@@ -203,6 +203,8 @@
 #     return ResNet(Bottleneck, [3, 8, 36, 3], num_classes=num_classes, l2_norm=l2_norm)
 
 
+# models/resnet.py
+
 '''ResNet in PyTorch.
 For Pre-activation ResNet, see 'preact_resnet.py'.
 Reference:
@@ -401,5 +403,3 @@ class ResNet18(ResNet):
 class PersonalizedResNet18(PersonalizedResNet):
     def __init__(self, args, num_classes=10, **kwargs):
         super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, **kwargs)
-
-

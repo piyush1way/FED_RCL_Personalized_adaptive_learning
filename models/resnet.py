@@ -321,36 +321,74 @@ class ResNet(nn.Module):
 #  Personalized FedRCL Model with a Client-Specific Head
 class PersonalizedResNet(ResNet):
     def __init__(self, block, num_blocks, num_classes=10, last_feature_dim=512, l2_norm=False, **kwargs):
-        super().__init__(block, num_blocks, num_classes, last_feature_dim=last_feature_dim, l2_norm=l2_norm, **kwargs)
-        
-        self.shared_backbone = nn.Sequential(
-            self.conv1, self.bn1, nn.ReLU(), 
-            self.layer1, self.layer2, self.layer3, self.layer4
-        )
-        
-        self.personalized_head = nn.Linear(last_feature_dim * block.expansion, num_classes)
-    
-    def forward(self, x, return_feature=False):
-        out = self.shared_backbone(x)
-        out = F.adaptive_avg_pool2d(out, 1)
-        out = out.view(out.size(0), -1)
+        super().__init__(block, num_blocks, num_classes=num_classes, last_feature_dim=last_feature_dim, l2_norm=l2_norm, **kwargs)
+        self.frozen_layers = []
+        self.adaptive_freezing_enabled = False
 
-        logit = self.personalized_head(out)
+    def setup_adaptive_freezing(self):
+        """Setup adaptive layer freezing for personalization"""
+        self.adaptive_freezing_enabled = True
+        # Initially freeze all layers except the last one
+        self.frozen_layers = ['conv1', 'bn1', 'layer1', 'layer2', 'layer3']
+        self.freeze_layers(self.frozen_layers)
         
-        if return_feature:
-            return out, logit
-        else:
-            return logit
-    
+    def freeze_layers(self, layer_names):
+        """Freeze specific layers by name"""
+        for name, param in self.named_parameters():
+            if any(layer in name for layer in layer_names):
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+
     def freeze_backbone(self):
-        """Freezes all shared layers so that only the personalized head is updated."""
-        for param in self.shared_backbone.parameters():
-            param.requires_grad = False
+        """Freeze all layers except the classifier"""
+        for name, param in self.named_parameters():
+            if 'fc' not in name:  # fc is the classifier layer
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
 
     def unfreeze_backbone(self):
-        """Unfreezes the backbone for fine-tuning if needed."""
-        for param in self.shared_backbone.parameters():
+        """Unfreeze all layers"""
+        for param in self.parameters():
             param.requires_grad = True
+
+    def forward(self, x, return_feature=False):
+        """Forward pass with layer-wise feature extraction"""
+        features = {}
+        
+        # Layer 0
+        out = F.relu(self.bn1(self.conv1(x)))
+        features['layer0'] = out
+        
+        # Layers 1-4
+        out = self.layer1(out)
+        features['layer1'] = out
+        
+        out = self.layer2(out)
+        features['layer2'] = out
+        
+        out = self.layer3(out)
+        features['layer3'] = out
+        
+        out = self.layer4(out)
+        features['layer4'] = out
+        
+        # Global average pooling
+        out = F.adaptive_avg_pool2d(out, 1)
+        out = out.view(out.size(0), -1)
+        features['pooled'] = out
+        
+        # Classification
+        if self.l2_norm:
+            self.fc.weight.data = F.normalize(self.fc.weight.data, p=2, dim=1)
+            out = F.normalize(out, dim=1)
+        logit = self.fc(out)
+        features['logit'] = logit
+        
+        if return_feature:
+            return features, logit
+        return logit
 
 
 @ENCODER_REGISTRY.register()

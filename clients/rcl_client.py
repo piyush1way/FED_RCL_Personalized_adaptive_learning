@@ -300,7 +300,8 @@ class RCLClient(Client):
         self.lr_strategy = self.adaptive_lr_config.get("strategy", "gradient_variance")
 
         # Trust Filtering
-        self.trust_threshold = getattr(args.client.trust_filtering, "trust_threshold", 0.5)
+        # self.trust_threshold = getattr(args.client.trust_filtering, "trust_threshold", 0.5)
+        self.trust_threshold = args.client.get("trust_filtering", {}).get("trust_threshold", 0.5)
         self.enable_trust_filtering = getattr(args.client.trust_filtering, "enable", False)
 
         # Loss function

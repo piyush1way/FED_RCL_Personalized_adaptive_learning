@@ -154,7 +154,9 @@ class Server():
             )
             avg_weights[param_key] = weighted_sum
 
-        return avg_weights
+        model_dict.update(avg_weights)
+        return model_dict
+
 
 
 @SERVER_REGISTRY.register()

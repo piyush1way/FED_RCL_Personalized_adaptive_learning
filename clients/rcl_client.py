@@ -124,10 +124,17 @@ class RCLClient(Client):
 
     def local_train(self, global_epoch, **kwargs):
         """Performs local training on the client's dataset"""
-
         self.global_epoch = global_epoch
-        self.model.to(self.device)
-        self.global_model.to(self.device)
+        
+        # Move models to device safely
+        try:
+            self.model = self.model.to(self.device)
+            self.global_model = self.global_model.to(self.device)
+        except RuntimeError as e:
+            logger.warning(f"CUDA initialization error: {e}. Falling back to CPU.")
+            self.device = torch.device("cpu")
+            self.model = self.model.to(self.device)
+            self.global_model = self.global_model.to(self.device)
 
         scaler = GradScaler()
         start_time = time.time()
@@ -137,7 +144,9 @@ class RCLClient(Client):
 
         for local_epoch in range(self.args.trainer.local_epochs):
             for images, labels in self.loader:
-                images, labels = images.to(self.device), labels.to(self.device)
+                images = images.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+                
                 self.model.zero_grad()
 
                 with autocast(enabled=self.args.use_amp):
@@ -146,7 +155,7 @@ class RCLClient(Client):
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(self.optimizer)
-                gradients.append([p.grad for p in self.model.parameters() if p.grad is not None])
+                gradients.append([p.grad.detach().clone() for p in self.model.parameters() if p.grad is not None])
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10)
                 scaler.step(self.optimizer)
                 scaler.update()
@@ -156,7 +165,7 @@ class RCLClient(Client):
             self.scheduler.step()
 
             # Adaptive Learning Rate Adjustment
-            if self.adaptive_lr:
+            if hasattr(self, 'adaptive_lr') and self.adaptive_lr:
                 new_lr = self.adapt_learning_rate(gradients)
                 logger.info(f"[C{self.client_index}] Adaptive LR Adjusted: {new_lr:.5f}")
 
@@ -172,9 +181,11 @@ class RCLClient(Client):
             logger.warning(f"[C{self.client_index}] Skipped in Aggregation (Trust Score {trust_score:.3f} < {self.trust_threshold})")
             return None, None
 
-        self.model.to('cpu')
-        self.global_model.to('cpu')
+        # Move models back to CPU to save memory
+        self.model = self.model.cpu()
+        self.global_model = self.global_model.cpu()
 
         gc.collect()
+        torch.cuda.empty_cache()  # Clear CUDA cache
 
         return self.model.state_dict(), {"loss": float(loss_meter.avg), "trust_score": trust_score}

@@ -445,8 +445,7 @@ class Trainer:
                 local_weights, local_deltas, [cid for cid in selected_client_ids if trust_scores[cid] > self.args.trainer.trust_threshold],
                 copy.deepcopy(global_state_dict), current_lr, trust_scores
             )
-            self.model.load_state_dict(updated_global_state_dict)
-
+            self.model.load_state_dict(updated_global_state_dict, strict=False)
             # Evaluate and Log Metrics
             if self.args.eval.freq > 0 and epoch % self.args.eval.freq == 0:
                 self.evaluate(epoch=epoch)

@@ -3,12 +3,18 @@ from utils.registry import Registry
 import models
 
 ENCODER_REGISTRY = Registry("ENCODER")
-ENCODER_REGISTRY.__doc__ = """
-Registry for encoder models.
-"""
 
-__all__ = ['get_model', 'build_encoder']
+__all__ = ["get_model", "build_encoder"]
 
+# ✅ Import models before registering
+from models.resnet import ResNet18, PersonalizedResNet18
+
+# ✅ Register models only if not already registered
+if "ResNet18" not in ENCODER_REGISTRY._obj_map:
+    ENCODER_REGISTRY.register(ResNet18)
+
+if "PersonalizedResNet18" not in ENCODER_REGISTRY._obj_map:
+    ENCODER_REGISTRY.register(PersonalizedResNet18)
 
 def build_encoder(args):
     """
@@ -27,7 +33,7 @@ def build_encoder(args):
 
     print(f"=> Creating model '{args.model.name}, pretrained={args.model.pretrained}'")
 
-    # Ensure model exists in the registry
+    # Ensure model exists in the registry before fetching it
     if args.model.name not in ENCODER_REGISTRY._obj_map:
         raise KeyError(
             f"Model '{args.model.name}' not found in ENCODER_REGISTRY. Available models: {list(ENCODER_REGISTRY._obj_map.keys())}"
@@ -35,14 +41,3 @@ def build_encoder(args):
 
     encoder_class = ENCODER_REGISTRY.get(args.model.name)
     return encoder_class(args, num_classes, **args.model)
-
-
-# ✅ Import models
-from models.resnet import ResNet18, PersonalizedResNet18
-
-# ✅ Register models only if they are not already registered
-if "ResNet18" not in ENCODER_REGISTRY._obj_map:
-    ENCODER_REGISTRY.register(ResNet18)
-
-if "PersonalizedResNet18" not in ENCODER_REGISTRY._obj_map:
-    ENCODER_REGISTRY.register(PersonalizedResNet18)

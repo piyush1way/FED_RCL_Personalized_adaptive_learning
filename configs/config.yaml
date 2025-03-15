@@ -128,13 +128,12 @@ eval:
   batch_size: 128
 
 analysis: False
-
 defaults:
   - _self_
   - trainer: base
-  - client: base
+  - client: base  # Ensure client config is loaded!
   - evaler: base
   - dataset: cifar100
   - server: base
-  - model: personalized_resnet18  # Change to use the personalized model
+  - model: personalized_resnet18
 

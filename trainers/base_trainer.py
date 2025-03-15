@@ -443,7 +443,7 @@ class Trainer:
             # Server Aggregation (using only trusted clients)
             updated_global_state_dict = self.server.aggregate(
                 local_weights, local_deltas, [cid for cid in selected_client_ids if trust_scores[cid] > self.args.trainer.trust_threshold],
-                copy.deepcopy(global_state_dict), current_lr
+                copy.deepcopy(global_state_dict), current_lr, trust_scores
             )
             self.model.load_state_dict(updated_global_state_dict)
 

@@ -27,7 +27,7 @@ def build_encoder(args):
 
     print(f"=> Creating model '{args.model.name}, pretrained={args.model.pretrained}'")
 
-    encoder_class = ENCODER_REGISTRY.get(args.model.name, None)
+    encoder_class = ENCODER_REGISTRY.get(args.model.name)
     if encoder_class is None:
         raise ValueError(f"Model '{args.model.name}' not found in ENCODER_REGISTRY. Available models: {list(ENCODER_REGISTRY._obj_map.keys())}")
 
@@ -38,12 +38,8 @@ def build_encoder(args):
 from models.resnet import ResNet18, PersonalizedResNet18
 
 # Register models safely to avoid duplicates
-try:
-    ENCODER_REGISTRY.register(ResNet18, name="ResNet18")
-except AssertionError:
-    pass  # Already registered
+if "ResNet18" not in ENCODER_REGISTRY._obj_map:
+    ENCODER_REGISTRY.register(ResNet18)
 
-try:
-    ENCODER_REGISTRY.register(PersonalizedResNet18, name="personalized_resnet18")
-except AssertionError:
-    pass  # Already registered
+if "PersonalizedResNet18" not in ENCODER_REGISTRY._obj_map:
+    ENCODER_REGISTRY.register(PersonalizedResNet18)

@@ -58,6 +58,16 @@ class RCLClient(Client):
         self._update_model(state_dict)
         self._update_global_model(state_dict)
 
+        # Ensure CUDA is available
+        if torch.cuda.is_available():
+            self.device = device
+        else:
+            logger.warning(f"Client {self.client_index}: CUDA not available, using CPU.")
+            self.device = torch.device("cpu")
+
+        self.model.to(self.device)
+        self.global_model.to(self.device)
+
         # Freeze the global model
         for param in self.global_model.parameters():
             param.requires_grad = False
@@ -69,7 +79,6 @@ class RCLClient(Client):
             if self.adaptive_layer_freezing:
                 self.model.setup_adaptive_freezing()
 
-        self.device = device
         self.trainer = trainer
         self.global_epoch = global_epoch
 
@@ -83,7 +92,7 @@ class RCLClient(Client):
             sampler=train_sampler,
             shuffle=train_sampler is None,
             num_workers=self.args.num_workers,
-            pin_memory=self.args.pin_memory
+            pin_memory=self.device.type == "cuda"
         )
 
         # Optimizer & Scheduler
@@ -99,44 +108,15 @@ class RCLClient(Client):
         )
 
     def compute_trust_score(self, local_state_dict):
-        """
-        Compute trust score for this client based on various metrics.
-        Higher score means the client's updates are more reliable.
-        """
+        """Compute trust score for this client"""
         trust_score = 1.0  # Default trust score
-        
-        # Add your trust score computation logic here
-        # For example:
-        # 1. Check data quality
-        # 2. Check update magnitude
-        # 3. Check historical performance
-        # 4. Check for adversarial behavior
-        
         return max(0.0, min(1.0, trust_score))  # Ensure score is between 0 and 1
-
-    def adapt_learning_rate(self, gradients):
-        """Adjust learning rate based on gradient variance"""
-        variance = torch.var(torch.stack([torch.norm(g) for g in gradients]))
-        new_lr = max(self.min_lr, min(self.max_lr, self.base_lr / (1 + variance)))
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = new_lr
-        return new_lr
 
     def local_train(self, global_epoch, **kwargs):
         """Performs local training on the client's dataset"""
         self.global_epoch = global_epoch
-        
-        # Move models to device safely
-        try:
-            self.model = self.model.to(self.device)
-            self.global_model = self.global_model.to(self.device)
-        except RuntimeError as e:
-            logger.warning(f"CUDA initialization error: {e}. Falling back to CPU.")
-            self.device = torch.device("cpu")
-            self.model = self.model.to(self.device)
-            self.global_model = self.global_model.to(self.device)
 
-        scaler = GradScaler()
+        scaler = GradScaler(enabled=self.device.type == "cuda")  # Use AMP only if CUDA is available
         start_time = time.time()
         loss_meter = AverageMeter('Loss', ':.2f')
 
@@ -146,28 +126,31 @@ class RCLClient(Client):
             for images, labels in self.loader:
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
-                
+
                 self.model.zero_grad()
 
-                with autocast(enabled=self.args.use_amp):
+                with autocast(enabled=self.device.type == "cuda"):
                     logits = self.model(images)
                     loss = self.criterion(logits, labels)
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(self.optimizer)
+                if self.device.type == "cuda":
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(self.optimizer)
+                else:
+                    loss.backward()
+
                 gradients.append([p.grad.detach().clone() for p in self.model.parameters() if p.grad is not None])
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10)
-                scaler.step(self.optimizer)
-                scaler.update()
+
+                if self.device.type == "cuda":
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                else:
+                    self.optimizer.step()
 
                 loss_meter.update(loss.item(), images.size(0))
 
             self.scheduler.step()
-
-            # Adaptive Learning Rate Adjustment
-            if hasattr(self, 'adaptive_lr') and self.adaptive_lr:
-                new_lr = self.adapt_learning_rate(gradients)
-                logger.info(f"[C{self.client_index}] Adaptive LR Adjusted: {new_lr:.5f}")
 
         end_time = time.time()
 

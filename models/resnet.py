@@ -403,3 +403,23 @@ class ResNet18(ResNet):
 class PersonalizedResNet18(PersonalizedResNet):
     def __init__(self, args, num_classes=10, **kwargs):
         super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, **kwargs)
+
+    def forward_classifier(self, x):
+        """
+        Forward pass for the classifier head.
+        Args:
+            x (torch.Tensor): Input features (e.g., from the global model).
+        Returns:
+            torch.Tensor: Output logits.
+        """
+        # Pass the input through the classifier (fully connected layer)
+        if self.l2_norm:
+            self.fc.weight.data = F.normalize(self.fc.weight.data, p=2, dim=1)
+            x = F.normalize(x, dim=1)
+        return self.fc(x)
+
+
+@ENCODER_REGISTRY.register()
+class PersonalizedResNet18(PersonalizedResNet):
+    def __init__(self, args, num_classes=10, **kwargs):
+        super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, **kwargs)

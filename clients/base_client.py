@@ -6,7 +6,7 @@ import time
 import matplotlib.pyplot as plt
 import torch.multiprocessing as mp
 import gc
-
+from models.build import build_encoder
 from utils import *
 from utils.metrics import evaluate
 from models import build_encoder

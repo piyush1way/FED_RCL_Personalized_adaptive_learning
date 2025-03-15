@@ -7,8 +7,9 @@
 # last_feature_dim: 512
 
 ## Model ##
-name: "PersonalizedResNet18"
+name: "personalized_resnet18"  # ✅ Ensure this matches the registered name!
 pretrained: False
 l2_norm: False
 use_bn_layer: False
 last_feature_dim: 512
+

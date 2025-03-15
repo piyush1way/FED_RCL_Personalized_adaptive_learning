@@ -32,8 +32,9 @@ wandb.require("service")
 def main(args : DictConfig) -> None:
     # Set CUDA memory allocator
     if torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(0.8)  # Use 80% of available memory
+        # Use a more compatible approach to manage CUDA memory
         torch.backends.cuda.max_split_size_mb = 512  # Limit split size
+        torch.cuda.empty_cache()  # Clear unused memory
 
     torch.multiprocessing.set_sharing_strategy('file_system')
     set_start_method('spawn', True)
@@ -80,3 +81,4 @@ def main(args : DictConfig) -> None:
 
 if __name__ == '__main__':
     main()
+

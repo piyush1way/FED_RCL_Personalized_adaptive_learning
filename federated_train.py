@@ -30,11 +30,19 @@ wandb.require("service")
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(args : DictConfig) -> None:
+    # Set CUDA memory allocator
+    if torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(0.8)  # Use 80% of available memory
+        torch.backends.cuda.max_split_size_mb = 512  # Limit split size
 
     torch.multiprocessing.set_sharing_strategy('file_system')
     set_start_method('spawn', True)
     # pid = os.getpid()
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+
+    # Initialize device
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print("device", device)
 
     args.log_dir = Path(args.log_dir)
     exp_name = args.exp_name if args.remark == "" else f"{args.exp_name}_{args.remark}"
@@ -56,8 +64,6 @@ def main(args : DictConfig) -> None:
         ))
 
     initalize_random_seed(args)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print("device", device)
 
     model = build_encoder(args)
     client_type = get_client_type(args)

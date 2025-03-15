@@ -388,9 +388,15 @@ class PersonalizedResNet(ResNet):
         logit = self.fc(out)
         features['logit'] = logit
         
+        # Return a dictionary with 'feature' and 'logit' keys
+        output_dict = {
+            "feature": features['pooled'],  # Feature representation
+            "logit": logit,                # Logits for classification
+        }
+        
         if return_feature:
-            return features, logit
-        return logit
+            return output_dict, features
+        return output_dict
 
 
 @ENCODER_REGISTRY.register()
@@ -417,9 +423,3 @@ class PersonalizedResNet18(PersonalizedResNet):
             self.fc.weight.data = F.normalize(self.fc.weight.data, p=2, dim=1)
             x = F.normalize(x, dim=1)
         return self.fc(x)
-
-
-@ENCODER_REGISTRY.register()
-class PersonalizedResNet18(PersonalizedResNet):
-    def __init__(self, args, num_classes=10, **kwargs):
-        super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, **kwargs)

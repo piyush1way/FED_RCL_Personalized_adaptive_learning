@@ -41,7 +41,7 @@ def main(args: DictConfig) -> None:
     else:
         device = torch.device("cpu")
 
-    print(f"💻 Using device: {device}")
+    print(f" Using device: {device}")
 
     # Set multiprocessing strategy
     try:
@@ -59,7 +59,7 @@ def main(args: DictConfig) -> None:
     if not args.log_dir.exists():
         args.log_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"📁 Experiment Name: {exp_name}")
+    print(f" Experiment Name: {exp_name}")
 
     # ======= Initialize Wandb =======
     if args.wandb:
@@ -85,9 +85,9 @@ def main(args: DictConfig) -> None:
     trainer_type = get_trainer_type(args)
 
     # ======= Debugging Logs =======
-    logger.info(f"✅ Model: {args.model.name}, Pretrained={args.model.pretrained}")
-    logger.info(f"✅ Client Type: {client_type.__name__}")
-    logger.info(f"✅ Server Type: {server.__class__.__name__}")
+    logger.info(f" Model: {args.model.name}, Pretrained={args.model.pretrained}")
+    logger.info(f" Client Type: {client_type.__name__}")
+    logger.info(f" Server Type: {server.__class__.__name__}")
 
     # ======= Initialize Trainer =======
     trainer = trainer_type(
@@ -105,7 +105,7 @@ def main(args: DictConfig) -> None:
     try:
         trainer.train()
     except RuntimeError as e:
-        logger.error(f"🔥 Training Failed: {e}")
+        logger.error(f" Training Failed: {e}")
         raise e
 
 

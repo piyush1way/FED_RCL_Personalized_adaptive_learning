@@ -432,7 +432,8 @@ class Trainer:
                 # Compute Trust Score
                 trust_scores[client_idx] = self.compute_trust_score(local_state_dict, global_state_dict)
 
-                if trust_scores[client_idx] > self.args.trainer.trust_threshold:
+                # if trust_scores[client_idx] > self.args.trainer.trust_threshold:
+                if trust_scores[client_idx] > getattr(self.args.trainer, "trust_threshold", 0.5):
                     for param_key in local_state_dict:
                         local_weights.setdefault(param_key, []).append(local_state_dict[param_key])
                         local_deltas.setdefault(param_key, []).append(local_state_dict[param_key] - global_state_dict[param_key])

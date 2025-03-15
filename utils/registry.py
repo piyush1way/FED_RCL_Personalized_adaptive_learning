@@ -1,7 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 # pyre-ignore-all-errors[2,3]
 from typing import Any, Dict, Iterable, Iterator, Tuple
-
 from tabulate import tabulate
 
 
@@ -40,39 +39,47 @@ class Registry(Iterable[Tuple[str, Any]]):
         self._obj_map: Dict[str, Any] = {}
 
     def _do_register(self, name: str, obj: Any) -> None:
-        assert (
-            name not in self._obj_map
-        ), "An object named '{}' was already registered in '{}' registry!".format(
-            name, self._name
-        )
+        if name in self._obj_map:
+            raise ValueError(
+                f"An object named '{name}' is already registered in '{self._name}' registry!"
+            )
         self._obj_map[name] = obj
 
     def register(self, obj: Any = None) -> Any:
         """
-        Register the given object under the the name `obj.__name__`.
-        Can be used as either a decorator or not. See docstring of this class for usage.
+        Register the given object under the name `obj.__name__`.
+        Can be used as either a decorator or function call.
+
+        Returns:
+            The registered object for chaining.
         """
 
         if obj is None:
             # used as a decorator
-            def deco(func_or_class: Any) -> Any:
+            def decorator(func_or_class: Any) -> Any:
                 name = func_or_class.__name__
                 self._do_register(name, func_or_class)
                 return func_or_class
 
-            return deco
+            return decorator
 
         # used as a function call
         name = obj.__name__
         self._do_register(name, obj)
+        return obj  # ✅ Ensure function call returns the object
 
     def get(self, name: str) -> Any:
-        ret = self._obj_map.get(name)
-        if ret is None:
+        """
+        Retrieve an object by name from the registry.
+
+        Raises:
+            KeyError if the name is not found.
+        """
+        if name not in self._obj_map:
             raise KeyError(
-                "No object named '{}' found in '{}' registry!".format(name, self._name)
+                f"No object named '{name}' found in '{self._name}' registry!"
             )
-        return ret
+        return self._obj_map[name]
 
     def __contains__(self, name: str) -> bool:
         return name in self._obj_map
@@ -82,10 +89,9 @@ class Registry(Iterable[Tuple[str, Any]]):
         table = tabulate(
             self._obj_map.items(), headers=table_headers, tablefmt="fancy_grid"
         )
-        return "Registry of {}:\n".format(self._name) + table
+        return f"Registry of {self._name}:\n{table}"
 
     def __iter__(self) -> Iterator[Tuple[str, Any]]:
         return iter(self._obj_map.items())
 
-    # pyre-fixme[4]: Attribute must be annotated.
-    __str__ = __repr__
+    __str__ = __repr__  # Make __str__ behave like __repr__

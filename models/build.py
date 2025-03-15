@@ -1,19 +1,19 @@
 from utils import get_numclasses
 from utils.registry import Registry
-import models
 
-ENCODER_REGISTRY = Registry("ENCODER")
-
-__all__ = ["get_model", "build_encoder"]
-
-# ✅ Import models before registering
+# Import models directly instead of from models/__init__.py
 from models.resnet import ResNet18, PersonalizedResNet18
 
-# ✅ Register models only if not already registered
-if "ResNet18" not in ENCODER_REGISTRY._obj_map:
+ENCODER_REGISTRY = Registry("ENCODER")
+ENCODER_REGISTRY.__doc__ = """
+Registry for encoder models.
+"""
+
+# ✅ Register models only if they are not already registered
+if "ResNet18" not in ENCODER_REGISTRY:
     ENCODER_REGISTRY.register(ResNet18)
 
-if "PersonalizedResNet18" not in ENCODER_REGISTRY._obj_map:
+if "PersonalizedResNet18" not in ENCODER_REGISTRY:
     ENCODER_REGISTRY.register(PersonalizedResNet18)
 
 def build_encoder(args):
@@ -28,15 +28,13 @@ def build_encoder(args):
     """
     num_classes = get_numclasses(args)
 
-    if args.verbose:
-        print(ENCODER_REGISTRY)
-
     print(f"=> Creating model '{args.model.name}, pretrained={args.model.pretrained}'")
 
-    # Ensure model exists in the registry before fetching it
-    if args.model.name not in ENCODER_REGISTRY._obj_map:
+    # Ensure model exists in the registry
+    if args.model.name not in ENCODER_REGISTRY:
         raise KeyError(
-            f"Model '{args.model.name}' not found in ENCODER_REGISTRY. Available models: {list(ENCODER_REGISTRY._obj_map.keys())}"
+            f"Model '{args.model.name}' not found in ENCODER_REGISTRY. "
+            f"Available models: {list(ENCODER_REGISTRY._obj_map.keys())}"
         )
 
     encoder_class = ENCODER_REGISTRY.get(args.model.name)

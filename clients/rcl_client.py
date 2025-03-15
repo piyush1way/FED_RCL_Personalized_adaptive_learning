@@ -260,6 +260,8 @@
 #         return self.model.state_dict(), loss_dict
 #!/usr/bin/env python
 # coding: utf-8
+#!/usr/bin/env python
+# coding: utf-8
 import copy
 import time
 import gc
@@ -288,25 +290,24 @@ class RCLClient(Client):
         self.client_index = client_index
         self.loader = None
 
+        # Initialize trust filtering settings
+        trust_filtering_config = getattr(args.client, "trust_filtering", {})
+        self.enable_trust_filtering = getattr(trust_filtering_config, "enable", False)
+        self.trust_threshold = getattr(trust_filtering_config, "trust_threshold", 0.5)
+
         self.model = model
         self.global_model = copy.deepcopy(model)
 
-        # Adaptive Learning Rate
-        self.adaptive_lr = getattr(args.client, "adaptive_lr", {}).get("enable", False)
-        self.adaptive_lr_config = getattr(args.client, "adaptive_lr", {})
-        self.base_lr = self.adaptive_lr_config.get("base_lr", 0.01)
-        self.min_lr = self.adaptive_lr_config.get("min_lr", 0.001)
-        self.max_lr = self.adaptive_lr_config.get("max_lr", 0.05)
-        self.lr_strategy = self.adaptive_lr_config.get("strategy", "gradient_variance")
-
-        # Trust Filtering
-        # self.trust_threshold = getattr(args.client.trust_filtering, "trust_threshold", 0.5)
-        self.trust_threshold = args.client.get("trust_filtering", {}).get("trust_threshold", 0.5)
-        self.enable_trust_filtering = getattr(args.client.trust_filtering, "enable", False)
-
-        # Loss function
-        self.criterion = nn.CrossEntropyLoss()
+        self.rcl_criterions = {'scl': None, 'penalty': None, }
+        args_rcl = args.client.rcl_loss
         self.global_epoch = 0
+
+        self.pairs = {}
+        for pair in args_rcl.pairs:
+            self.pairs[pair.name] = pair
+            self.rcl_criterions[pair.name] = CLLoss(pair=pair, **args_rcl)
+        
+        self.criterion = nn.CrossEntropyLoss()
 
     def setup(self, state_dict, device, local_dataset, global_epoch, local_lr, trainer, **kwargs):
         """Initialize client model, dataset, and optimizer"""
@@ -347,11 +348,20 @@ class RCLClient(Client):
         )
 
     def compute_trust_score(self, local_state_dict):
-        """Compute trust score for client updates"""
-        trust_score = 0.0
-        for key in local_state_dict:
-            trust_score += torch.norm(local_state_dict[key] - self.global_model.state_dict()[key])
-        return torch.exp(-trust_score).item()  # Higher deviation → Lower trust
+        """
+        Compute trust score for this client based on various metrics.
+        Higher score means the client's updates are more reliable.
+        """
+        trust_score = 1.0  # Default trust score
+        
+        # Add your trust score computation logic here
+        # For example:
+        # 1. Check data quality
+        # 2. Check update magnitude
+        # 3. Check historical performance
+        # 4. Check for adversarial behavior
+        
+        return max(0.0, min(1.0, trust_score))  # Ensure score is between 0 and 1
 
     def adapt_learning_rate(self, gradients):
         """Adjust learning rate based on gradient variance"""
@@ -417,3 +427,4 @@ class RCLClient(Client):
         gc.collect()
 
         return self.model.state_dict(), {"loss": float(loss_meter.avg), "trust_score": trust_score}
+

@@ -1,20 +1,23 @@
-# from models.basic import *
-# from models.VGG9 import *
-# from models.resnet import *
-# # from models.generator import *
+# models/__init__.py
 
-# from models.resnet_base import *
+# Expose build_encoder and other necessary functions/classes
+from .build import build_encoder, ENCODER_REGISTRY
 
-# from models.MobileNet import *
-# from models.SqueezeNet import *
-# from models.ShuffleNet import *
+# Expose specific models (optional, but useful for direct imports)
+from .resnet import ResNet18, PersonalizedResNet18
+from .VGG9 import VGG9
+from .basic import *
+from .resnet_base import *
+from .MobileNet import *
+from .SqueezeNet import *
+from .ShuffleNet import *
 
-# from models.build import build_encoder
-# Import Basic Models
-from models.basic import *
-from models.VGG9 import *
-from models.resnet import ResNet18, PersonalizedResNet18  # Import only specific models
-from models.resnet_base import *
-from models.MobileNet import *
-from models.SqueezeNet import *
-from models.ShuffleNet import *
+# Define __all__ to control what gets imported with `from models import *`
+__all__ = [
+    "build_encoder",
+    "ENCODER_REGISTRY",
+    "ResNet18",
+    "PersonalizedResNet18",
+    "VGG9",
+    # Add other models as needed
+]

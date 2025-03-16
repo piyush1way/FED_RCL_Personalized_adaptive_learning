@@ -1,333 +1,37 @@
-# from pathlib import Path
-# from typing import Callable, Dict, Tuple, Union, List, Type, Any
-# from argparse import Namespace
-# from collections import defaultdict
-
-# import torch
-# import torch.nn as nn
-# import torch.multiprocessing as mp
-# import tqdm
-# import wandb
-# import gc
-
-# import pickle, os
-# import numpy as np
-
-# import logging
-# logger = logging.getLogger(__name__)
-
-# import time, io, copy
-
-# from trainers.build import TRAINER_REGISTRY
-# from servers import Server  # Ensure Server is imported correctly
-# from clients import Client
-
-# from utils import DatasetSplit, DatasetSplitSubset, get_dataset
-# from utils.logging_utils import AverageMeter
-
-# from torch.utils.data import DataLoader
-
-# from utils import terminate_processes, initalize_random_seed, save_checkpoint
-# from omegaconf import DictConfig, OmegaConf
-
-# from netcal.metrics import ECE
-# import matplotlib.pyplot as plt
-
-
-# @TRAINER_REGISTRY.register()
-# class Trainer:
-#     def __init__(
-#         self,
-#         model: nn.Module,
-#         client_type: Type,
-#         server: Server,  # Ensure server is of type Server
-#         evaler_type: Type,
-#         datasets: Dict,
-#         device: torch.device,
-#         args: DictConfig,
-#         multiprocessing: Dict = None,
-#         **kwargs,
-#     ) -> None:
-#         self.args = args
-#         self.device = device
-#         self.model = model
-
-#         self.checkpoint_path = Path(self.args.checkpoint_path)
-#         mode = self.args.split.mode
-#         if self.args.split.mode == "dirichlet":
-#             mode += str(self.args.split.alpha)
-#         self.exp_path = self.checkpoint_path / self.args.dataset.name / mode / self.args.exp_name
-#         logger.info(f"Exp path : {self.exp_path}")
-
-#         ### Training config
-#         trainer_args = self.args.trainer
-#         self.num_clients = trainer_args.num_clients
-#         self.participation_rate = trainer_args.participation_rate
-#         self.global_rounds = trainer_args.global_rounds
-#         self.lr = trainer_args.local_lr
-#         self.local_lr_decay = trainer_args.local_lr_decay
-
-#         self.clients: List[Client] = [
-#             client_type(self.args, client_index=c, model=copy.deepcopy(self.model))
-#             for c in range(self.args.trainer.num_clients)
-#         ]
-#         self.server = server  # Ensure server is correctly assigned
-
-#         # Initialize global_delta if using ServerAdam
-#         if hasattr(self.server, 'global_delta') and self.server.global_delta is None:
-#             self.server.global_delta = {}
-
-#         # Check if momentum is defined before accessing it
-#         if hasattr(self.args.server, 'momentum') and self.args.server.momentum > 0:
-#             self.server.set_momentum(self.model)
-
-#         self.datasets = datasets
-#         self.local_dataset_split_ids = get_dataset(self.args, self.datasets["train"], mode=self.args.split.mode)
-
-#         test_loader = DataLoader(
-#             self.datasets["test"],
-#             batch_size=args.evaler.batch_size if args.evaler.batch_size > 0 else args.batch_size,
-#             shuffle=False,
-#             num_workers=args.num_workers,
-#         )
-#         eval_device = self.device if not self.args.multiprocessing else torch.device(f"cuda:{self.args.main_gpu}")
-#         eval_params = {
-#             "test_loader": test_loader,
-#             "device": eval_device,
-#             "args": args,
-#         }
-#         self.eval_params = eval_params
-#         self.eval_device = eval_device
-#         self.evaler = evaler_type(**eval_params)
-#         logger.info(f"Trainer: {self.__class__}, client: {client_type}, server: {server.__class__}, evaler: {evaler_type}")
-
-#         self.start_round = 0
-#         if self.args.get("load_model_path"):
-#             self.load_model()
-
-#     def local_update(self, device, task_queue, result_queue):
-#         if self.args.multiprocessing:
-#             torch.cuda.set_device(device)
-#             initalize_random_seed(self.args)
-
-#         while True:
-#             task = task_queue.get()
-#             if task is None:
-#                 break
-#             client = self.clients[task["client_idx"]]
-
-#             local_dataset = DatasetSplitSubset(
-#                 self.datasets["train"],
-#                 idxs=self.local_dataset_split_ids[task["client_idx"]],
-#                 subset_classes=self.args.dataset.get("subset_classes"),
-#             )
-
-#             setup_inputs = {
-#                 "state_dict": task["state_dict"],
-#                 "device": device,
-#                 "local_dataset": local_dataset,
-#                 "local_lr": task["local_lr"],
-#                 "global_epoch": task["global_epoch"],
-#                 "trainer": self,
-#             }
-#             client.setup(**setup_inputs)
-
-#             # Local Training
-#             local_model, local_loss_dict = client.local_train(global_epoch=task["global_epoch"])
-#             result_queue.put((local_model, local_loss_dict))
-#             if not self.args.multiprocessing:
-#                 break
-
-#     def train(self) -> Dict:
-#         result_queue = mp.Manager().Queue()
-
-#         M = max(int(self.participation_rate * self.num_clients), 1)
-
-#         if self.args.multiprocessing:
-#             ngpus_per_node = torch.cuda.device_count()
-#             task_queues = [mp.Queue() for _ in range(M)]
-#             processes = [
-#                 mp.get_context("spawn").Process(
-#                     target=self.local_update, args=(i % ngpus_per_node, task_queues[i], result_queue)
-#                 )
-#                 for i in range(M)
-#             ]
-
-#             # Start all processes
-#             for p in processes:
-#                 p.start()
-
-#         for epoch in range(self.start_round, self.global_rounds):
-#             self.lr_update(epoch=epoch)
-
-#             global_state_dict = copy.deepcopy(self.model.state_dict())
-#             prev_model_weight = copy.deepcopy(self.model.state_dict())
-
-#             # Select clients
-#             if self.participation_rate < 1.0:
-#                 selected_client_ids = np.random.choice(range(self.num_clients), M, replace=False)
-#             else:
-#                 selected_client_ids = range(len(self.clients))
-#             logger.info(f"Global epoch {epoch}, Selected client : {selected_client_ids}")
-
-#             current_lr = self.lr
-
-#             local_weights = defaultdict(list)
-#             local_loss_dicts = defaultdict(list)
-#             local_deltas = defaultdict(list)
-
-#             local_models = []
-
-#             # FedACG lookahead momentum
-#             if self.args.server.get("FedACG"):
-#                 assert self.args.server.momentum > 0
-#                 self.model = copy.deepcopy(self.server.FedACG_lookahead(copy.deepcopy(self.model)))
-#                 global_state_dict = copy.deepcopy(self.model.state_dict())
-
-#             # Client-side
-#             start = time.time()
-#             for i, client_idx in enumerate(selected_client_ids):
-#                 task_queue_input = {
-#                     "state_dict": self.model.state_dict(),
-#                     "client_idx": client_idx,
-#                     "local_lr": current_lr,
-#                     "global_epoch": epoch,
-#                 }
-#                 if self.args.multiprocessing:
-#                     task_queues[i].put(task_queue_input)
-#                 else:
-#                     task_queue = mp.Queue()
-#                     task_queue.put(task_queue_input)
-#                     self.local_update(self.device, task_queue, result_queue)
-
-#                     local_state_dict, local_loss_dict = result_queue.get()
-#                     for loss_key in local_loss_dict:
-#                         local_loss_dicts[loss_key].append(local_loss_dict[loss_key])
-
-#                     local_models.append(local_state_dict)
-
-#                     for param_key in local_state_dict:
-#                         local_weights[param_key].append(local_state_dict[param_key])
-#                         local_deltas[param_key].append(local_state_dict[param_key] - global_state_dict[param_key])
-
-#             if self.args.multiprocessing:
-#                 for _ in range(len(selected_client_ids)):
-#                     result = result_queue.get()
-#                     local_state_dict, local_loss_dict = result
-#                     for loss_key in local_loss_dict:
-#                         local_loss_dicts[loss_key].append(local_loss_dict[loss_key])
-
-#                     local_models.append(local_state_dict)
-
-#                     for param_key in local_state_dict:
-#                         local_weights[param_key].append(local_state_dict[param_key])
-#                         local_deltas[param_key].append(local_state_dict[param_key] - global_state_dict[param_key])
-
-#             logger.info(f"Global epoch {epoch}, Train End. Total Time: {time.time() - start:.2f}s")
-
-#             # Server-side
-#             updated_global_state_dict = self.server.aggregate(
-#                 local_weights, local_deltas, selected_client_ids, copy.deepcopy(global_state_dict), current_lr
-#             )
-#             self.model.load_state_dict(updated_global_state_dict)
-
-#             local_datasets = [
-#                 DatasetSplit(self.datasets["train"], idxs=self.local_dataset_split_ids[client_id])
-#                 for client_id in selected_client_ids
-#             ]
-
-#             # Logging
-#             wandb_dict = {loss_key: np.mean(local_loss_dicts[loss_key]) for loss_key in local_loss_dicts}
-#             wandb_dict["lr"] = self.lr
-
-#             if self.args.eval.freq > 0 and epoch % self.args.eval.freq == 0:
-#                 self.evaluate(epoch=epoch, local_datasets=local_datasets)
-
-#             if (self.args.save_freq > 0 and (epoch + 1) % self.args.save_freq == 0) or (
-#                 epoch + 1 == self.args.trainer.global_rounds
-#             ):
-#                 self.save_model(epoch=epoch)
-
-#             self.wandb_log(wandb_dict, step=epoch)
-#             gc.collect()
-
-#         if self.args.multiprocessing:
-#             # Terminate Processes
-#             terminate_processes(task_queues, processes)
-
-#         return
-
-#     def lr_update(self, epoch: int) -> None:
-#         self.lr = self.args.trainer.local_lr * (self.local_lr_decay) ** (epoch)
-#         return
-
-#     def save_model(self, epoch: int = -1, suffix: str = "") -> None:
-#         model_path = self.exp_path / self.args.output_model_path
-#         if not model_path.parent.exists():
-#             model_path.parent.mkdir(parents=True, exist_ok=True)
-
-#         if epoch < self.args.trainer.global_rounds - 1:
-#             model_path = Path(f"{model_path}.e{epoch+1}")
-
-#         if suffix:
-#             model_path = Path(f"{model_path}.{suffix}")
-
-#         save_checkpoint(self.model, model_path, epoch, save_torch=True, use_breakpoint=False)
-#         print(f"Saved model at {model_path}")
-#         return
-
-#     def load_model(self) -> None:
-#         if self.args.get("load_model_path"):
-#             saved_dict = torch.load(self.args.load_model_path)
-#             self.model.load_state_dict(saved_dict["model_state_dict"], strict=False)
-#             self.start_round = saved_dict["epoch"] + 1
-#             logger.warning(f"Load model from {self.args.load_model_path}, epoch {saved_dict['epoch']}")
-#         return
-
-#     def wandb_log(self, log: Dict, step: int = None):
-#         if self.args.wandb:
-#             wandb.log(log, step=step)
-
-#     def validate(self, epoch: int) -> Dict:
-#         return
-
-#     def evaluate(self, epoch: int, local_datasets: List[torch.utils.data.Dataset] = None) -> Dict:
-#         results = self.evaler.eval(model=copy.deepcopy(self.model), epoch=epoch)
-#         acc = results["acc"]
-
-#         wandb_dict = {
-#             f"acc/{self.args.dataset.name}": acc,
-#         }
-
-#         logger.warning(f"[Epoch {epoch}] Test Accuracy: {acc:.2f}%")
-
-#         plt.close()
-
-#         self.wandb_log(wandb_dict, step=epoch)
-#         return {
-#             "acc": acc,
-#         }
-
-
 from pathlib import Path
-from typing import Dict, List, Type
+from typing import Callable, Dict, Tuple, Union, List, Type, Any
+from argparse import Namespace
+from collections import defaultdict
+
 import torch
 import torch.nn as nn
-import copy
-import numpy as np
-import logging
-import time
-import gc
+import torch.multiprocessing as mp
+import tqdm
 import wandb
-from trainers.build import TRAINER_REGISTRY
-from servers import Server
-from clients import Client
-from utils import DatasetSplitSubset, get_dataset, save_checkpoint
-from utils.logging_utils import MultiMetricLogger
-from torch.utils.data import DataLoader
-from omegaconf import DictConfig
+import gc
 
+import pickle, os
+import numpy as np
+
+import logging
 logger = logging.getLogger(__name__)
+
+import time, io, copy
+
+from trainers.build import TRAINER_REGISTRY
+from servers import Server  # Ensure Server is imported correctly
+from clients import Client
+
+from utils import DatasetSplit, DatasetSplitSubset, get_dataset
+from utils.logging_utils import AverageMeter
+
+from torch.utils.data import DataLoader
+
+from utils import terminate_processes, initalize_random_seed, save_checkpoint
+from omegaconf import DictConfig, OmegaConf
+
+from netcal.metrics import ECE
+import matplotlib.pyplot as plt
 
 
 @TRAINER_REGISTRY.register()
@@ -336,21 +40,26 @@ class Trainer:
         self,
         model: nn.Module,
         client_type: Type,
-        server: Server,
+        server: Server,  # Ensure server is of type Server
         evaler_type: Type,
         datasets: Dict,
         device: torch.device,
         args: DictConfig,
+        multiprocessing: Dict = None,
         **kwargs,
     ) -> None:
         self.args = args
         self.device = device
         self.model = model
+
         self.checkpoint_path = Path(self.args.checkpoint_path)
-        self.exp_path = self.checkpoint_path / self.args.dataset.name / str(self.args.split.mode) / self.args.exp_name
+        mode = self.args.split.mode
+        if self.args.split.mode == "dirichlet":
+            mode += str(self.args.split.alpha)
+        self.exp_path = self.checkpoint_path / self.args.dataset.name / mode / self.args.exp_name
         logger.info(f"Exp path : {self.exp_path}")
 
-        # Training Config
+        ### Training config
         trainer_args = self.args.trainer
         self.num_clients = trainer_args.num_clients
         self.participation_rate = trainer_args.participation_rate
@@ -358,13 +67,18 @@ class Trainer:
         self.lr = trainer_args.local_lr
         self.local_lr_decay = trainer_args.local_lr_decay
 
-        # Initialize Clients
         self.clients: List[Client] = [
             client_type(self.args, client_index=c, model=copy.deepcopy(self.model))
-            for c in range(self.num_clients)
+            for c in range(self.args.trainer.num_clients)
         ]
-        self.server = server
-        if self.args.server.momentum > 0:
+        self.server = server  # Ensure server is correctly assigned
+
+        # Initialize global_delta if using ServerAdam
+        if hasattr(self.server, 'global_delta') and self.server.global_delta is None:
+            self.server.global_delta = {}
+
+        # Check if momentum is defined before accessing it
+        if hasattr(self.args.server, 'momentum') and self.args.server.momentum > 0:
             self.server.set_momentum(self.model)
 
         self.datasets = datasets
@@ -376,102 +90,183 @@ class Trainer:
             shuffle=False,
             num_workers=args.num_workers,
         )
-        self.evaler = evaler_type(test_loader=test_loader, device=self.device, args=args)
-        self.metric_logger = MultiMetricLogger()
+        eval_device = self.device if not self.args.multiprocessing else torch.device(f"cuda:{self.args.main_gpu}")
+        eval_params = {
+            "test_loader": test_loader,
+            "device": eval_device,
+            "args": args,
+        }
+        self.eval_params = eval_params
+        self.eval_device = eval_device
+        self.evaler = evaler_type(**eval_params)
+        logger.info(f"Trainer: {self.__class__}, client: {client_type}, server: {server.__class__}, evaler: {evaler_type}")
 
         self.start_round = 0
         if self.args.get("load_model_path"):
             self.load_model()
 
+    def local_update(self, device, task_queue, result_queue):
+        if self.args.multiprocessing:
+            torch.cuda.set_device(device)
+            initalize_random_seed(self.args)
+
+        while True:
+            task = task_queue.get()
+            if task is None:
+                break
+            client = self.clients[task["client_idx"]]
+
+            local_dataset = DatasetSplitSubset(
+                self.datasets["train"],
+                idxs=self.local_dataset_split_ids[task["client_idx"]],
+                subset_classes=self.args.dataset.get("subset_classes"),
+            )
+
+            setup_inputs = {
+                "state_dict": task["state_dict"],
+                "device": device,
+                "local_dataset": local_dataset,
+                "local_lr": task["local_lr"],
+                "global_epoch": task["global_epoch"],
+                "trainer": self,
+            }
+            client.setup(**setup_inputs)
+
+            # Local Training
+            local_model, local_loss_dict = client.local_train(global_epoch=task["global_epoch"])
+            result_queue.put((local_model, local_loss_dict))
+            if not self.args.multiprocessing:
+                break
+
     def train(self) -> Dict:
-        if not torch.cuda.is_available():
-            raise RuntimeError("No GPU available. This script requires a GPU to run.")
+        result_queue = mp.Manager().Queue()
 
         M = max(int(self.participation_rate * self.num_clients), 1)
 
+        if self.args.multiprocessing:
+            ngpus_per_node = torch.cuda.device_count()
+            task_queues = [mp.Queue() for _ in range(M)]
+            processes = [
+                mp.get_context("spawn").Process(
+                    target=self.local_update, args=(i % ngpus_per_node, task_queues[i], result_queue)
+                )
+                for i in range(M)
+            ]
+
+            # Start all processes
+            for p in processes:
+                p.start()
+
         for epoch in range(self.start_round, self.global_rounds):
             self.lr_update(epoch=epoch)
-            global_state_dict = copy.deepcopy(self.model.state_dict())
 
-            # Select Clients
-            selected_client_ids = np.random.choice(range(self.num_clients), M, replace=False) \
-                if self.participation_rate < 1.0 else range(len(self.clients))
-            logger.info(f"Global epoch {epoch}, Selected clients: {selected_client_ids}")
+            global_state_dict = copy.deepcopy(self.model.state_dict())
+            prev_model_weight = copy.deepcopy(self.model.state_dict())
+
+            # Select clients
+            if self.participation_rate < 1.0:
+                selected_client_ids = np.random.choice(range(self.num_clients), M, replace=False)
+            else:
+                selected_client_ids = range(len(self.clients))
+            logger.info(f"Global epoch {epoch}, Selected client : {selected_client_ids}")
 
             current_lr = self.lr
-            local_weights, local_deltas, trust_scores = {}, {}, {}
 
+            local_weights = defaultdict(list)
+            local_loss_dicts = defaultdict(list)
+            local_deltas = defaultdict(list)
+
+            local_models = []
+
+            # FedACG lookahead momentum
             if self.args.server.get("FedACG"):
                 assert self.args.server.momentum > 0
                 self.model = copy.deepcopy(self.server.FedACG_lookahead(copy.deepcopy(self.model)))
                 global_state_dict = copy.deepcopy(self.model.state_dict())
 
-            start_time = time.time()
-            for client_idx in selected_client_ids:
-                client = self.clients[client_idx]
-                local_dataset = DatasetSplitSubset(
-                    self.datasets["train"], idxs=self.local_dataset_split_ids[client_idx]
-                )
-
-                setup_inputs = {
-                    "state_dict": global_state_dict,
-                    "device": self.device,
-                    "local_dataset": local_dataset,
+            # Client-side
+            start = time.time()
+            for i, client_idx in enumerate(selected_client_ids):
+                task_queue_input = {
+                    "state_dict": self.model.state_dict(),
+                    "client_idx": client_idx,
                     "local_lr": current_lr,
                     "global_epoch": epoch,
-                    "trainer": self,
                 }
-                client.setup(**setup_inputs)
+                if self.args.multiprocessing:
+                    task_queues[i].put(task_queue_input)
+                else:
+                    task_queue = mp.Queue()
+                    task_queue.put(task_queue_input)
+                    self.local_update(self.device, task_queue, result_queue)
 
-                # Freeze global layers, update only the personalized head
-                client.model.freeze_backbone()
+                    local_state_dict, local_loss_dict = result_queue.get()
+                    for loss_key in local_loss_dict:
+                        local_loss_dicts[loss_key].append(local_loss_dict[loss_key])
 
-                # Local Training
-                local_state_dict, local_loss_dict = client.local_train(global_epoch=epoch)
+                    local_models.append(local_state_dict)
 
-                # Compute Trust Score
-                trust_scores[client_idx] = self.compute_trust_score(local_state_dict, global_state_dict)
-
-                # if trust_scores[client_idx] > self.args.trainer.trust_threshold:
-                if trust_scores[client_idx] > getattr(self.args.trainer, "trust_threshold", 0.5):
                     for param_key in local_state_dict:
-                        local_weights.setdefault(param_key, []).append(local_state_dict[param_key])
-                        local_deltas.setdefault(param_key, []).append(local_state_dict[param_key] - global_state_dict[param_key])
+                        local_weights[param_key].append(local_state_dict[param_key])
+                        local_deltas[param_key].append(local_state_dict[param_key] - global_state_dict[param_key])
 
-            logger.info(f"Global epoch {epoch}, Train End. Time: {time.time() - start_time:.2f}s")
+            if self.args.multiprocessing:
+                for _ in range(len(selected_client_ids)):
+                    result = result_queue.get()
+                    local_state_dict, local_loss_dict = result
+                    for loss_key in local_loss_dict:
+                        local_loss_dicts[loss_key].append(local_loss_dict[loss_key])
 
-            # Server Aggregation (using only trusted clients)
+                    local_models.append(local_state_dict)
+
+                    for param_key in local_state_dict:
+                        local_weights[param_key].append(local_state_dict[param_key])
+                        local_deltas[param_key].append(local_state_dict[param_key] - global_state_dict[param_key])
+
+            logger.info(f"Global epoch {epoch}, Train End. Total Time: {time.time() - start:.2f}s")
+
+            # Server-side
             updated_global_state_dict = self.server.aggregate(
-                local_weights, local_deltas, [cid for cid in selected_client_ids if trust_scores[cid] > self.args.trainer.trust_threshold],
-                copy.deepcopy(global_state_dict), current_lr, trust_scores
+                local_weights, local_deltas, selected_client_ids, copy.deepcopy(global_state_dict), current_lr
             )
-            self.model.load_state_dict(updated_global_state_dict, strict=False)
-            # Evaluate and Log Metrics
-            if self.args.eval.freq > 0 and epoch % self.args.eval.freq == 0:
-                self.evaluate(epoch=epoch)
+            self.model.load_state_dict(updated_global_state_dict)
 
-            if (self.args.save_freq > 0 and (epoch + 1) % self.args.save_freq == 0) or (epoch + 1 == self.global_rounds):
+            local_datasets = [
+                DatasetSplit(self.datasets["train"], idxs=self.local_dataset_split_ids[client_id])
+                for client_id in selected_client_ids
+            ]
+
+            # Logging
+            wandb_dict = {loss_key: np.mean(local_loss_dicts[loss_key]) for loss_key in local_loss_dicts}
+            wandb_dict["lr"] = self.lr
+
+            if self.args.eval.freq > 0 and epoch % self.args.eval.freq == 0:
+                self.evaluate(epoch=epoch, local_datasets=local_datasets)
+
+            if (self.args.save_freq > 0 and (epoch + 1) % self.args.save_freq == 0) or (
+                epoch + 1 == self.args.trainer.global_rounds
+            ):
                 self.save_model(epoch=epoch)
 
+            self.wandb_log(wandb_dict, step=epoch)
             gc.collect()
+
+        if self.args.multiprocessing:
+            # Terminate Processes
+            terminate_processes(task_queues, processes)
 
         return
 
-    def compute_trust_score(self, local_state_dict, global_state_dict) -> float:
-        """Computes a trust score based on how much local updates deviate from global updates."""
-        norm_diff = sum(torch.norm(local_state_dict[key] - global_state_dict[key]) for key in local_state_dict)
-        return torch.exp(-norm_diff).item()  # Higher norm difference = Lower trust
-
     def lr_update(self, epoch: int) -> None:
-        """Update learning rate."""
-        self.lr = self.args.trainer.local_lr * (self.local_lr_decay) ** epoch
+        self.lr = self.args.trainer.local_lr * (self.local_lr_decay) ** (epoch)
+        return
 
     def save_model(self, epoch: int = -1, suffix: str = "") -> None:
-        """Save model checkpoint."""
         model_path = self.exp_path / self.args.output_model_path
-        model_path.parent.mkdir(parents=True, exist_ok=True)
+        if not model_path.parent.exists():
+            model_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if epoch < self.global_rounds - 1:
+        if epoch < self.args.trainer.global_rounds - 1:
             model_path = Path(f"{model_path}.e{epoch+1}")
 
         if suffix:
@@ -479,25 +274,230 @@ class Trainer:
 
         save_checkpoint(self.model, model_path, epoch, save_torch=True, use_breakpoint=False)
         print(f"Saved model at {model_path}")
+        return
 
     def load_model(self) -> None:
-        """Load model checkpoint."""
         if self.args.get("load_model_path"):
             saved_dict = torch.load(self.args.load_model_path)
             self.model.load_state_dict(saved_dict["model_state_dict"], strict=False)
             self.start_round = saved_dict["epoch"] + 1
-            logger.warning(f"Loaded model from {self.args.load_model_path}, epoch {saved_dict['epoch']}")
+            logger.warning(f"Load model from {self.args.load_model_path}, epoch {saved_dict['epoch']}")
+        return
 
-    def evaluate(self, epoch: int) -> Dict:
-        """Evaluate global and personalized model accuracy."""
+    def wandb_log(self, log: Dict, step: int = None):
+        if self.args.wandb:
+            wandb.log(log, step=step)
+
+    def validate(self, epoch: int) -> Dict:
+        return
+
+    def evaluate(self, epoch: int, local_datasets: List[torch.utils.data.Dataset] = None) -> Dict:
         results = self.evaler.eval(model=copy.deepcopy(self.model), epoch=epoch)
-        acc_global = results["acc_global"]
-        acc_personalized = results["acc_personalized"]
+        acc = results["acc"]
 
-        logger.warning(f"[Epoch {epoch}] Global Accuracy: {acc_global:.2f}% | Personalized Accuracy: {acc_personalized:.2f}%")
+        wandb_dict = {
+            f"acc/{self.args.dataset.name}": acc,
+        }
 
-        self.metric_logger.update("Global Accuracy", acc_global)
-        self.metric_logger.update("Personalized Accuracy", acc_personalized)
-        self.metric_logger.log()
+        logger.warning(f"[Epoch {epoch}] Test Accuracy: {acc:.2f}%")
 
-        return {"acc_global": acc_global, "acc_personalized": acc_personalized}
+        plt.close()
+
+        self.wandb_log(wandb_dict, step=epoch)
+        return {
+            "acc": acc,
+        }
+
+
+# from pathlib import Path
+# from typing import Dict, List, Type
+# import torch
+# import torch.nn as nn
+# import copy
+# import numpy as np
+# import logging
+# import time
+# import gc
+# import wandb
+# from trainers.build import TRAINER_REGISTRY
+# from servers import Server
+# from clients import Client
+# from utils import DatasetSplitSubset, get_dataset, save_checkpoint
+# from utils.logging_utils import MultiMetricLogger
+# from torch.utils.data import DataLoader
+# from omegaconf import DictConfig
+
+# logger = logging.getLogger(__name__)
+
+
+# @TRAINER_REGISTRY.register()
+# class Trainer:
+#     def __init__(
+#         self,
+#         model: nn.Module,
+#         client_type: Type,
+#         server: Server,
+#         evaler_type: Type,
+#         datasets: Dict,
+#         device: torch.device,
+#         args: DictConfig,
+#         **kwargs,
+#     ) -> None:
+#         self.args = args
+#         self.device = device
+#         self.model = model
+#         self.checkpoint_path = Path(self.args.checkpoint_path)
+#         self.exp_path = self.checkpoint_path / self.args.dataset.name / str(self.args.split.mode) / self.args.exp_name
+#         logger.info(f"Exp path : {self.exp_path}")
+
+#         # Training Config
+#         trainer_args = self.args.trainer
+#         self.num_clients = trainer_args.num_clients
+#         self.participation_rate = trainer_args.participation_rate
+#         self.global_rounds = trainer_args.global_rounds
+#         self.lr = trainer_args.local_lr
+#         self.local_lr_decay = trainer_args.local_lr_decay
+
+#         # Initialize Clients
+#         self.clients: List[Client] = [
+#             client_type(self.args, client_index=c, model=copy.deepcopy(self.model))
+#             for c in range(self.num_clients)
+#         ]
+#         self.server = server
+#         if self.args.server.momentum > 0:
+#             self.server.set_momentum(self.model)
+
+#         self.datasets = datasets
+#         self.local_dataset_split_ids = get_dataset(self.args, self.datasets["train"], mode=self.args.split.mode)
+
+#         test_loader = DataLoader(
+#             self.datasets["test"],
+#             batch_size=args.evaler.batch_size if args.evaler.batch_size > 0 else args.batch_size,
+#             shuffle=False,
+#             num_workers=args.num_workers,
+#         )
+#         self.evaler = evaler_type(test_loader=test_loader, device=self.device, args=args)
+#         self.metric_logger = MultiMetricLogger()
+
+#         self.start_round = 0
+#         if self.args.get("load_model_path"):
+#             self.load_model()
+
+#     def train(self) -> Dict:
+#         if not torch.cuda.is_available():
+#             raise RuntimeError("No GPU available. This script requires a GPU to run.")
+
+#         M = max(int(self.participation_rate * self.num_clients), 1)
+
+#         for epoch in range(self.start_round, self.global_rounds):
+#             self.lr_update(epoch=epoch)
+#             global_state_dict = copy.deepcopy(self.model.state_dict())
+
+#             # Select Clients
+#             selected_client_ids = np.random.choice(range(self.num_clients), M, replace=False) \
+#                 if self.participation_rate < 1.0 else range(len(self.clients))
+#             logger.info(f"Global epoch {epoch}, Selected clients: {selected_client_ids}")
+
+#             current_lr = self.lr
+#             local_weights, local_deltas, trust_scores = {}, {}, {}
+
+#             if self.args.server.get("FedACG"):
+#                 assert self.args.server.momentum > 0
+#                 self.model = copy.deepcopy(self.server.FedACG_lookahead(copy.deepcopy(self.model)))
+#                 global_state_dict = copy.deepcopy(self.model.state_dict())
+
+#             start_time = time.time()
+#             for client_idx in selected_client_ids:
+#                 client = self.clients[client_idx]
+#                 local_dataset = DatasetSplitSubset(
+#                     self.datasets["train"], idxs=self.local_dataset_split_ids[client_idx]
+#                 )
+
+#                 setup_inputs = {
+#                     "state_dict": global_state_dict,
+#                     "device": self.device,
+#                     "local_dataset": local_dataset,
+#                     "local_lr": current_lr,
+#                     "global_epoch": epoch,
+#                     "trainer": self,
+#                 }
+#                 client.setup(**setup_inputs)
+
+#                 # Freeze global layers, update only the personalized head
+#                 client.model.freeze_backbone()
+
+#                 # Local Training
+#                 local_state_dict, local_loss_dict = client.local_train(global_epoch=epoch)
+
+#                 # Compute Trust Score
+#                 trust_scores[client_idx] = self.compute_trust_score(local_state_dict, global_state_dict)
+
+#                 # if trust_scores[client_idx] > self.args.trainer.trust_threshold:
+#                 if trust_scores[client_idx] > getattr(self.args.trainer, "trust_threshold", 0.5):
+#                     for param_key in local_state_dict:
+#                         local_weights.setdefault(param_key, []).append(local_state_dict[param_key])
+#                         local_deltas.setdefault(param_key, []).append(local_state_dict[param_key] - global_state_dict[param_key])
+
+#             logger.info(f"Global epoch {epoch}, Train End. Time: {time.time() - start_time:.2f}s")
+
+#             # Server Aggregation (using only trusted clients)
+#             updated_global_state_dict = self.server.aggregate(
+#                 local_weights, local_deltas, [cid for cid in selected_client_ids if trust_scores[cid] > self.args.trainer.trust_threshold],
+#                 copy.deepcopy(global_state_dict), current_lr, trust_scores
+#             )
+#             self.model.load_state_dict(updated_global_state_dict, strict=False)
+#             # Evaluate and Log Metrics
+#             if self.args.eval.freq > 0 and epoch % self.args.eval.freq == 0:
+#                 self.evaluate(epoch=epoch)
+
+#             if (self.args.save_freq > 0 and (epoch + 1) % self.args.save_freq == 0) or (epoch + 1 == self.global_rounds):
+#                 self.save_model(epoch=epoch)
+
+#             gc.collect()
+
+#         return
+
+#     def compute_trust_score(self, local_state_dict, global_state_dict) -> float:
+#         """Computes a trust score based on how much local updates deviate from global updates."""
+#         norm_diff = sum(torch.norm(local_state_dict[key] - global_state_dict[key]) for key in local_state_dict)
+#         return torch.exp(-norm_diff).item()  # Higher norm difference = Lower trust
+
+#     def lr_update(self, epoch: int) -> None:
+#         """Update learning rate."""
+#         self.lr = self.args.trainer.local_lr * (self.local_lr_decay) ** epoch
+
+#     def save_model(self, epoch: int = -1, suffix: str = "") -> None:
+#         """Save model checkpoint."""
+#         model_path = self.exp_path / self.args.output_model_path
+#         model_path.parent.mkdir(parents=True, exist_ok=True)
+
+#         if epoch < self.global_rounds - 1:
+#             model_path = Path(f"{model_path}.e{epoch+1}")
+
+#         if suffix:
+#             model_path = Path(f"{model_path}.{suffix}")
+
+#         save_checkpoint(self.model, model_path, epoch, save_torch=True, use_breakpoint=False)
+#         print(f"Saved model at {model_path}")
+
+#     def load_model(self) -> None:
+#         """Load model checkpoint."""
+#         if self.args.get("load_model_path"):
+#             saved_dict = torch.load(self.args.load_model_path)
+#             self.model.load_state_dict(saved_dict["model_state_dict"], strict=False)
+#             self.start_round = saved_dict["epoch"] + 1
+#             logger.warning(f"Loaded model from {self.args.load_model_path}, epoch {saved_dict['epoch']}")
+
+#     def evaluate(self, epoch: int) -> Dict:
+#         """Evaluate global and personalized model accuracy."""
+#         results = self.evaler.eval(model=copy.deepcopy(self.model), epoch=epoch)
+#         acc_global = results["acc_global"]
+#         acc_personalized = results["acc_personalized"]
+
+#         logger.warning(f"[Epoch {epoch}] Global Accuracy: {acc_global:.2f}% | Personalized Accuracy: {acc_personalized:.2f}%")
+
+#         self.metric_logger.update("Global Accuracy", acc_global)
+#         self.metric_logger.update("Personalized Accuracy", acc_personalized)
+#         self.metric_logger.log()
+
+#         return {"acc_global": acc_global, "acc_personalized": acc_personalized}

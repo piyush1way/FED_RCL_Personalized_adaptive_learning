@@ -130,7 +130,16 @@ class RCLClient(Client):
                 self.model.zero_grad()
 
                 with autocast(enabled=self.device.type == "cuda"):
-                    logits = self.model(images)
+                    # Forward pass
+                    output = self.model(images)
+                    
+                    # Extract logits from the output dictionary
+                    if isinstance(output, dict):
+                        logits = output["logit"]  # Extract logits tensor
+                    else:
+                        logits = output  # Fallback if output is not a dictionary
+                    
+                    # Compute loss
                     loss = self.criterion(logits, labels)
 
                 if self.device.type == "cuda":
@@ -139,6 +148,7 @@ class RCLClient(Client):
                 else:
                     loss.backward()
 
+                # Collect gradients for debugging
                 gradients.append([p.grad.detach().clone() for p in self.model.parameters() if p.grad is not None])
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10)
 

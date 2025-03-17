@@ -1,0 +1,12 @@
+type: ServerM  # Use ServerM for momentum-based aggregation
+
+# Server optimizer configuration
+momentum: 0.9
+beta: 0.99
+tau: 0.001
+FedACG: False
+
+# Trust filtering settings for server-side
+trust_filtering:
+  enable: true
+  threshold: 0.5  # Minimum trust score for client updates to be included

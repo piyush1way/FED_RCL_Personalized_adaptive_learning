@@ -1,0 +1,13 @@
+type: BaseTrainer
+
+num_clients: 10
+participating_clients: 10
+num_rounds: 100
+local_epochs: 5
+
+# Initially higher global LR, but will be balanced by adaptive local LRs
+global_lr: 0.01
+
+# Local learning rate configurations
+local_lr: 0.01
+local_lr_decay: 0.99

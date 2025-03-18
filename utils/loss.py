@@ -7,7 +7,7 @@ from utils.helper import *
 from utils.logging_utils import AverageMeter
 import math
 
-__all__ = ['MultiLabelCrossEntropyLoss', 'CLLoss', 'KL_u_p_loss']
+__all__ = ['MultiLabelCrossEntropyLoss', 'CLLoss', 'KL_u_p_loss', 'compute_personalized_loss', 'RelaxedContrastiveLoss']
 
 
 class MultiLabelCrossEntropyLoss(nn.Module):
@@ -48,7 +48,6 @@ class MultiLabelCrossEntropyLoss(nn.Module):
             loss = loss.sum() / non_zero_cnt
         else:
             loss = loss
-
 
         return loss
 
@@ -143,7 +142,6 @@ class CLLoss(nn.Module):
         return sim_pos
 
 
-
     def forward(self, old_feat, new_feat, target, reduction=True, pair=None, topk_pos=None, topk_neg=None, name="loss1"):
 
         if old_feat.dim() > 2:
@@ -209,6 +207,109 @@ class CLLoss(nn.Module):
         return loss
 
 
+class RelaxedContrastiveLoss(nn.Module):
+    """
+    Relaxed Contrastive Loss with divergence penalty for FedRCL-P.
+    This loss prevents representation collapse by imposing a penalty on excessively similar pairs.
+    """
+    def __init__(self, temperature=0.05, lambda_penalty=1.0, similarity_threshold=0.7):
+        super(RelaxedContrastiveLoss, self).__init__()
+        self.temperature = temperature
+        self.lambda_penalty = lambda_penalty
+        self.similarity_threshold = similarity_threshold
+        
+    def forward(self, features, labels):
+        """
+        Args:
+            features: Feature representations (B x D)
+            labels: Ground truth labels (B)
+            
+        Returns:
+            torch.Tensor: Relaxed contrastive loss
+        """
+        # Normalize features
+        features = F.normalize(features, dim=1)
+        batch_size = features.size(0)
+        
+        # Compute similarity matrix
+        sim_matrix = torch.mm(features, features.t()) / self.temperature
+        
+        # Create mask for positive pairs (same class)
+        labels_expand = labels.expand(batch_size, batch_size)
+        pos_mask = labels_expand.eq(labels_expand.t()).float()
+        # Remove self-similarity
+        eye_mask = torch.eye(batch_size, device=features.device)
+        pos_mask = pos_mask - eye_mask
+        
+        # Standard supervised contrastive loss
+        # For each anchor, compute loss over positive pairs
+        exp_sim = torch.exp(sim_matrix)
+        
+        # For each anchor i, compute sum of exp(sim(i,j)) for all j
+        exp_sim_sum = exp_sim.sum(dim=1, keepdim=True) - exp_sim.diag().unsqueeze(1)
+        
+        # Compute log of probability for positive pairs
+        pos_pairs = pos_mask * exp_sim
+        pos_pairs_sum = pos_pairs.sum(dim=1, keepdim=True)
+        denominator = torch.max(exp_sim_sum, torch.ones_like(exp_sim_sum)*1e-8)
+        log_probs = torch.log(pos_pairs_sum / denominator + 1e-8)
+        
+        # Compute standard SCL loss (only for anchors with positive pairs)
+        pos_count = pos_mask.sum(dim=1)
+        scl_loss = -log_probs.sum() / (pos_count.sum() + 1e-8)
+        
+        # Compute divergence penalty for excessively similar positive pairs
+        # Find positive pairs with similarity > threshold
+        high_sim_pos = (sim_matrix > self.similarity_threshold) & (pos_mask > 0)
+        
+        # If there are high similarity pairs, compute penalty
+        if high_sim_pos.sum() > 0:
+            # Penalty is proportional to the similarity beyond the threshold
+            penalty_values = (sim_matrix - self.similarity_threshold) * high_sim_pos.float()
+            penalty = penalty_values.sum() / (high_sim_pos.sum() + 1e-8)
+        else:
+            penalty = torch.tensor(0.0, device=features.device)
+        
+        # Combine standard loss with penalty
+        total_loss = scl_loss + self.lambda_penalty * penalty
+        
+        return total_loss
+
+
+def compute_personalized_loss(output, target, model=None, reduction='mean'):
+    """Compute loss with support for personalized models.
+    
+    Args:
+        output: Model output (logits or features)
+        target: Ground truth labels
+        model: The model instance (used for regularization)
+        reduction: How to reduce the loss ('mean', 'sum', or 'none')
+        
+    Returns:
+        torch.Tensor: Computed loss
+    """
+    # Standard cross-entropy loss
+    if isinstance(output, dict):
+        if "personalized_logit" in output:
+            logits = output["personalized_logit"]
+        else:
+            logits = output["logit"] if "logit" in output else output
+    else:
+        logits = output
+        
+    loss = F.cross_entropy(logits, target, reduction=reduction)
+    
+    # Add regularization for personalized models if needed
+    if model is not None and hasattr(model, 'personalized_head'):
+        # Optional: Add regularization for personalized head
+        l2_reg = 0
+        for param in model.personalized_head.parameters():
+            l2_reg += torch.norm(param)
+        
+        # Add regularization term to loss (with small weight)
+        loss += 0.01 * l2_reg
+    
+    return loss
 
 
 def KL_u_p_loss(outputs):

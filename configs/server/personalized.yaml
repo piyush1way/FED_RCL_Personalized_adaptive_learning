@@ -1,4 +1,4 @@
-type: ServerM  # Use ServerM for momentum-based aggregation
+type: "PersonalizedServer"  # Use the new server class that supports personalization
 
 # Server optimizer configuration
 momentum: 0.9
@@ -10,3 +10,4 @@ FedACG: False
 trust_filtering:
   enable: true
   threshold: 0.5  # Minimum trust score for client updates to be included
+  min_trusted_clients: 1  # Minimum number of trusted clients required

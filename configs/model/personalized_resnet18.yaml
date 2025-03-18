@@ -1,6 +1,14 @@
-## Personalized ResNet Model ##
-name: "PersonalizedResNet18"  # Match the registered name
+# ## Personalized ResNet Model ##
+# name: "PersonalizedResNet18"  # Match the registered name
+# pretrained: False
+# l2_norm: False
+# use_bn_layer: False
+# last_feature_dim: 512
+type: "build_personalized_resnet18"  # Match the registered builder function
+name: "PersonalizedResNet18"  # Match the registered class name
+num_classes: 10  # Will be overridden by dataset config
 pretrained: False
 l2_norm: False
 use_bn_layer: False
 last_feature_dim: 512
+personalization_layers: 1  # Number of personalized layers (can be increased for deeper personalization)

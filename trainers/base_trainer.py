@@ -1,503 +1,307 @@
-from pathlib import Path
-from typing import Callable, Dict, Tuple, Union, List, Type, Any
-from argparse import Namespace
-from collections import defaultdict
-
+import copy
+import logging
+import time
+import gc
 import torch
 import torch.nn as nn
-import torch.multiprocessing as mp
-import tqdm
-import wandb
-import gc
-
-import pickle, os
 import numpy as np
+from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 
-import logging
+from utils.logging_utils import AverageMeter
+from utils.metrics import evaluate
+
 logger = logging.getLogger(__name__)
 
-import time, io, copy
-
-from trainers.build import TRAINER_REGISTRY
-from servers import Server  # Ensure Server is imported correctly
-from clients import Client
-
-from utils import DatasetSplit, DatasetSplitSubset, get_dataset
-from utils.logging_utils import AverageMeter
-
-from torch.utils.data import DataLoader
-
-from utils import terminate_processes, initalize_random_seed, save_checkpoint
-from omegaconf import DictConfig, OmegaConf
-
-from netcal.metrics import ECE
-import matplotlib.pyplot as plt
-
-
-@TRAINER_REGISTRY.register()
-class Trainer:
-    def __init__(
-        self,
-        model: nn.Module,
-        client_type: Type,
-        server: Server,  # Ensure server is of type Server
-        evaler_type: Type,
-        datasets: Dict,
-        device: torch.device,
-        args: DictConfig,
-        multiprocessing: Dict = None,
-        **kwargs,
-    ) -> None:
+class BaseTrainer:
+    """Base trainer class for federated learning experiments.
+    
+    This class provides the foundation for training models in a federated learning setup,
+    with support for personalization, adaptive learning rates, and trust-based filtering.
+    """
+    
+    def __init__(self, args):
+        """Initialize the trainer with configuration parameters.
+        
+        Args:
+            args: Configuration parameters for training
+        """
         self.args = args
-        self.device = device
+        self.device = None
+        self.model = None
+        self.optimizer = None
+        self.scheduler = None
+        self.criterion = nn.CrossEntropyLoss()
+        
+        # Personalization settings
+        personalization_config = getattr(args, "personalization", {})
+        self.enable_personalization = getattr(personalization_config, "enable", False)
+        
+        # Adaptive learning rate settings
+        adaptive_lr_config = getattr(args, "adaptive_lr", {})
+        self.enable_adaptive_lr = getattr(adaptive_lr_config, "enable", False)
+        self.adaptive_lr_beta = getattr(adaptive_lr_config, "beta", 0.1)
+        self.adaptive_lr_min = getattr(adaptive_lr_config, "min_lr", 0.001)
+        self.adaptive_lr_max = getattr(adaptive_lr_config, "max_lr", 0.1)
+        
+        # Trust filtering settings
+        trust_config = getattr(args, "trust_filtering", {})
+        self.enable_trust_filtering = getattr(trust_config, "enable", False)
+        self.trust_threshold = getattr(trust_config, "threshold", 0.5)
+        
+        # Gradient tracking for adaptive learning rate
+        self.grad_history = []
+        self.grad_variance = 0.0
+        self.previous_model_state = None
+        
+    def setup(self, model, device, optimizer=None):
+        """Set up the trainer with a model and device.
+        
+        Args:
+            model: The model to train
+            device: The device to use for training
+            optimizer: Optional optimizer (will be created if not provided)
+        """
         self.model = model
-
-        self.checkpoint_path = Path(self.args.checkpoint_path)
-        mode = self.args.split.mode
-        if self.args.split.mode == "dirichlet":
-            mode += str(self.args.split.alpha)
-        self.exp_path = self.checkpoint_path / self.args.dataset.name / mode / self.args.exp_name
-        logger.info(f"Exp path : {self.exp_path}")
-
-        ### Training config
-        trainer_args = self.args.trainer
-        self.num_clients = trainer_args.num_clients
-        self.participation_rate = trainer_args.participation_rate
-        self.global_rounds = trainer_args.global_rounds
-        self.lr = trainer_args.local_lr
-        self.local_lr_decay = trainer_args.local_lr_decay
-
-        self.clients: List[Client] = [
-            client_type(self.args, client_index=c, model=copy.deepcopy(self.model))
-            for c in range(self.args.trainer.num_clients)
-        ]
-        self.server = server  # Ensure server is correctly assigned
-
-        # Initialize global_delta if using ServerAdam
-        if hasattr(self.server, 'global_delta') and self.server.global_delta is None:
-            self.server.global_delta = {}
-
-        # Check if momentum is defined before accessing it
-        if hasattr(self.args.server, 'momentum') and self.args.server.momentum > 0:
-            self.server.set_momentum(self.model)
-
-        self.datasets = datasets
-        self.local_dataset_split_ids = get_dataset(self.args, self.datasets["train"], mode=self.args.split.mode)
-
-        test_loader = DataLoader(
-            self.datasets["test"],
-            batch_size=args.evaler.batch_size if args.evaler.batch_size > 0 else args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-        )
-        eval_device = self.device if not self.args.multiprocessing else torch.device(f"cuda:{self.args.main_gpu}")
-        eval_params = {
-            "test_loader": test_loader,
-            "device": eval_device,
-            "args": args,
-        }
-        self.eval_params = eval_params
-        self.eval_device = eval_device
-        self.evaler = evaler_type(**eval_params)
-        logger.info(f"Trainer: {self.__class__}, client: {client_type}, server: {server.__class__}, evaler: {evaler_type}")
-
-        self.start_round = 0
-        if self.args.get("load_model_path"):
-            self.load_model()
-
-    def local_update(self, device, task_queue, result_queue):
-        if self.args.multiprocessing:
-            torch.cuda.set_device(device)
-            initalize_random_seed(self.args)
-
-        while True:
-            task = task_queue.get()
-            if task is None:
-                break
-            client = self.clients[task["client_idx"]]
-
-            local_dataset = DatasetSplitSubset(
-                self.datasets["train"],
-                idxs=self.local_dataset_split_ids[task["client_idx"]],
-                subset_classes=self.args.dataset.get("subset_classes"),
+        self.device = device
+        self.model.to(self.device)
+        
+        if optimizer is None:
+            self.optimizer = torch.optim.SGD(
+                self.model.parameters(),
+                lr=self.args.lr,
+                momentum=self.args.momentum,
+                weight_decay=self.args.weight_decay
             )
-
-            setup_inputs = {
-                "state_dict": task["state_dict"],
-                "device": device,
-                "local_dataset": local_dataset,
-                "local_lr": task["local_lr"],
-                "global_epoch": task["global_epoch"],
-                "trainer": self,
-            }
-            client.setup(**setup_inputs)
-
-            # Local Training
-            local_model, local_loss_dict = client.local_train(global_epoch=task["global_epoch"])
-            result_queue.put((local_model, local_loss_dict))
-            if not self.args.multiprocessing:
-                break
-
-    def train(self) -> Dict:
-        result_queue = mp.Manager().Queue()
-
-        M = max(int(self.participation_rate * self.num_clients), 1)
-
-        if self.args.multiprocessing:
-            ngpus_per_node = torch.cuda.device_count()
-            task_queues = [mp.Queue() for _ in range(M)]
-            processes = [
-                mp.get_context("spawn").Process(
-                    target=self.local_update, args=(i % ngpus_per_node, task_queues[i], result_queue)
-                )
-                for i in range(M)
-            ]
-
-            # Start all processes
-            for p in processes:
-                p.start()
-
-        for epoch in range(self.start_round, self.global_rounds):
-            self.lr_update(epoch=epoch)
-
-            global_state_dict = copy.deepcopy(self.model.state_dict())
-            prev_model_weight = copy.deepcopy(self.model.state_dict())
-
-            # Select clients
-            if self.participation_rate < 1.0:
-                selected_client_ids = np.random.choice(range(self.num_clients), M, replace=False)
-            else:
-                selected_client_ids = range(len(self.clients))
-            logger.info(f"Global epoch {epoch}, Selected client : {selected_client_ids}")
-
-            current_lr = self.lr
-
-            local_weights = defaultdict(list)
-            local_loss_dicts = defaultdict(list)
-            local_deltas = defaultdict(list)
-
-            local_models = []
-
-            # FedACG lookahead momentum
-            if self.args.server.get("FedACG"):
-                assert self.args.server.momentum > 0
-                self.model = copy.deepcopy(self.server.FedACG_lookahead(copy.deepcopy(self.model)))
-                global_state_dict = copy.deepcopy(self.model.state_dict())
-
-            # Client-side
-            start = time.time()
-            for i, client_idx in enumerate(selected_client_ids):
-                task_queue_input = {
-                    "state_dict": self.model.state_dict(),
-                    "client_idx": client_idx,
-                    "local_lr": current_lr,
-                    "global_epoch": epoch,
-                }
-                if self.args.multiprocessing:
-                    task_queues[i].put(task_queue_input)
+        else:
+            self.optimizer = optimizer
+            
+        # Store previous model state for trust score calculation
+        if self.enable_trust_filtering:
+            self.previous_model_state = copy.deepcopy(model.state_dict())
+            
+    def train_one_epoch(self, model, train_loader, optimizer, epoch):
+        """Train the model for one epoch.
+        
+        Args:
+            model: The model to train
+            train_loader: DataLoader for training data
+            optimizer: The optimizer to use
+            epoch: Current epoch number
+            
+        Returns:
+            float: Average loss for the epoch
+        """
+        model.train()
+        losses = AverageMeter('Loss', ':.4f')
+        
+        # Calculate gradient variance from previous epoch if available
+        if self.enable_adaptive_lr:
+            grad_variance = self.calculate_gradient_variance() if len(self.grad_history) > 1 else 0.0
+            
+            # Adjust learning rate based on gradient variance
+            current_lr = self.adjust_learning_rate(optimizer, grad_variance)
+            logger.info(f"Adaptive learning rate: {current_lr:.6f} (variance: {grad_variance:.6f})")
+        
+        # Store gradients for variance calculation
+        current_gradients = []
+        
+        # Use mixed precision training if available
+        scaler = GradScaler(enabled=self.device.type == "cuda")
+        
+        start_time = time.time()
+        for batch_idx, (data, target) in enumerate(train_loader):
+            data, target = data.to(self.device), target.to(self.device)
+            optimizer.zero_grad()
+            
+            # Forward pass with mixed precision
+            with autocast(enabled=self.device.type == "cuda"):
+                if hasattr(model, 'forward') and callable(model.forward):
+                    output = model(data)
+                    
+                    # Handle different output formats
+                    if isinstance(output, dict):
+                        if self.enable_personalization and "personalized_logit" in output:
+                            logits = output["personalized_logit"]
+                        else:
+                            logits = output["logit"] if "logit" in output else output["output"]
+                    else:
+                        logits = output
+                        
+                    loss = self.criterion(logits, target)
                 else:
-                    task_queue = mp.Queue()
-                    task_queue.put(task_queue_input)
-                    self.local_update(self.device, task_queue, result_queue)
-
-                    local_state_dict, local_loss_dict = result_queue.get()
-                    for loss_key in local_loss_dict:
-                        local_loss_dicts[loss_key].append(local_loss_dict[loss_key])
-
-                    local_models.append(local_state_dict)
-
-                    for param_key in local_state_dict:
-                        local_weights[param_key].append(local_state_dict[param_key])
-                        local_deltas[param_key].append(local_state_dict[param_key] - global_state_dict[param_key])
-
-            if self.args.multiprocessing:
-                for _ in range(len(selected_client_ids)):
-                    result = result_queue.get()
-                    local_state_dict, local_loss_dict = result
-                    for loss_key in local_loss_dict:
-                        local_loss_dicts[loss_key].append(local_loss_dict[loss_key])
-
-                    local_models.append(local_state_dict)
-
-                    for param_key in local_state_dict:
-                        local_weights[param_key].append(local_state_dict[param_key])
-                        local_deltas[param_key].append(local_state_dict[param_key] - global_state_dict[param_key])
-
-            logger.info(f"Global epoch {epoch}, Train End. Total Time: {time.time() - start:.2f}s")
-
-            # Server-side
-            updated_global_state_dict = self.server.aggregate(
-                local_weights, local_deltas, selected_client_ids, copy.deepcopy(global_state_dict), current_lr
-            )
-            self.model.load_state_dict(updated_global_state_dict)
-
-            local_datasets = [
-                DatasetSplit(self.datasets["train"], idxs=self.local_dataset_split_ids[client_id])
-                for client_id in selected_client_ids
-            ]
-
-            # Logging
-            wandb_dict = {loss_key: np.mean(local_loss_dicts[loss_key]) for loss_key in local_loss_dicts}
-            wandb_dict["lr"] = self.lr
-
-            if self.args.eval.freq > 0 and epoch % self.args.eval.freq == 0:
-                self.evaluate(epoch=epoch, local_datasets=local_datasets)
-
-            if (self.args.save_freq > 0 and (epoch + 1) % self.args.save_freq == 0) or (
-                epoch + 1 == self.args.trainer.global_rounds
-            ):
-                self.save_model(epoch=epoch)
-
-            self.wandb_log(wandb_dict, step=epoch)
-            gc.collect()
-
-        if self.args.multiprocessing:
-            # Terminate Processes
-            terminate_processes(task_queues, processes)
-
-        return
-
-    def lr_update(self, epoch: int) -> None:
-        self.lr = self.args.trainer.local_lr * (self.local_lr_decay) ** (epoch)
-        return
-
-    def save_model(self, epoch: int = -1, suffix: str = "") -> None:
-        model_path = self.exp_path / self.args.output_model_path
-        if not model_path.parent.exists():
-            model_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if epoch < self.args.trainer.global_rounds - 1:
-            model_path = Path(f"{model_path}.e{epoch+1}")
-
-        if suffix:
-            model_path = Path(f"{model_path}.{suffix}")
-
-        save_checkpoint(self.model, model_path, epoch, save_torch=True, use_breakpoint=False)
-        print(f"Saved model at {model_path}")
-        return
-
-    def load_model(self) -> None:
-        if self.args.get("load_model_path"):
-            saved_dict = torch.load(self.args.load_model_path)
-            self.model.load_state_dict(saved_dict["model_state_dict"], strict=False)
-            self.start_round = saved_dict["epoch"] + 1
-            logger.warning(f"Load model from {self.args.load_model_path}, epoch {saved_dict['epoch']}")
-        return
-
-    def wandb_log(self, log: Dict, step: int = None):
-        if self.args.wandb:
-            wandb.log(log, step=step)
-
-    def validate(self, epoch: int) -> Dict:
-        return
-
-    def evaluate(self, epoch: int, local_datasets: List[torch.utils.data.Dataset] = None) -> Dict:
-        results = self.evaler.eval(model=copy.deepcopy(self.model), epoch=epoch)
-        acc = results["acc"]
-
-        wandb_dict = {
-            f"acc/{self.args.dataset.name}": acc,
-        }
-
-        logger.warning(f"[Epoch {epoch}] Test Accuracy: {acc:.2f}%")
-
-        plt.close()
-
-        self.wandb_log(wandb_dict, step=epoch)
+                    raise AttributeError("Model must have a callable forward method")
+            
+            # Backward pass with mixed precision
+            if self.device.type == "cuda":
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+            else:
+                loss.backward()
+            
+            # Store gradients for adaptive learning rate
+            if self.enable_adaptive_lr:
+                batch_grads = []
+                for param in model.parameters():
+                    if param.grad is not None:
+                        batch_grads.append(param.grad.detach().clone())
+                current_gradients.append(batch_grads)
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
+            
+            # Update weights with mixed precision
+            if self.device.type == "cuda":
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+                
+            losses.update(loss.item(), data.size(0))
+            
+        # Update gradient history for adaptive learning rate
+        if self.enable_adaptive_lr and current_gradients:
+            self.grad_history.append(current_gradients)
+            # Keep history manageable
+            if len(self.grad_history) > 10:
+                self.grad_history.pop(0)
+        
+        end_time = time.time()
+        logger.info(f"Epoch {epoch} completed in {end_time - start_time:.2f}s. Loss: {losses.avg:.4f}")
+        
+        return losses.avg
+    
+    def calculate_gradient_variance(self):
+        """Calculate variance of gradients from previous epochs.
+        
+        Returns:
+            float: Variance of gradients
+        """
+        if len(self.grad_history) < 2:
+            return 0.0
+        
+        # Calculate average gradient norm per epoch
+        epoch_norms = []
+        for epoch_grads in self.grad_history:
+            batch_norms = []
+            for batch_grads in epoch_grads:
+                if batch_grads:
+                    # Calculate Frobenius norm of all gradients in the batch
+                    batch_norm = torch.norm(torch.cat([g.flatten() for g in batch_grads if g is not None]))
+                    batch_norms.append(batch_norm.item())
+            if batch_norms:
+                epoch_norms.append(np.mean(batch_norms))
+        
+        # Calculate variance of epoch norms
+        if len(epoch_norms) > 1:
+            return np.var(epoch_norms)
+        return 0.0
+    
+    def adjust_learning_rate(self, optimizer, grad_variance):
+        """Adjust learning rate based on gradient variance.
+        
+        Args:
+            optimizer: The optimizer to adjust
+            grad_variance: Variance of gradients
+            
+        Returns:
+            float: Adjusted learning rate
+        """
+        base_lr = self.args.lr
+        adjusted_lr = base_lr / (1 + self.adaptive_lr_beta * grad_variance)
+        
+        # Ensure learning rate stays within bounds
+        adjusted_lr = max(min(adjusted_lr, self.adaptive_lr_max), self.adaptive_lr_min)
+        
+        # Update optimizer learning rate
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = adjusted_lr
+        
+        return adjusted_lr
+    
+    def compute_trust_score(self, model):
+        """Compute trust score for model updates.
+        
+        Args:
+            model: Current model state
+            
+        Returns:
+            float: Trust score between 0 and 1
+        """
+        if not self.enable_trust_filtering or self.previous_model_state is None:
+            return 1.0
+        
+        # Get current model state
+        current_state = model.state_dict()
+        
+        # Calculate update norm (L2 distance between current and previous model)
+        update_norm = 0.0
+        param_count = 0
+        
+        for key in current_state:
+            if 'personalized_head' not in key and key in self.previous_model_state:
+                diff = current_state[key] - self.previous_model_state[key]
+                update_norm += torch.norm(diff).item() ** 2
+                param_count += diff.numel()
+        
+        if param_count > 0:
+            update_norm = (update_norm / param_count) ** 0.5
+        
+        # Trust score is inversely related to update norm
+        trust_score = 1.0 / (1.0 + update_norm)
+        
+        # Update previous model state for next calculation
+        self.previous_model_state = copy.deepcopy(current_state)
+        
+        return max(0.0, min(1.0, trust_score))  # Ensure score is between 0 and 1
+    
+    def evaluate(self, model, test_loader):
+        """Evaluate the model on a test dataset.
+        
+        Args:
+            model: The model to evaluate
+            test_loader: DataLoader for test data
+            
+        Returns:
+            dict: Evaluation metrics
+        """
+        model.eval()
+        test_loss = 0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for data, target in test_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                
+                # Forward pass
+                output = model(data)
+                
+                # Handle different output formats
+                if isinstance(output, dict):
+                    if self.enable_personalization and "personalized_logit" in output:
+                        logits = output["personalized_logit"]
+                    else:
+                        logits = output["logit"] if "logit" in output else output["output"]
+                else:
+                    logits = output
+                
+                # Calculate loss
+                test_loss += self.criterion(logits, target).item()
+                
+                # Calculate accuracy
+                pred = logits.argmax(dim=1, keepdim=True)
+                correct += pred.eq(target.view_as(pred)).sum().item()
+                total += target.size(0)
+        
+        test_loss /= len(test_loader)
+        accuracy = 100. * correct / total
+        
+        logger.info(f'Test set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{total} ({accuracy:.2f}%)')
+        
         return {
-            "acc": acc,
+            'loss': test_loss,
+            'accuracy': accuracy,
+            'correct': correct,
+            'total': total
         }
-
-
-# from pathlib import Path
-# from typing import Dict, List, Type
-# import torch
-# import torch.nn as nn
-# import copy
-# import numpy as np
-# import logging
-# import time
-# import gc
-# import wandb
-# from trainers.build import TRAINER_REGISTRY
-# from servers import Server
-# from clients import Client
-# from utils import DatasetSplitSubset, get_dataset, save_checkpoint
-# from utils.logging_utils import MultiMetricLogger
-# from torch.utils.data import DataLoader
-# from omegaconf import DictConfig
-
-# logger = logging.getLogger(__name__)
-
-
-# @TRAINER_REGISTRY.register()
-# class Trainer:
-#     def __init__(
-#         self,
-#         model: nn.Module,
-#         client_type: Type,
-#         server: Server,
-#         evaler_type: Type,
-#         datasets: Dict,
-#         device: torch.device,
-#         args: DictConfig,
-#         **kwargs,
-#     ) -> None:
-#         self.args = args
-#         self.device = device
-#         self.model = model
-#         self.checkpoint_path = Path(self.args.checkpoint_path)
-#         self.exp_path = self.checkpoint_path / self.args.dataset.name / str(self.args.split.mode) / self.args.exp_name
-#         logger.info(f"Exp path : {self.exp_path}")
-
-#         # Training Config
-#         trainer_args = self.args.trainer
-#         self.num_clients = trainer_args.num_clients
-#         self.participation_rate = trainer_args.participation_rate
-#         self.global_rounds = trainer_args.global_rounds
-#         self.lr = trainer_args.local_lr
-#         self.local_lr_decay = trainer_args.local_lr_decay
-
-#         # Initialize Clients
-#         self.clients: List[Client] = [
-#             client_type(self.args, client_index=c, model=copy.deepcopy(self.model))
-#             for c in range(self.num_clients)
-#         ]
-#         self.server = server
-#         if self.args.server.momentum > 0:
-#             self.server.set_momentum(self.model)
-
-#         self.datasets = datasets
-#         self.local_dataset_split_ids = get_dataset(self.args, self.datasets["train"], mode=self.args.split.mode)
-
-#         test_loader = DataLoader(
-#             self.datasets["test"],
-#             batch_size=args.evaler.batch_size if args.evaler.batch_size > 0 else args.batch_size,
-#             shuffle=False,
-#             num_workers=args.num_workers,
-#         )
-#         self.evaler = evaler_type(test_loader=test_loader, device=self.device, args=args)
-#         self.metric_logger = MultiMetricLogger()
-
-#         self.start_round = 0
-#         if self.args.get("load_model_path"):
-#             self.load_model()
-
-#     def train(self) -> Dict:
-#         if not torch.cuda.is_available():
-#             raise RuntimeError("No GPU available. This script requires a GPU to run.")
-
-#         M = max(int(self.participation_rate * self.num_clients), 1)
-
-#         for epoch in range(self.start_round, self.global_rounds):
-#             self.lr_update(epoch=epoch)
-#             global_state_dict = copy.deepcopy(self.model.state_dict())
-
-#             # Select Clients
-#             selected_client_ids = np.random.choice(range(self.num_clients), M, replace=False) \
-#                 if self.participation_rate < 1.0 else range(len(self.clients))
-#             logger.info(f"Global epoch {epoch}, Selected clients: {selected_client_ids}")
-
-#             current_lr = self.lr
-#             local_weights, local_deltas, trust_scores = {}, {}, {}
-
-#             if self.args.server.get("FedACG"):
-#                 assert self.args.server.momentum > 0
-#                 self.model = copy.deepcopy(self.server.FedACG_lookahead(copy.deepcopy(self.model)))
-#                 global_state_dict = copy.deepcopy(self.model.state_dict())
-
-#             start_time = time.time()
-#             for client_idx in selected_client_ids:
-#                 client = self.clients[client_idx]
-#                 local_dataset = DatasetSplitSubset(
-#                     self.datasets["train"], idxs=self.local_dataset_split_ids[client_idx]
-#                 )
-
-#                 setup_inputs = {
-#                     "state_dict": global_state_dict,
-#                     "device": self.device,
-#                     "local_dataset": local_dataset,
-#                     "local_lr": current_lr,
-#                     "global_epoch": epoch,
-#                     "trainer": self,
-#                 }
-#                 client.setup(**setup_inputs)
-
-#                 # Freeze global layers, update only the personalized head
-#                 client.model.freeze_backbone()
-
-#                 # Local Training
-#                 local_state_dict, local_loss_dict = client.local_train(global_epoch=epoch)
-
-#                 # Compute Trust Score
-#                 trust_scores[client_idx] = self.compute_trust_score(local_state_dict, global_state_dict)
-
-#                 # if trust_scores[client_idx] > self.args.trainer.trust_threshold:
-#                 if trust_scores[client_idx] > getattr(self.args.trainer, "trust_threshold", 0.5):
-#                     for param_key in local_state_dict:
-#                         local_weights.setdefault(param_key, []).append(local_state_dict[param_key])
-#                         local_deltas.setdefault(param_key, []).append(local_state_dict[param_key] - global_state_dict[param_key])
-
-#             logger.info(f"Global epoch {epoch}, Train End. Time: {time.time() - start_time:.2f}s")
-
-#             # Server Aggregation (using only trusted clients)
-#             updated_global_state_dict = self.server.aggregate(
-#                 local_weights, local_deltas, [cid for cid in selected_client_ids if trust_scores[cid] > self.args.trainer.trust_threshold],
-#                 copy.deepcopy(global_state_dict), current_lr, trust_scores
-#             )
-#             self.model.load_state_dict(updated_global_state_dict, strict=False)
-#             # Evaluate and Log Metrics
-#             if self.args.eval.freq > 0 and epoch % self.args.eval.freq == 0:
-#                 self.evaluate(epoch=epoch)
-
-#             if (self.args.save_freq > 0 and (epoch + 1) % self.args.save_freq == 0) or (epoch + 1 == self.global_rounds):
-#                 self.save_model(epoch=epoch)
-
-#             gc.collect()
-
-#         return
-
-#     def compute_trust_score(self, local_state_dict, global_state_dict) -> float:
-#         """Computes a trust score based on how much local updates deviate from global updates."""
-#         norm_diff = sum(torch.norm(local_state_dict[key] - global_state_dict[key]) for key in local_state_dict)
-#         return torch.exp(-norm_diff).item()  # Higher norm difference = Lower trust
-
-#     def lr_update(self, epoch: int) -> None:
-#         """Update learning rate."""
-#         self.lr = self.args.trainer.local_lr * (self.local_lr_decay) ** epoch
-
-#     def save_model(self, epoch: int = -1, suffix: str = "") -> None:
-#         """Save model checkpoint."""
-#         model_path = self.exp_path / self.args.output_model_path
-#         model_path.parent.mkdir(parents=True, exist_ok=True)
-
-#         if epoch < self.global_rounds - 1:
-#             model_path = Path(f"{model_path}.e{epoch+1}")
-
-#         if suffix:
-#             model_path = Path(f"{model_path}.{suffix}")
-
-#         save_checkpoint(self.model, model_path, epoch, save_torch=True, use_breakpoint=False)
-#         print(f"Saved model at {model_path}")
-
-#     def load_model(self) -> None:
-#         """Load model checkpoint."""
-#         if self.args.get("load_model_path"):
-#             saved_dict = torch.load(self.args.load_model_path)
-#             self.model.load_state_dict(saved_dict["model_state_dict"], strict=False)
-#             self.start_round = saved_dict["epoch"] + 1
-#             logger.warning(f"Loaded model from {self.args.load_model_path}, epoch {saved_dict['epoch']}")
-
-#     def evaluate(self, epoch: int) -> Dict:
-#         """Evaluate global and personalized model accuracy."""
-#         results = self.evaler.eval(model=copy.deepcopy(self.model), epoch=epoch)
-#         acc_global = results["acc_global"]
-#         acc_personalized = results["acc_personalized"]
-
-#         logger.warning(f"[Epoch {epoch}] Global Accuracy: {acc_global:.2f}% | Personalized Accuracy: {acc_personalized:.2f}%")
-
-#         self.metric_logger.update("Global Accuracy", acc_global)
-#         self.metric_logger.update("Personalized Accuracy", acc_personalized)
-#         self.metric_logger.log()
-
-#         return {"acc_global": acc_global, "acc_personalized": acc_personalized}

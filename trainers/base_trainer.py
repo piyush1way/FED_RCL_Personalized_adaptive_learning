@@ -322,5 +322,85 @@ class BaseTrainer:
     
     def train(self):
         """Main training method for the federated learning process"""
-        # Implementation will depend on the specific federated learning approach
-        raise NotImplementedError("Subclasses must implement the train method")
+        logger.info("Starting federated training...")
+        
+        # Initialize clients and server
+        if self.server is None or self.client_type is None:
+            raise ValueError("Server and client_type must be provided")
+            
+        # Setup server with the model
+        self.server.setup(self.model)
+        
+        # Get training parameters
+        num_rounds = self.args.trainer.global_rounds
+        num_clients = self.args.trainer.num_clients
+        
+        # Calculate number of participating clients per round
+        if hasattr(self.args.trainer, 'participating_clients'):
+            clients_per_round = self.args.trainer.participating_clients
+        elif hasattr(self.args.trainer, 'participation_rate'):
+            clients_per_round = max(1, int(num_clients * self.args.trainer.participation_rate))
+        else:
+            clients_per_round = max(1, int(num_clients * 0.1))  # Default 10% participation
+            
+        logger.info(f"Training with {num_clients} clients, {clients_per_round} per round for {num_rounds} rounds")
+        
+        # Create client instances
+        clients = {}
+        for i in range(num_clients):
+            clients[i] = self.client_type(self.args, i, copy.deepcopy(self.model))
+            
+        # Training loop
+        for round_num in range(num_rounds):
+            logger.info(f"Round {round_num+1}/{num_rounds}")
+            
+            # Select clients for this round
+            selected_clients = self.server.select_clients(list(clients.keys()), clients_per_round)
+            logger.info(f"Selected clients: {selected_clients}")
+            
+            # Get global model state
+            global_model = self.server.get_global_model()
+            global_state = global_model.state_dict()
+            
+            # Train selected clients
+            client_models = {}
+            client_stats = {}
+            
+            for client_id in selected_clients:
+                # Setup client with global model and dataset
+                clients[client_id].setup(
+                    state_dict=global_state,
+                    device=self.device,
+                    local_dataset=self.datasets.train_data[client_id],
+                    global_epoch=round_num,
+                    local_lr=self.args.trainer.local_lr,
+                    trainer=self
+                )
+                
+                # Train client
+                client_state_dict, stats = clients[client_id].local_train(round_num)
+                
+                # Store client results if valid
+                if client_state_dict is not None:
+                    client_models[client_id] = client_state_dict
+                    client_stats[client_id] = stats
+            
+            # Aggregate client models
+            if client_models:
+                updated_state = self.server.update_global_model(client_models, client_stats=client_stats)
+                self.model.load_state_dict(updated_state)
+            else:
+                logger.warning("No valid client models returned for aggregation")
+            
+            # Evaluate global model periodically
+            if (round_num + 1) % self.args.eval.freq == 0 or round_num == num_rounds - 1:
+                eval_results = self.evaluate(self.model, DataLoader(
+                    self.datasets.test_data,
+                    batch_size=self.args.eval.batch_size,
+                    shuffle=False,
+                    num_workers=self.args.num_workers
+                ))
+                logger.info(f"Round {round_num+1} evaluation: Accuracy = {eval_results['accuracy']:.2f}%")
+        
+        logger.info("Federated training completed")
+        return self.model

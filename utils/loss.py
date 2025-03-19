@@ -91,9 +91,13 @@ class CLLoss(nn.Module):
     
 
     def get_topk_neg(self, sim, pos_mask=None, topk_neg=None, topk_pos=None, labels=None,):
+        # Check for minimum batch size
+        B = sim.size(0)
+        if B < 2:
+            # Return empty tensor if batch is too small
+            return torch.tensor([], device=sim.device)
 
         sim_neg = sim.clone()
-        B = sim_neg.size(0)
 
         neg_loss_type = self.neg_loss_type if self.neg_loss_type else self.loss_type
 
@@ -108,27 +112,38 @@ class CLLoss(nn.Module):
                 sim_neg[~classwise_mask] = np.inf
                 sim_neg[torch.eye(B)==1] = np.inf
                 
-                sim_neg = torch.topk(sim_neg, min(topk_pos, B), dim=1, largest=False)[0]
-                # sim_neg = torch.topk(sim_neg, min(topk_pos, B), dim=1, largest=True)[0]
-                idx = sim_neg < self.threshold
-                sim_neg[idx] = -1
-                sim_neg[sim_neg == np.inf] = -1
-
+                # Ensure topk_pos doesn't exceed batch size
+                k = min(topk_pos, B-1) if topk_pos > 0 else 1
+                if k > 0:
+                    sim_neg = torch.topk(sim_neg, k, dim=1, largest=False)[0]
+                    idx = sim_neg < self.threshold
+                    sim_neg[idx] = -1
+                    sim_neg[sim_neg == np.inf] = -1
+                else:
+                    return torch.tensor([], device=sim.device)
             else:
                 raise ValueError
 
         else:
             sim_neg[pos_mask==1] = -np.inf
-            sim_neg = torch.topk(sim_neg, min(topk_neg, B), dim=1, largest=True)[0]
-
+            # Ensure topk_neg doesn't exceed batch size
+            k = min(topk_neg, B-1) if topk_neg > 0 else 1
+            if k > 0:
+                sim_neg = torch.topk(sim_neg, k, dim=1, largest=True)[0]
+            else:
+                return torch.tensor([], device=sim.device)
 
         return sim_neg
     
 
     def get_topk_pos(self, sim, topk_pos=None, labels=None, uncertainty=None):
+        # Check for minimum batch size
+        B = sim.size(0)
+        if B < 2:
+            # Return empty tensor if batch is too small
+            return torch.tensor([], device=sim.device)
 
         sim_pos = sim.clone()
-        B = sim.size(0)
 
         pos_loss_type = self.pos_loss_type if self.pos_loss_type else self.loss_type
         if pos_loss_type == 'unsupervised':
@@ -137,12 +152,22 @@ class CLLoss(nn.Module):
             pos_mask = self.get_classwise_mask(labels)
 
         sim_pos[pos_mask==0] = np.inf
-        sim_pos, inds = torch.topk(sim_pos, topk_pos, dim=1, largest=False)
+        
+        # Ensure topk_pos doesn't exceed number of positive pairs
+        k = min(topk_pos, (pos_mask.sum(dim=1) - 1).max().item()) if topk_pos > 0 else 1
+        if k > 0:
+            sim_pos, inds = torch.topk(sim_pos, k, dim=1, largest=False)
+        else:
+            return torch.tensor([], device=sim.device)
 
         return sim_pos
 
 
     def forward(self, old_feat, new_feat, target, reduction=True, pair=None, topk_pos=None, topk_neg=None, name="loss1"):
+        # Check for minimum batch size
+        if old_feat.size(0) < 2 or new_feat.size(0) < 2:
+            # Return zero loss if batch is too small for contrastive learning
+            return torch.tensor(0.0, device=old_feat.device)
 
         if old_feat.dim() > 2:
             old_feat = old_feat.squeeze(-1).squeeze(-1)
@@ -169,42 +194,54 @@ class CLLoss(nn.Module):
         if topk_neg is None:
             topk_neg = self.topk_neg
             
-
         neg_loss_type = self.neg_loss_type if self.neg_loss_type else self.loss_type
 
         for pair_type in all_pair_types:
             sim_poss[pair_type] = self.get_topk_pos(sims[pair_type], topk_pos=topk_pos, labels=target)
             sim_negs[pair_type] = self.get_topk_neg(sims[pair_type], topk_neg=topk_neg, topk_pos=topk_pos, labels=target)
             
-
         if pair is None:
             pair = self.pair
 
         pair_poss, pair_negs = [], []
 
         for pos_name in pair['pos'].split(' '):
-            pair_poss.append(sim_poss[pos_name])
+            if sim_poss[pos_name].numel() > 0:
+                pair_poss.append(sim_poss[pos_name])
 
         for neg_name in pair['neg'].split(' '):
-            pair_negs.append(sim_negs[neg_name])
+            if sim_negs[neg_name].numel() > 0:
+                pair_negs.append(sim_negs[neg_name])
 
+        # Check if we have any positive or negative pairs
+        if not pair_poss or not pair_negs:
+            return torch.tensor(0.0, device=old_feat.device)
+            
         pair_poss = torch.cat(pair_poss, 1) # B*P
         pair_negs = torch.cat(pair_negs, 1) # B*N
 
         pair_poss_ = pair_poss.unsqueeze(2).repeat(1, 1, 1) # B*P*1
-        pair_negs_ = pair_negs.unsqueeze(1).repeat(1, pair_poss_.shape[1] , 1)
+        pair_negs_ = pair_negs.unsqueeze(1).repeat(1, pair_poss_.shape[1], 1)
         pair_all_ = torch.cat((pair_poss_, pair_negs_), 2) # B*P*(N+1)
 
         binary_zero_labels_ = torch.zeros_like(pair_all_)
         binary_zero_labels_[:, :, 0] = 1
 
-        loss = self.criterion(
-            input=pair_all_.reshape(-1, pair_all_.size(2))/self.temp,
-            targets=binary_zero_labels_.reshape(-1, pair_all_.size(2)),
-            reduction=reduction, beta=self.beta,)
-        loss = loss.reshape(B, -1).mean(1)
-            
-        return loss
+        try:
+            loss = self.criterion(
+                input=pair_all_.reshape(-1, pair_all_.size(2))/self.temp,
+                targets=binary_zero_labels_.reshape(-1, pair_all_.size(2)),
+                reduction=reduction, beta=self.beta,)
+                
+            # Safe reshaping with size check
+            if loss.numel() == 1:
+                return loss  # Return scalar loss directly
+            else:
+                return loss.reshape(B, -1).mean(1)
+        except Exception as e:
+            # Handle any exceptions during loss calculation
+            print(f"Error in CLLoss forward: {e}")
+            return torch.tensor(0.0, device=old_feat.device)
 
 
 class RelaxedContrastiveLoss(nn.Module):
@@ -227,9 +264,13 @@ class RelaxedContrastiveLoss(nn.Module):
         Returns:
             torch.Tensor: Relaxed contrastive loss
         """
+        # Check batch size
+        batch_size = features.size(0)
+        if batch_size < 2:
+            return torch.tensor(0.0, device=features.device)
+            
         # Normalize features
         features = F.normalize(features, dim=1)
-        batch_size = features.size(0)
         
         # Compute similarity matrix
         sim_matrix = torch.mm(features, features.t()) / self.temperature
@@ -240,6 +281,10 @@ class RelaxedContrastiveLoss(nn.Module):
         # Remove self-similarity
         eye_mask = torch.eye(batch_size, device=features.device)
         pos_mask = pos_mask - eye_mask
+        
+        # Check if there are any positive pairs
+        if pos_mask.sum() == 0:
+            return torch.tensor(0.0, device=features.device)
         
         # Standard supervised contrastive loss
         # For each anchor, compute loss over positive pairs

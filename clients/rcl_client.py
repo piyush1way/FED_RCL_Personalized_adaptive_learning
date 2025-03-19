@@ -1,5 +1,3 @@
-
-# rcl_client.py
 import copy
 import time
 import gc
@@ -115,14 +113,6 @@ class RCLClient(Client):
         train_sampler = RandomClasswiseSampler(local_dataset, num_instances=self.args.dataset.num_instances) \
             if self.args.dataset.num_instances > 0 else None
 
-        # self.loader = DataLoader(
-        #     local_dataset,
-        #     batch_size=self.args.batch_size,
-        #     sampler=train_sampler,
-        #     shuffle=train_sampler is None,
-        #     num_workers=self.args.num_workers,
-        #     pin_memory=self.device.type == "cuda"
-        # )
         # In clients/rcl_client.py, modify the DataLoader creation:
         self.loader = DataLoader(
             local_dataset,
@@ -133,7 +123,6 @@ class RCLClient(Client):
             pin_memory=False,  # Disable pin_memory for now
             drop_last=True  # Drop incomplete batches
         )
-
 
         # Apply adaptive learning rate if enabled
         if self.enable_adaptive_lr:
@@ -256,8 +245,19 @@ class RCLClient(Client):
         start_time = time.time()
         loss_meter = AverageMeter('Loss', ':.2f')
 
+        # Skip training if loader is empty
+        if self.loader is None or len(self.loader) == 0:
+            logger.warning(f"[C{self.client_index}] No data for training!")
+            return None, None
+
         for local_epoch in range(self.args.trainer.local_epochs):
+            epoch_loss = 0.0
+            samples_processed = 0
+            
             for images, labels in self.loader:
+                if len(images) == 0:
+                    continue  # Skip empty batches
+                    
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
 
@@ -269,19 +269,39 @@ class RCLClient(Client):
                     
                     # Extract logits from the output dictionary
                     if isinstance(output, dict):
-                        logits = output["logit"] if "logit" in output else output["personalized_logit"]
+                        logits = output["logit"] if "logit" in output else output.get("personalized_logit", output)
+                        features = output.get("feature", None)
                     else:
-                        logits = output  # Fallback if output is not a dictionary
+                        logits = output
+                        features = None
                     
-                    # Compute loss
-                    loss = self.criterion(logits, labels)
-
+                    # Compute cross-entropy loss
+                    ce_loss = self.criterion(logits, labels)
+                    
+                    # Compute relaxed contrastive loss if enabled
+                    rcl_loss = 0.0
+                    if hasattr(self.args.client, 'rcl_loss') and self.args.client.rcl_loss.weight > 0:
+                        for pair_name, criterion in self.rcl_criterions.items():
+                            if pair_name in self.pairs:
+                                pair = self.pairs[pair_name]
+                                if features is not None:
+                                    rcl_loss += criterion(features, features, labels) * pair.lambda_weight
+                    
+                    # Total loss
+                    loss = ce_loss + rcl_loss
+                
+                # Check if loss is valid
+                if not torch.isfinite(loss):
+                    logger.warning(f"[C{self.client_index}] Loss is {loss}, skipping batch")
+                    continue
+                    
+                # Backward and optimize
                 if self.device.type == "cuda":
                     scaler.scale(loss).backward()
                     scaler.unscale_(self.optimizer)
                 else:
                     loss.backward()
-
+                
                 # Store gradients for adaptive learning rate
                 if self.enable_adaptive_lr:
                     self.store_gradients()
@@ -295,16 +315,25 @@ class RCLClient(Client):
                 else:
                     self.optimizer.step()
 
-                loss_meter.update(loss.item(), images.size(0))
+                # Update metrics
+                batch_size = images.size(0)
+                loss_meter.update(loss.item(), batch_size)
+                epoch_loss += loss.item() * batch_size
+                samples_processed += batch_size
 
+            # Log per-epoch statistics
+            if samples_processed > 0:
+                logger.info(f"[C{self.client_index}] Epoch {local_epoch+1}/{self.args.trainer.local_epochs}, Loss: {epoch_loss/samples_processed:.4f}")
+            
             self.scheduler.step()
 
         end_time = time.time()
+        training_time = end_time - start_time
         
         # Compute trust score for client updates
         trust_score = self.compute_trust_score() if self.enable_trust_filtering else 1.0
 
-        logger.info(f"[C{self.client_index}] Training Complete. Time: {end_time - start_time:.2f}s, Loss: {loss_meter.avg:.3f}, Trust Score: {trust_score:.3f}")
+        logger.info(f"[C{self.client_index}] Training Complete. Time: {training_time:.2f}s, Loss: {loss_meter.avg:.4f}, Trust Score: {trust_score:.3f}")
 
         # Prepare model parameters for aggregation
         if self.enable_personalization:

@@ -22,39 +22,51 @@ class BaseTrainer:
     with support for personalization, adaptive learning rates, and trust-based filtering.
     """
     
-    def __init__(self, args):
-        """Initialize the trainer with configuration parameters.
-        
-        Args:
-            args: Configuration parameters for training
-        """
+    def __init__(self, model=None, client_type=None, server=None, evaler_type=None, 
+                datasets=None, device=None, args=None, config=None):
+        """Initialize the trainer with configuration parameters."""
+        self.model = model
+        self.client_type = client_type
+        self.server = server
+        self.evaler_type = evaler_type
+        self.datasets = datasets
+        self.device = device
         self.args = args
-        self.device = None
-        self.model = None
+        self.config = config
+        
         self.optimizer = None
         self.scheduler = None
         self.criterion = nn.CrossEntropyLoss()
         
         # Personalization settings
-        personalization_config = getattr(args, "personalization", {})
-        self.enable_personalization = getattr(personalization_config, "enable", False)
-        
-        # Adaptive learning rate settings
-        adaptive_lr_config = getattr(args, "adaptive_lr", {})
-        self.enable_adaptive_lr = getattr(adaptive_lr_config, "enable", False)
-        self.adaptive_lr_beta = getattr(adaptive_lr_config, "beta", 0.1)
-        self.adaptive_lr_min = getattr(adaptive_lr_config, "min_lr", 0.001)
-        self.adaptive_lr_max = getattr(adaptive_lr_config, "max_lr", 0.1)
-        
-        # Trust filtering settings
-        trust_config = getattr(args, "trust_filtering", {})
-        self.enable_trust_filtering = getattr(trust_config, "enable", False)
-        self.trust_threshold = getattr(trust_config, "threshold", 0.5)
+        if args:
+            personalization_config = getattr(args, "personalization", {})
+            self.enable_personalization = getattr(personalization_config, "enable", False)
+            
+            # Adaptive learning rate settings
+            adaptive_lr_config = getattr(args, "adaptive_lr", {})
+            self.enable_adaptive_lr = getattr(adaptive_lr_config, "enable", False)
+            self.adaptive_lr_beta = getattr(adaptive_lr_config, "beta", 0.1)
+            self.adaptive_lr_min = getattr(adaptive_lr_config, "min_lr", 0.001)
+            self.adaptive_lr_max = getattr(adaptive_lr_config, "max_lr", 0.1)
+            
+            # Trust filtering settings
+            trust_config = getattr(args, "trust_filtering", {})
+            self.enable_trust_filtering = getattr(trust_config, "enable", False)
+            self.trust_threshold = getattr(trust_config, "threshold", 0.5)
+        else:
+            self.enable_personalization = False
+            self.enable_adaptive_lr = False
+            self.enable_trust_filtering = False
         
         # Gradient tracking for adaptive learning rate
         self.grad_history = []
         self.grad_variance = 0.0
         self.previous_model_state = None
+        
+        # Initialize model if provided
+        if self.model is not None and self.device is not None:
+            self.setup(self.model, self.device)
         
     def setup(self, model, device, optimizer=None):
         """Set up the trainer with a model and device.
@@ -68,12 +80,12 @@ class BaseTrainer:
         self.device = device
         self.model.to(self.device)
         
-        if optimizer is None:
+        if optimizer is None and hasattr(self.args, 'lr'):
             self.optimizer = torch.optim.SGD(
                 self.model.parameters(),
                 lr=self.args.lr,
-                momentum=self.args.momentum,
-                weight_decay=self.args.weight_decay
+                momentum=getattr(self.args, 'momentum', 0.9),
+                weight_decay=getattr(self.args, 'weight_decay', 1e-4)
             )
         else:
             self.optimizer = optimizer
@@ -126,7 +138,7 @@ class BaseTrainer:
                         if self.enable_personalization and "personalized_logit" in output:
                             logits = output["personalized_logit"]
                         else:
-                            logits = output["logit"] if "logit" in output else output["output"]
+                            logits = output["logit"] if "logit" in output else output.get("output", output)
                     else:
                         logits = output
                         
@@ -284,7 +296,7 @@ class BaseTrainer:
                     if self.enable_personalization and "personalized_logit" in output:
                         logits = output["personalized_logit"]
                     else:
-                        logits = output["logit"] if "logit" in output else output["output"]
+                        logits = output["logit"] if "logit" in output else output.get("output", output)
                 else:
                     logits = output
                 
@@ -307,4 +319,8 @@ class BaseTrainer:
             'correct': correct,
             'total': total
         }
-
+    
+    def train(self):
+        """Main training method for the federated learning process"""
+        # Implementation will depend on the specific federated learning approach
+        raise NotImplementedError("Subclasses must implement the train method")

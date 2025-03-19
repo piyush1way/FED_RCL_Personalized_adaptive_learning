@@ -10,15 +10,15 @@ class BasicBlock(nn.Module):
     def __init__(self, in_planes, planes, stride=1, use_bn_layer=True, Conv2d=nn.Conv2d):
         super(BasicBlock, self).__init__()
         self.conv1 = Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)  # Always use BatchNorm for better performance
+        self.bn1 = nn.BatchNorm2d(planes)
         self.conv2 = Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)  # Always use BatchNorm for better performance
+        self.bn2 = nn.BatchNorm2d(planes)
 
         self.downsample = nn.Sequential()
         if stride != 1 or in_planes != self.expansion * planes:
             self.downsample = nn.Sequential(
                 Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion * planes)  # Always use BatchNorm for better performance
+                nn.BatchNorm2d(self.expansion * planes)
             )
 
     def forward(self, x: torch.Tensor, no_relu: bool = False) -> torch.Tensor:
@@ -36,17 +36,17 @@ class Bottleneck(nn.Module):
     def __init__(self, in_planes, planes, stride=1, use_bn_layer=True, Conv2d=nn.Conv2d):
         super(Bottleneck, self).__init__()
         self.conv1 = Conv2d(in_planes, planes, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)  # Always use BatchNorm for better performance
+        self.bn1 = nn.BatchNorm2d(planes)
         self.conv2 = Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)  # Always use BatchNorm for better performance
+        self.bn2 = nn.BatchNorm2d(planes)
         self.conv3 = Conv2d(planes, self.expansion * planes, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(self.expansion * planes)  # Always use BatchNorm for better performance
+        self.bn3 = nn.BatchNorm2d(self.expansion * planes)
 
         self.downsample = nn.Sequential()
         if stride != 1 or in_planes != self.expansion * planes:
             self.downsample = nn.Sequential(
                 Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion * planes)  # Always use BatchNorm for better performance
+                nn.BatchNorm2d(self.expansion * planes)
             )
 
     def forward(self, x: torch.Tensor, no_relu: bool = False) -> torch.Tensor:
@@ -69,7 +69,7 @@ class ResNet(nn.Module):
 
         Conv2d = self.get_conv()
         self.conv1 = Conv2d(3, 64, kernel_size=conv1_kernel_size, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)  # Always use BatchNorm for better performance
+        self.bn1 = nn.BatchNorm2d(64)
 
         self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1, use_bn_layer=use_bn_layer)
         self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2, use_bn_layer=use_bn_layer)
@@ -80,6 +80,9 @@ class ResNet(nn.Module):
         self.fc = nn.Linear(last_feature_dim * block.expansion, num_classes)
         
         # Initialize weights properly
+        self._initialize_weights()
+
+    def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -88,7 +91,8 @@ class ResNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out')
-                nn.init.zeros_(m.bias)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def get_conv(self):
         return nn.Conv2d
@@ -131,11 +135,32 @@ class PersonalizedResNet(ResNet):
         # Feature dimension after pooling
         self.feature_dim = last_feature_dim * block.expansion
         
-        # Create personalized head (can be multiple layers)
+        # Create personalized head with proper initialization
+        self._create_personalized_head(personalization_layers, num_classes)
+        
+        # Flag to control which head to use
+        self.use_personalized_head = True  # Default to using personalized head
+        self.frozen_layers = []
+        
+        # Projection head for contrastive learning
+        self.projection_head = nn.Sequential(
+            nn.Linear(self.feature_dim, self.feature_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.feature_dim, 128)
+        )
+        
+        # Initialize projection head
+        for m in self.projection_head.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def _create_personalized_head(self, personalization_layers, num_classes):
         if personalization_layers == 1:
             self.personalized_head = nn.Linear(self.feature_dim, num_classes)
-            # Initialize weights properly
-            nn.init.kaiming_normal_(self.personalized_head.weight, mode='fan_out')
+            # Initialize with small weights for stability
+            nn.init.normal_(self.personalized_head.weight, mean=0.0, std=0.01)
             nn.init.zeros_(self.personalized_head.bias)
         else:
             layers = []
@@ -144,23 +169,20 @@ class PersonalizedResNet(ResNet):
                     layers.append(nn.Linear(self.feature_dim, self.feature_dim))
                 else:
                     layers.append(nn.Linear(self.feature_dim, self.feature_dim))
-                layers.append(nn.ReLU())
+                layers.append(nn.ReLU(inplace=True))
+                layers.append(nn.BatchNorm1d(self.feature_dim))  # Add BN for stability
             layers.append(nn.Linear(self.feature_dim, num_classes))
             self.personalized_head = nn.Sequential(*layers)
             
-            # Initialize weights properly
+            # Initialize with small weights for stability
             for m in self.personalized_head.modules():
                 if isinstance(m, nn.Linear):
-                    nn.init.kaiming_normal_(m.weight, mode='fan_out')
+                    nn.init.normal_(m.weight, mean=0.0, std=0.01)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
-        
-        # Flag to control which head to use
-        self.use_personalized_head = True  # Default to using personalized head
-        self.frozen_layers = []
 
-    def forward(self, x, return_feature=False):
-        """Forward pass with layer-wise feature extraction"""
+    def forward(self, x, return_feature=False, get_projection=False):
+        """Forward pass with support for contrastive learning"""
         # Extract features through backbone
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.layer1(out)
@@ -172,12 +194,15 @@ class PersonalizedResNet(ResNet):
         out = F.adaptive_avg_pool2d(out, 1)
         features = out.view(out.size(0), -1)
         
-        # Apply L2 normalization if needed
+        # Apply L2 normalization if needed (only to features, not weights)
         if self.l2_norm:
             features = F.normalize(features, p=2, dim=1)
-            self.fc.weight.data = F.normalize(self.fc.weight.data, p=2, dim=1)
-            if isinstance(self.personalized_head, nn.Linear):
-                self.personalized_head.weight.data = F.normalize(self.personalized_head.weight.data, p=2, dim=1)
+        
+        # Get projection features for contrastive learning
+        projection_features = None
+        if get_projection:
+            projection_features = self.projection_head(features)
+            projection_features = F.normalize(projection_features, p=2, dim=1)
         
         # Global classification
         global_logit = self.fc(features)
@@ -197,6 +222,9 @@ class PersonalizedResNet(ResNet):
             "use_personalized": self.use_personalized_head  # Flag for debugging
         }
         
+        if projection_features is not None:
+            output_dict["projection"] = projection_features
+        
         if return_feature:
             return output_dict, {"pooled": features}
         return output_dict
@@ -204,7 +232,7 @@ class PersonalizedResNet(ResNet):
     def freeze_backbone(self):
         """Freeze all layers except the classifier"""
         for name, param in self.named_parameters():
-            if 'fc' not in name and 'personalized_head' not in name:  # fc and personalized_head are classifier layers
+            if 'fc' not in name and 'personalized_head' not in name and 'projection_head' not in name:
                 param.requires_grad = False
             else:
                 param.requires_grad = True
@@ -238,10 +266,12 @@ class PersonalizedResNet(ResNet):
                 local_params[name] = param.data.clone()
         return local_params
     
-    def setup_adaptive_freezing(self):
-        """Setup adaptive layer freezing for personalization"""
-        # Initially freeze all layers except the last one
-        self.frozen_layers = ['conv1', 'bn1', 'layer1', 'layer2', 'layer3']
+    def setup_adaptive_freezing(self, freeze_ratio=0.5):
+        """Setup adaptive layer freezing based on training progress"""
+        # Calculate how many layers to freeze based on ratio
+        all_layers = ['conv1', 'bn1', 'layer1', 'layer2', 'layer3', 'layer4']
+        num_to_freeze = int(len(all_layers) * freeze_ratio)
+        self.frozen_layers = all_layers[:num_to_freeze]
         self.freeze_layers(self.frozen_layers)
         
     def freeze_layers(self, layer_names):
@@ -252,18 +282,24 @@ class PersonalizedResNet(ResNet):
             else:
                 param.requires_grad = True
     
-    def forward_classifier(self, x):
-        """
-        Forward pass for the classifier head.
-        Args:
-            x (torch.Tensor): Input features (e.g., from the global model).
-        Returns:
-            torch.Tensor: Output logits.
-        """
-        if self.use_personalized_head:
-            return self.personalized_head(x)
-        else:
-            return self.fc(x)
+    def get_contrastive_features(self, x):
+        """Extract features for contrastive learning"""
+        # Extract features through backbone
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        
+        # Global average pooling
+        out = F.adaptive_avg_pool2d(out, 1)
+        features = out.view(out.size(0), -1)
+        
+        # Project features for contrastive learning
+        projected = self.projection_head(features)
+        projected = F.normalize(projected, p=2, dim=1)
+        
+        return projected
 
 
 @ENCODER_REGISTRY.register()

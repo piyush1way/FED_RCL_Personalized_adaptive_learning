@@ -279,3 +279,12 @@ class PersonalizedResNet18(PersonalizedResNet):
         personalization_layers = getattr(args, 'personalization_layers', 1)
         super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, 
                          personalization_layers=personalization_layers, **kwargs)
+@ENCODER_REGISTRY.register()
+class PersonalizedResNet18(PersonalizedResNet):
+    def __init__(self, args, num_classes=10, **kwargs):
+        # Extract personalization_layers from kwargs if it exists
+        personalization_layers = kwargs.pop('personalization_layers', 1)
+        
+        # Now pass it explicitly to the parent class
+        super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, 
+                         personalization_layers=personalization_layers, **kwargs)

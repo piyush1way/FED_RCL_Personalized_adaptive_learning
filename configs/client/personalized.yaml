@@ -1,120 +1,45 @@
-# type: RCLClient
-
-# # Trust filtering settings
-# trust_filtering:
-#   enable: true
-#   trust_threshold: 0.5  # Minimum trust score to be considered for aggregation
-
-# # Personalization settings
-# personalization:
-#   enable: true
-#   freeze_backbone: true  # Freeze the backbone network except the personalized head
-#   adaptive_layer_freezing: true  # Enable adaptive freezing of model layers
-
-# # Adaptive learning rate settings
-# adaptive_lr:
-#   enable: true
-#   beta: 0.9  # Momentum parameter for gradient variance calculation
-#   min_lr: 0.001  # Minimum learning rate
-#   max_lr: 0.1  # Maximum learning rate
-
-# # Client contrastive loss settings (from original FedRCL)
-# rcl_loss:
-#   temperature: 0.1
-#   pairwise_euclid: true
-#   lambda_penalty: 0.8
-#   lambda_orthogonality: 0.0
-#   pairs:
-#     - name: scl
-#       loss_type: "supervised"
-#       contrast_mode: "all"
-#       lambda_weight: 0.5
-#     - name: penalty
-#       loss_type: "ssl"
-#       contrast_mode: "all"
-#       lambda_weight: 0.5
-
-# type: "RCLClient"
-
-# # Trust filtering settings
-# trust_filtering:
-#   enable: true
-#   trust_threshold: 0.5  # Minimum trust score to be considered for aggregation
-
-# # Personalization settings
-# personalization:
-#   enable: true
-#   freeze_backbone: true  # Freeze the backbone network except the personalized head
-#   adaptive_layer_freezing: false  # Simplified to just freeze/unfreeze for stability
-
-# # Adaptive learning rate settings
-# adaptive_lr:
-#   enable: true
-#   beta: 0.1  # Factor for adaptive learning rate calculation
-#   min_lr: 0.001  # Minimum learning rate
-#   max_lr: 0.1  # Maximum learning rate
-
-# # Client contrastive loss settings (from original FedRCL)
-# rcl_loss:
-#   temperature: 0.05
-#   pairwise_euclid: true
-#   lambda_penalty: 1.0  # Increased to better prevent representation collapse
-#   lambda_orthogonality: 0.0
-#   pairs:
-#     - name: scl
-#       loss_type: "supervised"
-#       contrast_mode: "all"
-#       lambda_weight: 0.5
-#     - name: penalty
-#       loss_type: "ssl"
-#       contrast_mode: "all"
-#       lambda_weight: 0.5
-
 type: "RCLClient"
 
 # Trust filtering settings
 trust_filtering:
   enable: true
-  trust_threshold: 0.5  # Minimum trust score to be considered for aggregation
+  trust_threshold: 0.5
 
 # Personalization settings
 personalization:
   enable: true
-  freeze_backbone: true  # Freeze the backbone network except the personalized head
-  adaptive_layer_freezing: false  # Simplified to just freeze/unfreeze for stability
+  freeze_backbone: false  # Changed to false to allow backbone training in early rounds
+  adaptive_layer_freezing: true
 
-# Cyclical learning rate settings (new)
+# Cyclical learning rate settings
 cyclical_lr:
   enable: true
   base_lr: 0.001
   max_lr: 0.1
   step_size: 10  # Number of rounds for half cycle
 
-# Knowledge distillation settings (new)
+# Knowledge distillation settings
 distillation:
   enable: true
-  temperature: 2.0
-  weight: 0.5  # Weight for distillation loss
+  temperature: 3.0  # Increased from 2.0 for smoother probabilities
+  weight: 0.7  # Increased from 0.5 for stronger knowledge transfer
 
-# FedProx regularization (new)
+# FedProx regularization
 fedprox:
   enable: true
-  mu: 0.01  # Regularization strength
+  mu: 0.005  # Reduced from 0.01 for less aggressive regularization
 
-# Adaptive learning rate settings (keeping for backward compatibility)
-adaptive_lr:
-  enable: false  # Disabled in favor of cyclical LR
-  beta: 0.1
-  min_lr: 0.001
-  max_lr: 0.1
+# EWC regularization to prevent catastrophic forgetting
+ewc:
+  enable: true
+  importance: 5000
 
-# Client contrastive loss settings (from original FedRCL)
+# Client contrastive loss settings
 rcl_loss:
-  temperature: 0.1  # Increased from 0.05 for more stable gradients
-  weight: 0.1  # Weight for contrastive loss
-  pairwise_euclid: true
-  lambda_penalty: 0.05  # Reduced to prevent dominating the loss
-  lambda_orthogonality: 0.0
+  temperature: 0.2  # Increased from 0.1 for more stable gradients
+  weight: 0.1
+  lambda_penalty: 0.03  # Reduced from 0.05
+  similarity_threshold: 0.4  # Reduced from 0.5
   pairs:
     - name: scl
       loss_type: "supervised"

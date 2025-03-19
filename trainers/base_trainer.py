@@ -371,7 +371,7 @@ class BaseTrainer:
                 clients[client_id].setup(
                     state_dict=global_state,
                     device=self.device,
-                    local_dataset=self.datasets.train_data[client_id],
+                    local_dataset=self.datasets['train_data'][client_id],
                     global_epoch=round_num,
                     local_lr=self.args.trainer.local_lr,
                     trainer=self

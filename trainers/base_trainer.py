@@ -39,245 +39,61 @@ class BaseTrainer:
         self.criterion = nn.CrossEntropyLoss()
         
         # Personalization settings
-        if args:
-            personalization_config = getattr(args, "personalization", {})
+        if hasattr(args, 'client') and hasattr(args.client, 'personalization'):
+            personalization_config = args.client.personalization
             self.enable_personalization = getattr(personalization_config, "enable", False)
-            
-            # Adaptive learning rate settings
-            adaptive_lr_config = getattr(args, "adaptive_lr", {})
-            self.enable_adaptive_lr = getattr(adaptive_lr_config, "enable", False)
-            self.adaptive_lr_beta = getattr(adaptive_lr_config, "beta", 0.1)
-            self.adaptive_lr_min = getattr(adaptive_lr_config, "min_lr", 0.001)
-            self.adaptive_lr_max = getattr(adaptive_lr_config, "max_lr", 0.1)
-            
-            # Trust filtering settings
-            trust_config = getattr(args, "trust_filtering", {})
-            self.enable_trust_filtering = getattr(trust_config, "enable", False)
-            self.trust_threshold = getattr(trust_config, "threshold", 0.5)
         else:
             self.enable_personalization = False
+            
+        # Adaptive learning rate settings
+        if hasattr(args, 'client') and hasattr(args.client, 'adaptive_lr'):
+            adaptive_lr_config = args.client.adaptive_lr
+            self.enable_adaptive_lr = getattr(adaptive_lr_config, "enable", False)
+        else:
             self.enable_adaptive_lr = False
+            
+        # Trust filtering settings
+        if hasattr(args, 'client') and hasattr(args.client, 'trust_filtering'):
+            trust_config = args.client.trust_filtering
+            self.enable_trust_filtering = getattr(trust_config, "enable", False)
+        else:
             self.enable_trust_filtering = False
-        
-        # Gradient tracking for adaptive learning rate
-        self.grad_history = []
-        self.grad_variance = 0.0
-        self.previous_model_state = None
         
         # Initialize model if provided
         if self.model is not None and self.device is not None:
             self.setup(self.model, self.device)
         
     def setup(self, model, device, optimizer=None):
-        """Set up the trainer with a model and device.
-        
-        Args:
-            model: The model to train
-            device: The device to use for training
-            optimizer: Optional optimizer (will be created if not provided)
-        """
+        """Set up the trainer with a model and device."""
         self.model = model
         self.device = device
         self.model.to(self.device)
         
-        if optimizer is None and hasattr(self.args, 'lr'):
+        if optimizer is None and hasattr(self.args, 'optimizer') and hasattr(self.args.optimizer, 'lr'):
             self.optimizer = torch.optim.SGD(
                 self.model.parameters(),
-                lr=self.args.lr,
-                momentum=getattr(self.args, 'momentum', 0.9),
-                weight_decay=getattr(self.args, 'weight_decay', 1e-4)
+                lr=self.args.optimizer.lr,
+                momentum=getattr(self.args.optimizer, 'momentum', 0.9),
+                weight_decay=getattr(self.args.optimizer, 'weight_decay', 1e-4)
             )
         else:
             self.optimizer = optimizer
             
-        # Store previous model state for trust score calculation
-        if self.enable_trust_filtering:
-            self.previous_model_state = copy.deepcopy(model.state_dict())
-            
-    def train_one_epoch(self, model, train_loader, optimizer, epoch):
-        """Train the model for one epoch.
-        
-        Args:
-            model: The model to train
-            train_loader: DataLoader for training data
-            optimizer: The optimizer to use
-            epoch: Current epoch number
-            
-        Returns:
-            float: Average loss for the epoch
-        """
-        model.train()
-        losses = AverageMeter('Loss', ':.4f')
-        
-        # Calculate gradient variance from previous epoch if available
-        if self.enable_adaptive_lr:
-            grad_variance = self.calculate_gradient_variance() if len(self.grad_history) > 1 else 0.0
-            
-            # Adjust learning rate based on gradient variance
-            current_lr = self.adjust_learning_rate(optimizer, grad_variance)
-            logger.info(f"Adaptive learning rate: {current_lr:.6f} (variance: {grad_variance:.6f})")
-        
-        # Store gradients for variance calculation
-        current_gradients = []
-        
-        # Use mixed precision training if available
-        scaler = GradScaler(enabled=self.device.type == "cuda")
-        
-        start_time = time.time()
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(self.device), target.to(self.device)
-            optimizer.zero_grad()
-            
-            # Forward pass with mixed precision
-            with autocast(enabled=self.device.type == "cuda"):
-                if hasattr(model, 'forward') and callable(model.forward):
-                    output = model(data)
-                    
-                    # Handle different output formats
-                    if isinstance(output, dict):
-                        if self.enable_personalization and "personalized_logit" in output:
-                            logits = output["personalized_logit"]
-                        else:
-                            logits = output["logit"] if "logit" in output else output.get("output", output)
-                    else:
-                        logits = output
-                        
-                    loss = self.criterion(logits, target)
-                else:
-                    raise AttributeError("Model must have a callable forward method")
-            
-            # Backward pass with mixed precision
-            if self.device.type == "cuda":
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-            else:
-                loss.backward()
-            
-            # Store gradients for adaptive learning rate
-            if self.enable_adaptive_lr:
-                batch_grads = []
-                for param in model.parameters():
-                    if param.grad is not None:
-                        batch_grads.append(param.grad.detach().clone())
-                current_gradients.append(batch_grads)
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
-            
-            # Update weights with mixed precision
-            if self.device.type == "cuda":
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-                
-            losses.update(loss.item(), data.size(0))
-            
-        # Update gradient history for adaptive learning rate
-        if self.enable_adaptive_lr and current_gradients:
-            self.grad_history.append(current_gradients)
-            # Keep history manageable
-            if len(self.grad_history) > 10:
-                self.grad_history.pop(0)
-        
-        end_time = time.time()
-        logger.info(f"Epoch {epoch} completed in {end_time - start_time:.2f}s. Loss: {losses.avg:.4f}")
-        
-        return losses.avg
-    
-    def calculate_gradient_variance(self):
-        """Calculate variance of gradients from previous epochs.
-        
-        Returns:
-            float: Variance of gradients
-        """
-        if len(self.grad_history) < 2:
-            return 0.0
-        
-        # Calculate average gradient norm per epoch
-        epoch_norms = []
-        for epoch_grads in self.grad_history:
-            batch_norms = []
-            for batch_grads in epoch_grads:
-                if batch_grads:
-                    # Calculate Frobenius norm of all gradients in the batch
-                    batch_norm = torch.norm(torch.cat([g.flatten() for g in batch_grads if g is not None]))
-                    batch_norms.append(batch_norm.item())
-            if batch_norms:
-                epoch_norms.append(np.mean(batch_norms))
-        
-        # Calculate variance of epoch norms
-        if len(epoch_norms) > 1:
-            return np.var(epoch_norms)
-        return 0.0
-    
-    def adjust_learning_rate(self, optimizer, grad_variance):
-        """Adjust learning rate based on gradient variance.
-        
-        Args:
-            optimizer: The optimizer to adjust
-            grad_variance: Variance of gradients
-            
-        Returns:
-            float: Adjusted learning rate
-        """
-        base_lr = self.args.lr
-        adjusted_lr = base_lr / (1 + self.adaptive_lr_beta * grad_variance)
-        
-        # Ensure learning rate stays within bounds
-        adjusted_lr = max(min(adjusted_lr, self.adaptive_lr_max), self.adaptive_lr_min)
-        
-        # Update optimizer learning rate
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = adjusted_lr
-        
-        return adjusted_lr
-    
-    def compute_trust_score(self, model):
-        """Compute trust score for model updates.
-        
-        Args:
-            model: Current model state
-            
-        Returns:
-            float: Trust score between 0 and 1
-        """
-        if not self.enable_trust_filtering or self.previous_model_state is None:
-            return 1.0
-        
-        # Get current model state
-        current_state = model.state_dict()
-        
-        # Calculate update norm (L2 distance between current and previous model)
-        update_norm = 0.0
-        param_count = 0
-        
-        for key in current_state:
-            if 'personalized_head' not in key and key in self.previous_model_state:
-                diff = current_state[key] - self.previous_model_state[key]
-                update_norm += torch.norm(diff).item() ** 2
-                param_count += diff.numel()
-        
-        if param_count > 0:
-            update_norm = (update_norm / param_count) ** 0.5
-        
-        # Trust score is inversely related to update norm
-        trust_score = 1.0 / (1.0 + update_norm)
-        
-        # Update previous model state for next calculation
-        self.previous_model_state = copy.deepcopy(current_state)
-        
-        return max(0.0, min(1.0, trust_score))  # Ensure score is between 0 and 1
-    
     def evaluate(self, epoch):
         """Evaluate the model on the test dataset"""
         self.model.eval()
-        test_loader = DataLoader(
-            self.datasets['test'],
-            batch_size=self.args.eval.batch_size,
-            shuffle=False,
-            num_workers=self.args.num_workers
-        )
+        
+        # Create test loader
+        if isinstance(self.datasets['test'], DataLoader):
+            test_loader = self.datasets['test']
+        else:
+            test_loader = DataLoader(
+                self.datasets['test'],
+                batch_size=self.args.eval.batch_size,
+                shuffle=False,
+                num_workers=getattr(self.args, 'num_workers', 0),
+                pin_memory=True
+            )
         
         global_correct = 0
         personalized_correct = 0
@@ -290,27 +106,42 @@ class BaseTrainer:
                 # Forward pass
                 output = self.model(data)
                 
-                # Global model accuracy
-                if isinstance(output, dict) and "global_logit" in output:
-                    global_pred = output["global_logit"].argmax(dim=1)
-                    global_correct += global_pred.eq(target).sum().item()
-                
-                # Personalized model accuracy
-                if isinstance(output, dict) and "personalized_logit" in output:
-                    personalized_pred = output["personalized_logit"].argmax(dim=1)
-                    personalized_correct += personalized_pred.eq(target).sum().item()
-                elif isinstance(output, dict) and "logit" in output:
-                    pred = output["logit"].argmax(dim=1)
-                    personalized_correct += pred.eq(target).sum().item()
+                # Handle different output formats
+                if isinstance(output, dict):
+                    # Global model accuracy
+                    if "global_logit" in output:
+                        global_pred = output["global_logit"].argmax(dim=1)
+                        global_correct += global_pred.eq(target).sum().item()
+                    elif "logit" in output:
+                        global_pred = output["logit"].argmax(dim=1)
+                        global_correct += global_pred.eq(target).sum().item()
+                    else:
+                        # Fallback if no specific logits found
+                        global_pred = list(output.values())[0].argmax(dim=1)
+                        global_correct += global_pred.eq(target).sum().item()
+                    
+                    # Personalized model accuracy
+                    if "personalized_logit" in output:
+                        personalized_pred = output["personalized_logit"].argmax(dim=1)
+                        personalized_correct += personalized_pred.eq(target).sum().item()
+                    elif "logit" in output and self.enable_personalization:
+                        # If personalization is enabled, the default logit should be personalized
+                        personalized_pred = output["logit"].argmax(dim=1)
+                        personalized_correct += personalized_pred.eq(target).sum().item()
+                    else:
+                        # Fallback if no personalized logits
+                        personalized_pred = global_pred
+                        personalized_correct += personalized_pred.eq(target).sum().item()
                 else:
-                    # Fallback if no personalized logits
-                    pred = output.argmax(dim=1) if not isinstance(output, dict) else output["logit"].argmax(dim=1)
+                    # Handle case where output is not a dictionary
+                    pred = output.argmax(dim=1)
+                    global_correct += pred.eq(target).sum().item()
                     personalized_correct += pred.eq(target).sum().item()
                     
                 total += target.size(0)
         
-        global_acc = 100. * global_correct / total
-        personalized_acc = 100. * personalized_correct / total
+        global_acc = 100. * global_correct / total if total > 0 else 0
+        personalized_acc = 100. * personalized_correct / total if total > 0 else 0
         
         logger.info(f'Round {epoch} - Global Acc: {global_acc:.2f}%, Personalized Acc: {personalized_acc:.2f}%')
         
@@ -351,8 +182,8 @@ class BaseTrainer:
             clients[i] = self.client_type(self.args, i, copy.deepcopy(self.model))
             
         # Training loop
-        for round_num in range(num_rounds):
-            logger.info(f"Round {round_num+1}/{num_rounds}")
+        for round_num in range(1, num_rounds + 1):
+            logger.info(f"Round {round_num}/{num_rounds}")
             
             # Select clients for this round
             selected_clients = self.server.select_clients(list(clients.keys()), clients_per_round)
@@ -371,7 +202,7 @@ class BaseTrainer:
                 clients[client_id].setup(
                     state_dict=global_state,
                     device=self.device,
-                    local_dataset=self.datasets['train'][client_id],
+                    local_dataset=self.datasets['train'][client_id] if client_id in self.datasets['train'] else None,
                     global_epoch=round_num,
                     local_lr=self.args.trainer.local_lr,
                     trainer=self
@@ -393,9 +224,9 @@ class BaseTrainer:
                 logger.warning("No valid client models returned for aggregation")
             
             # Evaluate global model periodically
-            if (round_num + 1) % self.args.eval.freq == 0 or round_num == num_rounds - 1:
-                eval_results = self.evaluate(round_num + 1)
-                logger.info(f"Round {round_num+1} evaluation: Global Acc = {eval_results['acc']:.2f}%, Personalized Acc = {eval_results['acc_personalized']:.2f}%")
+            if round_num % self.args.eval.freq == 0 or round_num == num_rounds:
+                eval_results = self.evaluate(round_num)
+                logger.info(f"Round {round_num} evaluation: Global Acc = {eval_results['acc']:.2f}%, Personalized Acc = {eval_results['acc_personalized']:.2f}%")
         
         logger.info("Federated training completed")
         return self.model

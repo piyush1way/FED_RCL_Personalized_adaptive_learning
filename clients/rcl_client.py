@@ -51,6 +51,7 @@ class RCLClient(Client):
 
         self.model = model
         self.global_model = copy.deepcopy(model)
+        self.device = torch.device("cpu")  # Default to CPU
 
         self.rcl_criterions = {'scl': None, 'penalty': None}
         args_rcl = args.client.rcl_loss
@@ -66,26 +67,24 @@ class RCLClient(Client):
         # Add relaxed contrastive loss
         self.relaxed_contrastive_loss = RelaxedContrastiveLoss(
             temperature=0.05,
-            lambda_penalty=1.0,
+            lambda_penalty=0.1,  # Reduced from 1.0 to prevent dominating the loss
             similarity_threshold=0.7
         )
 
     def setup(self, state_dict, device, local_dataset, global_epoch, local_lr, trainer, **kwargs):
         """Initialize client model, dataset, and optimizer"""
+        # Store device for later use
+        self.device = device
+        
         # Store previous model state for trust score calculation
         if self.enable_trust_filtering and hasattr(self.model, 'state_dict'):
-            self.previous_model_state = copy.deepcopy(self.model.state_dict())
+            # Make sure previous model state is on the same device as the current model
+            self.previous_model_state = {k: v.to(device) for k, v in self.model.state_dict().items()}
         
         self._update_model(state_dict)
         self._update_global_model(state_dict)
 
-        # Ensure CUDA is available
-        if torch.cuda.is_available():
-            self.device = device
-        else:
-            logger.warning(f"Client {self.client_index}: CUDA not available, using CPU.")
-            self.device = torch.device("cpu")
-
+        # Move models to the correct device
         self.model.to(self.device)
         self.global_model.to(self.device)
 
@@ -216,9 +215,9 @@ class RCLClient(Client):
         
         for key in current_state:
             if 'personalized_head' not in key and key in self.previous_model_state:
-                # Convert tensors to float before calculating difference and norm
-                current_param = current_state[key].float()
-                prev_param = self.previous_model_state[key].float()
+                # Ensure both tensors are on the same device
+                current_param = current_state[key].to(self.device).float()
+                prev_param = self.previous_model_state[key].to(self.device).float()
                 diff = current_param - prev_param
                 update_norm += torch.norm(diff).item() ** 2
                 param_count += diff.numel()
@@ -228,6 +227,9 @@ class RCLClient(Client):
         
         # Trust score is inversely related to update norm
         trust_score = 1.0 / (1.0 + update_norm)
+        
+        # Update previous model state for next calculation
+        self.previous_model_state = {k: v.detach().clone().to(self.device) for k, v in current_state.items()}
         
         return max(0.0, min(1.0, trust_score))  # Ensure score is between 0 and 1
 
@@ -299,7 +301,8 @@ class RCLClient(Client):
                     if hasattr(self.args.client, 'rcl_loss') and self.args.client.rcl_loss.weight > 0:
                         if features is not None and len(features) >= 2:
                             # Use relaxed contrastive loss for better representation learning
-                            rcl_loss = self.relaxed_contrastive_loss(features, labels)
+                            # Scale down the contrastive loss to prevent it from dominating
+                            rcl_loss = self.relaxed_contrastive_loss(features, labels) * 0.1
                             
                             # Also use traditional contrastive loss if configured
                             for pair_name, criterion in self.rcl_criterions.items():
@@ -309,7 +312,8 @@ class RCLClient(Client):
                                         # Get weight with fallback to 1.0 if lambda_weight not present
                                         weight = getattr(pair, 'weight', 1.0)
                                         pair_loss = criterion(features, features, labels)
-                                        rcl_loss += pair_loss * weight
+                                        # Scale down the contrastive loss
+                                        rcl_loss += pair_loss * weight * 0.1
                                     except Exception as e:
                                         logger.warning(f"[C{self.client_index}] Error in contrastive loss: {e}")
                     
@@ -394,6 +398,7 @@ class RCLClient(Client):
         self.global_model = self.global_model.cpu()
 
         gc.collect()
-        torch.cuda.empty_cache()  # Clear CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # Clear CUDA cache
 
         return return_dict, {"loss": float(loss_meter.avg), "trust_score": trust_score, "grad_variance": float(self.grad_variance)}

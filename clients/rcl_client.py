@@ -35,6 +35,7 @@ class RCLClient(Client):
         self.grad_history = []
         self.grad_variance = 0.0
         self.previous_model_state = None
+        self.update_history = []
 
         # Initialize personalization settings
         personalization_config = getattr(args.client, "personalization", {})
@@ -48,33 +49,42 @@ class RCLClient(Client):
         self.adaptive_lr_beta = getattr(adaptive_lr_config, "beta", 0.1)
         self.adaptive_lr_min = getattr(adaptive_lr_config, "min_lr", 0.001)
         self.adaptive_lr_max = getattr(adaptive_lr_config, "max_lr", 0.1)
+        self.warmup_rounds = getattr(adaptive_lr_config, "warmup_rounds", 5)
+        self.rounds_trained = 0
 
         self.model = model
         self.global_model = copy.deepcopy(model)
         self.device = torch.device("cpu")  # Default to CPU
 
         self.rcl_criterions = {'scl': None, 'penalty': None}
-        args_rcl = args.client.rcl_loss
+        args_rcl = getattr(args.client, "rcl_loss", None)
+        if args_rcl:
+            self.pairs = {}
+            for pair in args_rcl.pairs:
+                self.pairs[pair.name] = pair
+                self.rcl_criterions[pair.name] = CLLoss(pair=pair, **args_rcl)
+        else:
+            self.pairs = {}
+            
         self.global_epoch = 0
-
-        self.pairs = {}
-        for pair in args_rcl.pairs:
-            self.pairs[pair.name] = pair
-            self.rcl_criterions[pair.name] = CLLoss(pair=pair, **args_rcl)
-        
         self.criterion = nn.CrossEntropyLoss()
         
-        # Add relaxed contrastive loss
+        # Add relaxed contrastive loss with more conservative parameters
         self.relaxed_contrastive_loss = RelaxedContrastiveLoss(
-            temperature=0.05,
-            lambda_penalty=0.1,  # Reduced from 1.0 to prevent dominating the loss
-            similarity_threshold=0.7
+            temperature=0.1,  # Increased from 0.05 for more stable gradients
+            lambda_penalty=0.05,  # Reduced to prevent dominating the loss
+            similarity_threshold=0.5  # Reduced from 0.7 to be less aggressive
         )
+        
+        # Track metrics for debugging
+        self.ce_loss_avg = 0.0
+        self.rcl_loss_avg = 0.0
 
     def setup(self, state_dict, device, local_dataset, global_epoch, local_lr, trainer, **kwargs):
         """Initialize client model, dataset, and optimizer"""
         # Store device for later use
         self.device = device
+        self.rounds_trained += 1
         
         # Store previous model state for trust score calculation
         if self.enable_trust_filtering and hasattr(self.model, 'state_dict'):
@@ -122,8 +132,8 @@ class RCLClient(Client):
         else:
             # Create DataLoader with proper settings
             train_sampler = RandomClasswiseSampler(local_dataset, num_instances=self.args.dataset.num_instances) \
-                if self.args.dataset.num_instances > 0 else None
-
+                if hasattr(self.args.dataset, 'num_instances') and self.args.dataset.num_instances > 0 else None
+                
             # Configure DataLoader to drop incomplete batches
             self.loader = DataLoader(
                 local_dataset,
@@ -136,11 +146,13 @@ class RCLClient(Client):
             )
 
         # Apply adaptive learning rate if enabled
-        if self.enable_adaptive_lr:
+        if self.enable_adaptive_lr and self.rounds_trained > self.warmup_rounds:
             # Adjust learning rate based on gradient variance
             adjusted_lr = self.adaptive_learning_rate(local_lr)
             logger.info(f"[C{self.client_index}] Adjusted LR: {adjusted_lr:.6f} (base: {local_lr:.6f}, variance: {self.grad_variance:.6f})")
             local_lr = adjusted_lr
+        else:
+            logger.info(f"[C{self.client_index}] Using base LR: {local_lr:.6f}")
 
         # Set up optimizer based on personalization mode
         if self.enable_personalization:
@@ -194,11 +206,15 @@ class RCLClient(Client):
         if len(self.grad_history) < 2:
             return base_lr
             
-        # Calculate adjustment factor based on gradient variance
-        lr_factor = 1.0 / (1.0 + self.adaptive_lr_beta * self.grad_variance)
+        # More conservative adjustment factor
+        lr_factor = 1.0 / (1.0 + self.adaptive_lr_beta * min(self.grad_variance, 10.0))
         
-        # Limit the adaptive range
-        adjusted_lr = base_lr * max(min(lr_factor, self.adaptive_lr_max/base_lr), self.adaptive_lr_min/base_lr)
+        # Limit the adaptive range - more conservative limits
+        adjusted_lr = base_lr * max(min(lr_factor, 1.0), 0.1)
+        
+        # Ensure LR stays within absolute bounds
+        adjusted_lr = max(min(adjusted_lr, self.adaptive_lr_max), self.adaptive_lr_min)
+        
         return adjusted_lr
 
     def compute_trust_score(self):
@@ -225,8 +241,20 @@ class RCLClient(Client):
         if param_count > 0:
             update_norm = (update_norm / param_count) ** 0.5
         
-        # Trust score is inversely related to update norm
-        trust_score = 1.0 / (1.0 + update_norm)
+        # Track update norms for variance calculation
+        self.update_history.append(update_norm)
+        if len(self.update_history) > 5:
+            self.update_history.pop(0)
+            
+        # Calculate variance of updates
+        update_variance = np.var(self.update_history) if len(self.update_history) > 1 else 0.0
+        
+        # Trust score combines magnitude and consistency
+        magnitude_score = 1.0 / (1.0 + update_norm)
+        consistency_score = 1.0 / (1.0 + update_variance)
+        
+        # Weighted combination
+        trust_score = 0.7 * magnitude_score + 0.3 * consistency_score
         
         # Update previous model state for next calculation
         self.previous_model_state = {k: v.detach().clone().to(self.device) for k, v in current_state.items()}
@@ -248,8 +276,8 @@ class RCLClient(Client):
             self.grad_history.append(grad_norm)
             
             # Keep history manageable
-            if len(self.grad_history) > 10:
-                self.grad_history = self.grad_history[-10:]
+            if len(self.grad_history) > 5:  # Reduced from 10 to be more responsive
+                self.grad_history.pop(0)
             
             # Update variance calculation
             self.grad_variance = np.var(self.grad_history) if len(self.grad_history) > 1 else 0.0
@@ -260,7 +288,9 @@ class RCLClient(Client):
 
         scaler = GradScaler(enabled=self.device.type == "cuda")  # Use AMP only if CUDA is available
         start_time = time.time()
-        loss_meter = AverageMeter('Loss', ':.2f')
+        loss_meter = AverageMeter('Loss', ':.4f')
+        ce_loss_meter = AverageMeter('CE Loss', ':.4f')
+        rcl_loss_meter = AverageMeter('RCL Loss', ':.4f')
 
         # Skip training if loader is empty
         if self.loader is None or len(self.loader) == 0:
@@ -283,42 +313,39 @@ class RCLClient(Client):
 
                 with autocast(enabled=self.device.type == "cuda"):
                     # Forward pass
-                    output = self.model(images)
+                    output = self.model(images, get_projection=True)
                     
                     # Extract logits from the output dictionary
                     if isinstance(output, dict):
                         logits = output["logit"] if "logit" in output else output.get("personalized_logit", output)
                         features = output.get("feature", None)
+                        projection = output.get("projection", None)
                     else:
                         logits = output
                         features = None
+                        projection = None
                     
                     # Compute cross-entropy loss
                     ce_loss = self.criterion(logits, labels)
                     
                     # Compute relaxed contrastive loss if enabled
                     rcl_loss = 0.0
-                    if hasattr(self.args.client, 'rcl_loss') and self.args.client.rcl_loss.weight > 0:
-                        if features is not None and len(features) >= 2:
-                            # Use relaxed contrastive loss for better representation learning
-                            # Scale down the contrastive loss to prevent it from dominating
-                            rcl_loss = self.relaxed_contrastive_loss(features, labels) * 0.1
-                            
-                            # Also use traditional contrastive loss if configured
-                            for pair_name, criterion in self.rcl_criterions.items():
-                                if pair_name in self.pairs:
-                                    pair = self.pairs[pair_name]
-                                    try:
-                                        # Get weight with fallback to 1.0 if lambda_weight not present
-                                        weight = getattr(pair, 'weight', 1.0)
-                                        pair_loss = criterion(features, features, labels)
-                                        # Scale down the contrastive loss
-                                        rcl_loss += pair_loss * weight * 0.1
-                                    except Exception as e:
-                                        logger.warning(f"[C{self.client_index}] Error in contrastive loss: {e}")
+                    if hasattr(self.args.client, 'rcl_loss') and getattr(self.args.client.rcl_loss, 'weight', 0) > 0:
+                        # Use projection features if available, otherwise use regular features
+                        contrastive_features = projection if projection is not None else features
+                        
+                        if contrastive_features is not None and len(contrastive_features) >= 2:
+                            # Apply relaxed contrastive loss with a small weight
+                            rcl_weight = getattr(self.args.client.rcl_loss, 'weight', 0.1)
+                            rcl_loss = self.relaxed_contrastive_loss(contrastive_features, labels) * rcl_weight
                     
-                    # Total loss
+                    # Total loss with proper weighting
                     loss = ce_loss + rcl_loss
+                    
+                    # Update loss meters
+                    ce_loss_meter.update(ce_loss.item(), images.size(0))
+                    if rcl_loss > 0:
+                        rcl_loss_meter.update(rcl_loss.item(), images.size(0))
                 
                 # Check if loss is valid
                 if not torch.isfinite(loss):
@@ -337,7 +364,7 @@ class RCLClient(Client):
                     self.store_gradients()
                 
                 # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)  # Reduced from 10.0
 
                 if self.device.type == "cuda":
                     scaler.step(self.optimizer)
@@ -361,6 +388,10 @@ class RCLClient(Client):
 
         end_time = time.time()
         training_time = end_time - start_time
+        
+        # Store average losses for reporting
+        self.ce_loss_avg = ce_loss_meter.avg
+        self.rcl_loss_avg = rcl_loss_meter.avg
         
         # Compute trust score for client updates
         trust_score = self.compute_trust_score() if self.enable_trust_filtering else 1.0

@@ -1,4 +1,3 @@
-# base_trainer.py
 import copy
 import logging
 import time
@@ -270,19 +269,18 @@ class BaseTrainer:
         
         return max(0.0, min(1.0, trust_score))  # Ensure score is between 0 and 1
     
-    def evaluate(self, model, test_loader):
-        """Evaluate the model on a test dataset.
+    def evaluate(self, epoch):
+        """Evaluate the model on the test dataset"""
+        self.model.eval()
+        test_loader = DataLoader(
+            self.datasets['test'],
+            batch_size=self.args.eval.batch_size,
+            shuffle=False,
+            num_workers=self.args.num_workers
+        )
         
-        Args:
-            model: The model to evaluate
-            test_loader: DataLoader for test data
-            
-        Returns:
-            dict: Evaluation metrics
-        """
-        model.eval()
-        test_loss = 0
-        correct = 0
+        global_correct = 0
+        personalized_correct = 0
         total = 0
         
         with torch.no_grad():
@@ -290,34 +288,35 @@ class BaseTrainer:
                 data, target = data.to(self.device), target.to(self.device)
                 
                 # Forward pass
-                output = model(data)
+                output = self.model(data)
                 
-                # Handle different output formats
-                if isinstance(output, dict):
-                    if self.enable_personalization and "personalized_logit" in output:
-                        logits = output["personalized_logit"]
-                    else:
-                        logits = output["logit"] if "logit" in output else output.get("output", output)
+                # Global model accuracy
+                if isinstance(output, dict) and "global_logit" in output:
+                    global_pred = output["global_logit"].argmax(dim=1)
+                    global_correct += global_pred.eq(target).sum().item()
+                
+                # Personalized model accuracy
+                if isinstance(output, dict) and "personalized_logit" in output:
+                    personalized_pred = output["personalized_logit"].argmax(dim=1)
+                    personalized_correct += personalized_pred.eq(target).sum().item()
+                elif isinstance(output, dict) and "logit" in output:
+                    pred = output["logit"].argmax(dim=1)
+                    personalized_correct += pred.eq(target).sum().item()
                 else:
-                    logits = output
-                
-                # Calculate loss
-                test_loss += self.criterion(logits, target).item()
-                
-                # Calculate accuracy
-                pred = logits.argmax(dim=1, keepdim=True)
-                correct += pred.eq(target.view_as(pred)).sum().item()
+                    # Fallback if no personalized logits
+                    pred = output.argmax(dim=1) if not isinstance(output, dict) else output["logit"].argmax(dim=1)
+                    personalized_correct += pred.eq(target).sum().item()
+                    
                 total += target.size(0)
         
-        test_loss /= len(test_loader)
-        accuracy = 100. * correct / total
+        global_acc = 100. * global_correct / total
+        personalized_acc = 100. * personalized_correct / total
         
-        logger.info(f'Test set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{total} ({accuracy:.2f}%)')
+        logger.info(f'Round {epoch} - Global Acc: {global_acc:.2f}%, Personalized Acc: {personalized_acc:.2f}%')
         
         return {
-            'loss': test_loss,
-            'accuracy': accuracy,
-            'correct': correct,
+            'acc': global_acc,
+            'acc_personalized': personalized_acc,
             'total': total
         }
     
@@ -366,7 +365,7 @@ class BaseTrainer:
             # Train selected clients
             client_models = {}
             client_stats = {}
-            # print(f"Datasets structure: {type(self.datasets)}, keys: {self.datasets.keys() if isinstance(self.datasets, dict) else dir(self.datasets)}")
+            
             for client_id in selected_clients:
                 # Setup client with global model and dataset
                 clients[client_id].setup(
@@ -395,13 +394,8 @@ class BaseTrainer:
             
             # Evaluate global model periodically
             if (round_num + 1) % self.args.eval.freq == 0 or round_num == num_rounds - 1:
-                eval_results = self.evaluate(self.model, DataLoader(
-                    self.datasets['test'],
-                    batch_size=self.args.eval.batch_size,
-                    shuffle=False,
-                    num_workers=self.args.num_workers
-                ))
-                logger.info(f"Round {round_num+1} evaluation: Accuracy = {eval_results['accuracy']:.2f}%")
+                eval_results = self.evaluate(round_num + 1)
+                logger.info(f"Round {round_num+1} evaluation: Global Acc = {eval_results['acc']:.2f}%, Personalized Acc = {eval_results['acc_personalized']:.2f}%")
         
         logger.info("Federated training completed")
         return self.model

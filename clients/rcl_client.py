@@ -10,7 +10,7 @@ from torch.cuda.amp import autocast, GradScaler
 
 import logging
 from utils import *
-from utils.loss import KL_u_p_loss
+from utils.loss import KL_u_p_loss, RelaxedContrastiveLoss
 from utils.metrics import evaluate
 from models import build_encoder
 from utils.logging_utils import AverageMeter
@@ -62,6 +62,13 @@ class RCLClient(Client):
             self.rcl_criterions[pair.name] = CLLoss(pair=pair, **args_rcl)
         
         self.criterion = nn.CrossEntropyLoss()
+        
+        # Add relaxed contrastive loss
+        self.relaxed_contrastive_loss = RelaxedContrastiveLoss(
+            temperature=0.05,
+            lambda_penalty=1.0,
+            similarity_threshold=0.7
+        )
 
     def setup(self, state_dict, device, local_dataset, global_epoch, local_lr, trainer, **kwargs):
         """Initialize client model, dataset, and optimizer"""
@@ -109,20 +116,25 @@ class RCLClient(Client):
         self.trainer = trainer
         self.global_epoch = global_epoch
 
-        # Create DataLoader
-        train_sampler = RandomClasswiseSampler(local_dataset, num_instances=self.args.dataset.num_instances) \
-            if self.args.dataset.num_instances > 0 else None
+        # Check if dataset is empty and handle gracefully
+        if local_dataset is None or len(local_dataset) == 0:
+            logger.warning(f"[C{self.client_index}] Empty dataset provided. Creating a dummy loader.")
+            self.loader = None
+        else:
+            # Create DataLoader with proper settings
+            train_sampler = RandomClasswiseSampler(local_dataset, num_instances=self.args.dataset.num_instances) \
+                if self.args.dataset.num_instances > 0 else None
 
-        # In clients/rcl_client.py, modify the DataLoader creation:
-        self.loader = DataLoader(
-            local_dataset,
-            batch_size=self.args.batch_size,
-            sampler=train_sampler,
-            shuffle=train_sampler is None,
-            num_workers=0,  # Try reducing workers to debug
-            pin_memory=False,  # Disable pin_memory for now
-            drop_last=True  # Drop incomplete batches
-        )
+            # Configure DataLoader to drop incomplete batches
+            self.loader = DataLoader(
+                local_dataset,
+                batch_size=self.args.batch_size,
+                sampler=train_sampler,
+                shuffle=train_sampler is None,
+                num_workers=0,  # Reduced workers to avoid issues
+                pin_memory=False,  # Disabled pin_memory for stability
+                drop_last=True  # Drop incomplete batches to ensure consistent sizes
+            )
 
         # Apply adaptive learning rate if enabled
         if self.enable_adaptive_lr:
@@ -255,8 +267,9 @@ class RCLClient(Client):
             samples_processed = 0
             
             for images, labels in self.loader:
-                if len(images) == 0:
-                    continue  # Skip empty batches
+                # Skip batches that are too small for contrastive learning
+                if len(images) < 2:
+                    continue
                     
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
@@ -281,11 +294,19 @@ class RCLClient(Client):
                     # Compute relaxed contrastive loss if enabled
                     rcl_loss = 0.0
                     if hasattr(self.args.client, 'rcl_loss') and self.args.client.rcl_loss.weight > 0:
-                        for pair_name, criterion in self.rcl_criterions.items():
-                            if pair_name in self.pairs:
-                                pair = self.pairs[pair_name]
-                                if features is not None:
-                                    rcl_loss += criterion(features, features, labels) * pair.lambda_weight
+                        if features is not None and len(features) >= 2:
+                            # Use relaxed contrastive loss for better representation learning
+                            rcl_loss = self.relaxed_contrastive_loss(features, labels)
+                            
+                            # Also use traditional contrastive loss if configured
+                            for pair_name, criterion in self.rcl_criterions.items():
+                                if pair_name in self.pairs:
+                                    pair = self.pairs[pair_name]
+                                    try:
+                                        pair_loss = criterion(features, features, labels)
+                                        rcl_loss += pair_loss * pair.lambda_weight
+                                    except Exception as e:
+                                        logger.warning(f"[C{self.client_index}] Error in contrastive loss: {e}")
                     
                     # Total loss
                     loss = ce_loss + rcl_loss
@@ -324,6 +345,8 @@ class RCLClient(Client):
             # Log per-epoch statistics
             if samples_processed > 0:
                 logger.info(f"[C{self.client_index}] Epoch {local_epoch+1}/{self.args.trainer.local_epochs}, Loss: {epoch_loss/samples_processed:.4f}")
+            else:
+                logger.warning(f"[C{self.client_index}] No samples processed in epoch {local_epoch+1}")
             
             self.scheduler.step()
 

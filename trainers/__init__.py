@@ -1,5 +1,4 @@
-from trainers.build import get_trainer_type
+from trainers.build import TRAINER_REGISTRY, get_trainer_type
+from trainers.base_trainer import BaseTrainer
 
-# from trainers.base_trainer import Trainer
-from trainers.base_trainer import BaseTrainer as Trainer
-
+# Register any additional trainer classes here if needed

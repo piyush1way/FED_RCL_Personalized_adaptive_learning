@@ -1,8 +1,23 @@
-type: "PersonalizedResNet18"  # Changed from "build_personalized_resnet18"
+# type: "PersonalizedResNet18"  # Changed from "build_personalized_resnet18"
+# name: "PersonalizedResNet18"
+# num_classes: 10
+# pretrained: False
+# l2_norm: False
+# use_bn_layer: False
+# last_feature_dim: 512
+# personalization_layers: 1
+type: "PersonalizedResNet18"
 name: "PersonalizedResNet18"
 num_classes: 10
 pretrained: False
-l2_norm: False
-use_bn_layer: False
+l2_norm: True  # Enable L2 normalization for features
+use_bn_layer: True  # Enable batch normalization
 last_feature_dim: 512
-personalization_layers: 1
+personalization_layers: 2  # Increased from 1 to 2 for better personalization
+
+# Projection head settings for contrastive learning
+projection_head:
+  enable: true
+  hidden_dim: 512
+  output_dim: 128
+  use_bn: true

@@ -113,14 +113,25 @@ class RCLClient(Client):
         train_sampler = RandomClasswiseSampler(local_dataset, num_instances=self.args.dataset.num_instances) \
             if self.args.dataset.num_instances > 0 else None
 
+        # self.loader = DataLoader(
+        #     local_dataset,
+        #     batch_size=self.args.batch_size,
+        #     sampler=train_sampler,
+        #     shuffle=train_sampler is None,
+        #     num_workers=self.args.num_workers,
+        #     pin_memory=self.device.type == "cuda"
+        # )
+        # In clients/rcl_client.py, modify the DataLoader creation:
         self.loader = DataLoader(
             local_dataset,
             batch_size=self.args.batch_size,
             sampler=train_sampler,
             shuffle=train_sampler is None,
-            num_workers=self.args.num_workers,
-            pin_memory=self.device.type == "cuda"
+            num_workers=0,  # Try reducing workers to debug
+            pin_memory=False,  # Disable pin_memory for now
+            drop_last=True  # Drop incomplete batches
         )
+
 
         # Apply adaptive learning rate if enabled
         if self.enable_adaptive_lr:

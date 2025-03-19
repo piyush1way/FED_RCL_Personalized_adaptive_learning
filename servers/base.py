@@ -26,6 +26,10 @@ class Server:
         # Metrics tracking
         self.trust_scores = {}
         self.round_stats = {}
+        
+        # Initialize model
+        self.model = None
+        self.global_model = None
 
     def setup(self, model):
         """Initialize server model"""
@@ -36,6 +40,7 @@ class Server:
         """Select clients for the current round"""
         if num_clients >= len(clients):
             return clients
+        
         return np.random.choice(clients, num_clients, replace=False).tolist()
 
     def aggregate(self, client_models, client_weights=None, client_stats=None):
@@ -142,21 +147,20 @@ class Server:
         # Use a default current_lr if needed
         current_lr = getattr(self.args.trainer, 'local_lr', 0.01)
         
-        # Call the aggregate method with the prepared parameters
-        aggregated_params = self.aggregate(
-            local_weights, 
-            local_deltas, 
-            client_ids, 
-            model_dict, 
-            current_lr, 
-            client_stats
-        )
+        # Aggregate client models
+        aggregated_params = self.aggregate(client_models, client_weights, client_stats)
         
         # Update global model
-        self.global_model.load_state_dict(aggregated_params)
+        global_state_dict = self.global_model.state_dict()
         
-        return aggregated_params
-
+        # Only update keys that exist in the aggregated params
+        for key in global_state_dict.keys():
+            if key in aggregated_params:
+                global_state_dict[key] = aggregated_params[key]
+        
+        self.global_model.load_state_dict(global_state_dict)
+        
+        return global_state_dict
         
     def get_global_model(self):
         """Return the current global model"""
@@ -209,6 +213,10 @@ class ServerM(Server):
         # Create aggregated weights dictionary
         avg_weights = {}
         for param_key in local_weights:
+            # Skip personalized parameters if personalization is enabled
+            if isinstance(param_key, str) and self.enable_personalization and 'personalized_head' in param_key:
+                continue
+                
             # Check if this key exists in all trusted clients' local weights
             if all(param_key in local_weights[i] for i, cid in enumerate(client_ids) if cid in trusted_clients):
                 weighted_sum = sum(
@@ -228,7 +236,7 @@ class ServerM(Server):
 
             # Update delta and momentum
             for param_key in local_deltas:
-                if self.enable_personalization and 'personalized_head' in param_key:
+                if isinstance(param_key, str) and self.enable_personalization and 'personalized_head' in param_key:
                     continue
                     
                 if all(param_key in local_deltas[i] for i, cid in enumerate(client_ids) if cid in trusted_clients):
@@ -263,6 +271,49 @@ class PersonalizedServer(ServerM):
         super(PersonalizedServer, self).__init__(args)
         self.enable_personalization = True
         
+    def update_global_model(self, client_models, client_weights=None, client_stats=None):
+        """Update global model with aggregated parameters"""
+        if not client_models:
+            logger.warning("No client models received. Global model unchanged.")
+            return self.global_model.state_dict()
+            
+        # Convert client_models to format expected by aggregate method
+        local_weights = {}
+        local_deltas = {}
+        client_ids = list(client_models.keys())
+        
+        for i, client_id in enumerate(client_ids):
+            # Create filtered dictionary with only non-personalized parameters
+            local_weights[i] = {}
+            for key, value in client_models[client_id].items():
+                # Only include parameters that don't contain 'personalized_head'
+                if 'personalized_head' not in key:
+                    local_weights[i][key] = value
+            
+            # Do the same for deltas (empty for now)
+            local_deltas[i] = {}
+            
+        # Get current model state
+        model_dict = self.global_model.state_dict()
+        
+        # Use a default current_lr if needed
+        current_lr = getattr(self.args.trainer, 'local_lr', 0.01)
+        
+        # Call the aggregate method with the prepared parameters
+        aggregated_params = self.aggregate(
+            local_weights, 
+            local_deltas, 
+            client_ids, 
+            model_dict, 
+            current_lr, 
+            client_stats
+        )
+        
+        # Update global model
+        self.global_model.load_state_dict(aggregated_params)
+        
+        return aggregated_params
+        
     def aggregate(self, local_weights, local_deltas, client_ids, model_dict, current_lr, client_metrics=None):
         """
         Personalized aggregation that only aggregates global parameters
@@ -272,15 +323,21 @@ class PersonalizedServer(ServerM):
         filtered_deltas = {}
         
         for i, client_id in enumerate(client_ids):
-            filtered_weights[i] = {
-                k: v for k, v in local_weights[i].items() 
-                if 'personalized_head' not in k
-            }
-            
-            filtered_deltas[i] = {
-                k: v for k, v in local_deltas[i].items() 
-                if 'personalized_head' not in k
-            }
+            # Check if client_id exists in local_weights
+            if i in local_weights:
+                # Create filtered dictionary with only non-personalized parameters
+                filtered_weights[i] = {}
+                for key, value in local_weights[i].items():
+                    # Only include parameters that don't contain 'personalized_head'
+                    if isinstance(key, str) and 'personalized_head' not in key:
+                        filtered_weights[i][key] = value
+                
+                # Do the same for deltas if they exist
+                if i in local_deltas:
+                    filtered_deltas[i] = {}
+                    for key, value in local_deltas[i].items():
+                        if isinstance(key, str) and 'personalized_head' not in key:
+                            filtered_deltas[i][key] = value
         
         # Call parent class aggregation with filtered parameters
         return super().aggregate(filtered_weights, filtered_deltas, client_ids, model_dict, current_lr, client_metrics)

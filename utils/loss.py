@@ -162,7 +162,6 @@ class CLLoss(nn.Module):
 
         return sim_pos
 
-
     def forward(self, old_feat, new_feat, target, reduction=True, pair=None, topk_pos=None, topk_neg=None, name="loss1"):
         # Check for minimum batch size
         if old_feat.size(0) < 2 or new_feat.size(0) < 2:
@@ -269,7 +268,7 @@ class RelaxedContrastiveLoss(nn.Module):
     Relaxed Contrastive Loss with divergence penalty for FedRCL-P.
     This loss prevents representation collapse by imposing a penalty on excessively similar pairs.
     """
-    def __init__(self, temperature=0.05, lambda_penalty=0.1, similarity_threshold=0.7):
+    def __init__(self, temperature=0.1, lambda_penalty=0.05, similarity_threshold=0.5):
         super(RelaxedContrastiveLoss, self).__init__()
         self.temperature = temperature
         self.lambda_penalty = lambda_penalty
@@ -290,7 +289,7 @@ class RelaxedContrastiveLoss(nn.Module):
         features = F.normalize(features, dim=1)
         
         # Compute similarity matrix
-        sim_matrix = torch.mm(features, features.t()) / self.temperature
+        sim_matrix = torch.mm(features, features.t())
         
         # Create mask for positive pairs (same class)
         labels_expand = labels.expand(batch_size, batch_size)
@@ -304,42 +303,50 @@ class RelaxedContrastiveLoss(nn.Module):
         if pos_mask.sum() == 0:
             return torch.tensor(0.0, device=features.device)
         
-        # Standard supervised contrastive loss
-        exp_sim = torch.exp(sim_matrix)
+        # Compute average similarity for positive pairs for adaptive threshold
+        pos_sim = torch.clamp((sim_matrix * pos_mask).sum() / (pos_mask.sum() + 1e-8), min=0.1, max=0.9)
+        adaptive_threshold = pos_sim * 0.8  # 80% of average positive similarity
+        
+        # Apply temperature scaling for loss calculation
+        sim_matrix_scaled = sim_matrix / self.temperature
+        
+        # Standard supervised contrastive loss calculation with improved numerical stability
+        exp_sim = torch.exp(sim_matrix_scaled)
         
         # For each anchor i, compute sum of exp(sim(i,j)) for all j
         exp_sim_sum = exp_sim.sum(dim=1, keepdim=True) - exp_sim.diag().unsqueeze(1)
         
-        # Compute log of probability for positive pairs
+        # Compute positive pairs with masking
         pos_pairs = pos_mask * exp_sim
-        pos_pairs_sum = pos_pairs.sum(dim=1, keepdim=True)
-        denominator = torch.max(exp_sim_sum, torch.ones_like(exp_sim_sum)*1e-8)
-        log_probs = torch.log(pos_pairs_sum / denominator + 1e-8)
+        pos_pairs_sum = torch.clamp(pos_pairs.sum(dim=1, keepdim=True), min=1e-8)
+        
+        # Safe division with clamping
+        denominator = torch.clamp(exp_sim_sum, min=1e-8)
+        log_probs = torch.log(torch.clamp(pos_pairs_sum / denominator, min=1e-8))
         
         # Compute standard SCL loss (only for anchors with positive pairs)
-        pos_count = pos_mask.sum(dim=1)
-        scl_loss = -log_probs.sum() / (pos_count.sum() + 1e-8)
+        pos_count = torch.clamp(pos_mask.sum(dim=1), min=1e-8)
+        scl_loss = -log_probs.sum() / pos_count.sum()
         
         # Compute divergence penalty for excessively similar positive pairs
-        high_sim_pos = (sim_matrix > self.similarity_threshold) & (pos_mask > 0)
+        # Use adaptive threshold based on data distribution
+        high_sim_pos = (sim_matrix > adaptive_threshold) & (pos_mask > 0)
         
         # If there are high similarity pairs, compute penalty
         if high_sim_pos.sum() > 0:
-            penalty_values = (sim_matrix - self.similarity_threshold) * high_sim_pos.float()
+            penalty_values = (sim_matrix - adaptive_threshold) * high_sim_pos.float()
             penalty = penalty_values.sum() / (high_sim_pos.sum() + 1e-8)
         else:
             penalty = torch.tensor(0.0, device=features.device)
         
-        # Combine standard loss with penalty
+        # Combine standard loss with penalty using a smaller lambda value
         total_loss = scl_loss + self.lambda_penalty * penalty
         
         # Cap the loss to prevent explosion
         if torch.isnan(total_loss) or torch.isinf(total_loss) or total_loss > 10.0:
-            return torch.tensor(1.0, device=features.device)
+            return torch.tensor(0.5, device=features.device)
             
         return total_loss
-
-
 
 
 def compute_personalized_loss(output, target, model=None, reduction='mean'):

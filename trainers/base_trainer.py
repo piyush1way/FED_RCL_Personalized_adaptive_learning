@@ -365,13 +365,13 @@ class BaseTrainer:
             # Train selected clients
             client_models = {}
             client_stats = {}
-            print(f"Datasets structure: {type(self.datasets)}, keys: {self.datasets.keys() if isinstance(self.datasets, dict) else dir(self.datasets)}")
+            # print(f"Datasets structure: {type(self.datasets)}, keys: {self.datasets.keys() if isinstance(self.datasets, dict) else dir(self.datasets)}")
             for client_id in selected_clients:
                 # Setup client with global model and dataset
                 clients[client_id].setup(
                     state_dict=global_state,
                     device=self.device,
-                    local_dataset=self.datasets['train_data'][client_id],
+                    local_dataset=self.datasets['train'][client_id],
                     global_epoch=round_num,
                     local_lr=self.args.trainer.local_lr,
                     trainer=self

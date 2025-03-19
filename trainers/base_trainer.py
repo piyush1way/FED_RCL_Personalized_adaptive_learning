@@ -365,7 +365,7 @@ class BaseTrainer:
             # Train selected clients
             client_models = {}
             client_stats = {}
-            
+            print(f"Datasets structure: {type(self.datasets)}, keys: {self.datasets.keys() if isinstance(self.datasets, dict) else dir(self.datasets)}")
             for client_id in selected_clients:
                 # Setup client with global model and dataset
                 clients[client_id].setup(

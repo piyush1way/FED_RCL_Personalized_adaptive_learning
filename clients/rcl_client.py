@@ -216,7 +216,10 @@ class RCLClient(Client):
         
         for key in current_state:
             if 'personalized_head' not in key and key in self.previous_model_state:
-                diff = current_state[key] - self.previous_model_state[key]
+                # Convert tensors to float before calculating difference and norm
+                current_param = current_state[key].float()
+                prev_param = self.previous_model_state[key].float()
+                diff = current_param - prev_param
                 update_norm += torch.norm(diff).item() ** 2
                 param_count += diff.numel()
         
@@ -303,10 +306,10 @@ class RCLClient(Client):
                                 if pair_name in self.pairs:
                                     pair = self.pairs[pair_name]
                                     try:
-                                        # Get lambda_weight with fallback to 1.0 if not present
-                                        lambda_weight = getattr(pair, 'weight', 1.0)
+                                        # Get weight with fallback to 1.0 if lambda_weight not present
+                                        weight = getattr(pair, 'weight', 1.0)
                                         pair_loss = criterion(features, features, labels)
-                                        rcl_loss += pair_loss * lambda_weight
+                                        rcl_loss += pair_loss * weight
                                     except Exception as e:
                                         logger.warning(f"[C{self.client_index}] Error in contrastive loss: {e}")
                     

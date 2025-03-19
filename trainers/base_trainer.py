@@ -307,3 +307,4 @@ class BaseTrainer:
             'correct': correct,
             'total': total
         }
+

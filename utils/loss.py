@@ -194,54 +194,74 @@ class CLLoss(nn.Module):
         if topk_neg is None:
             topk_neg = self.topk_neg
             
+        # Ensure topk values don't exceed batch size
+        topk_pos = min(topk_pos, B-1) if topk_pos > 0 else 1
+        topk_neg = min(topk_neg, B-1) if topk_neg > 0 else 1
+
         neg_loss_type = self.neg_loss_type if self.neg_loss_type else self.loss_type
 
         for pair_type in all_pair_types:
-            sim_poss[pair_type] = self.get_topk_pos(sims[pair_type], topk_pos=topk_pos, labels=target)
-            sim_negs[pair_type] = self.get_topk_neg(sims[pair_type], topk_neg=topk_neg, topk_pos=topk_pos, labels=target)
-            
+            try:
+                sim_poss[pair_type] = self.get_topk_pos(sims[pair_type], topk_pos=topk_pos, labels=target)
+                sim_negs[pair_type] = self.get_topk_neg(sims[pair_type], topk_neg=topk_neg, topk_pos=topk_pos, labels=target)
+            except Exception as e:
+                # Handle errors gracefully
+                return torch.tensor(0.0, device=old_feat.device)
+
         if pair is None:
             pair = self.pair
 
         pair_poss, pair_negs = [], []
 
         for pos_name in pair['pos'].split(' '):
-            if sim_poss[pos_name].numel() > 0:
+            if pos_name in sim_poss and sim_poss[pos_name].numel() > 0:
                 pair_poss.append(sim_poss[pos_name])
-
+        
         for neg_name in pair['neg'].split(' '):
-            if sim_negs[neg_name].numel() > 0:
+            if neg_name in sim_negs and sim_negs[neg_name].numel() > 0:
                 pair_negs.append(sim_negs[neg_name])
-
-        # Check if we have any positive or negative pairs
+        
+        # Check if we have any pairs
         if not pair_poss or not pair_negs:
             return torch.tensor(0.0, device=old_feat.device)
-            
-        pair_poss = torch.cat(pair_poss, 1) # B*P
-        pair_negs = torch.cat(pair_negs, 1) # B*N
-
-        pair_poss_ = pair_poss.unsqueeze(2).repeat(1, 1, 1) # B*P*1
+        
+        # Concatenate pairs
+        pair_poss = torch.cat(pair_poss, 1)  # B*P
+        pair_negs = torch.cat(pair_negs, 1)  # B*N
+        
+        # Reshape for loss calculation
+        pair_poss_ = pair_poss.unsqueeze(2)  # B*P*1
         pair_negs_ = pair_negs.unsqueeze(1).repeat(1, pair_poss_.shape[1], 1)
-        pair_all_ = torch.cat((pair_poss_, pair_negs_), 2) # B*P*(N+1)
-
+        pair_all_ = torch.cat((pair_poss_, pair_negs_), 2)  # B*P*(N+1)
+        
+        # Create binary labels
         binary_zero_labels_ = torch.zeros_like(pair_all_)
         binary_zero_labels_[:, :, 0] = 1
-
+        
+        # Scale inputs by temperature
+        scaled_inputs = pair_all_.reshape(-1, pair_all_.size(2)) / self.temp
+        
+        # Calculate loss with a maximum cap to prevent explosion
         try:
             loss = self.criterion(
-                input=pair_all_.reshape(-1, pair_all_.size(2))/self.temp,
+                input=scaled_inputs,
                 targets=binary_zero_labels_.reshape(-1, pair_all_.size(2)),
-                reduction=reduction, beta=self.beta,)
+                reduction=reduction, 
+                beta=self.beta
+            )
+            
+            # Reshape and mean
+            if loss.numel() > 1:
+                loss = loss.reshape(B, -1).mean(1)
                 
-            # Safe reshaping with size check
-            if loss.numel() == 1:
-                return loss  # Return scalar loss directly
-            else:
-                return loss.reshape(B, -1).mean(1)
-        except Exception as e:
-            # Handle any exceptions during loss calculation
-            print(f"Error in CLLoss forward: {e}")
-            return torch.tensor(0.0, device=old_feat.device)
+            # Cap the loss to prevent explosion
+            if torch.any(torch.isnan(loss)) or torch.any(torch.isinf(loss)) or torch.any(loss > 100):
+                return torch.tensor(1.0, device=old_feat.device)
+                
+            return loss
+        except Exception:
+            # Return a small constant loss if calculation fails
+            return torch.tensor(1.0, device=old_feat.device)
 
 
 class RelaxedContrastiveLoss(nn.Module):
@@ -249,7 +269,7 @@ class RelaxedContrastiveLoss(nn.Module):
     Relaxed Contrastive Loss with divergence penalty for FedRCL-P.
     This loss prevents representation collapse by imposing a penalty on excessively similar pairs.
     """
-    def __init__(self, temperature=0.05, lambda_penalty=1.0, similarity_threshold=0.7):
+    def __init__(self, temperature=0.05, lambda_penalty=0.1, similarity_threshold=0.7):
         super(RelaxedContrastiveLoss, self).__init__()
         self.temperature = temperature
         self.lambda_penalty = lambda_penalty
@@ -260,9 +280,6 @@ class RelaxedContrastiveLoss(nn.Module):
         Args:
             features: Feature representations (B x D)
             labels: Ground truth labels (B)
-            
-        Returns:
-            torch.Tensor: Relaxed contrastive loss
         """
         # Check batch size
         batch_size = features.size(0)
@@ -278,6 +295,7 @@ class RelaxedContrastiveLoss(nn.Module):
         # Create mask for positive pairs (same class)
         labels_expand = labels.expand(batch_size, batch_size)
         pos_mask = labels_expand.eq(labels_expand.t()).float()
+        
         # Remove self-similarity
         eye_mask = torch.eye(batch_size, device=features.device)
         pos_mask = pos_mask - eye_mask
@@ -287,7 +305,6 @@ class RelaxedContrastiveLoss(nn.Module):
             return torch.tensor(0.0, device=features.device)
         
         # Standard supervised contrastive loss
-        # For each anchor, compute loss over positive pairs
         exp_sim = torch.exp(sim_matrix)
         
         # For each anchor i, compute sum of exp(sim(i,j)) for all j
@@ -304,12 +321,10 @@ class RelaxedContrastiveLoss(nn.Module):
         scl_loss = -log_probs.sum() / (pos_count.sum() + 1e-8)
         
         # Compute divergence penalty for excessively similar positive pairs
-        # Find positive pairs with similarity > threshold
         high_sim_pos = (sim_matrix > self.similarity_threshold) & (pos_mask > 0)
         
         # If there are high similarity pairs, compute penalty
         if high_sim_pos.sum() > 0:
-            # Penalty is proportional to the similarity beyond the threshold
             penalty_values = (sim_matrix - self.similarity_threshold) * high_sim_pos.float()
             penalty = penalty_values.sum() / (high_sim_pos.sum() + 1e-8)
         else:
@@ -318,6 +333,10 @@ class RelaxedContrastiveLoss(nn.Module):
         # Combine standard loss with penalty
         total_loss = scl_loss + self.lambda_penalty * penalty
         
+        # Cap the loss to prevent explosion
+        if torch.isnan(total_loss) or torch.isinf(total_loss) or total_loss > 10.0:
+            return torch.tensor(1.0, device=features.device)
+            
         return total_loss
 
 

@@ -10,9 +10,11 @@ from torch.cuda.amp import autocast, GradScaler
 
 from utils.logging_utils import AverageMeter
 from utils.metrics import evaluate
+from trainers.build import TRAINER_REGISTRY
 
 logger = logging.getLogger(__name__)
 
+@TRAINER_REGISTRY.register()
 class BaseTrainer:
     """Base trainer class for federated learning experiments.
     

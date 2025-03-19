@@ -126,16 +126,8 @@ class PersonalizedResNet(ResNet):
             layers.append(nn.Linear(self.feature_dim, num_classes))
             self.personalized_head = nn.Sequential(*layers)
         
-        # Adaptive learning rate parameters
-        self.grad_history = []
-        self.learning_rate_scale = 1.0
-        
-        # Trust score for client filtering
-        self.update_norm = 0.0
-        self.trust_score = 1.0
-        
         # Flag to control which head to use
-        self.use_personalized_head = True
+        self.use_personalized_head = False
 
     def forward(self, x, return_feature=False):
         """Forward pass with layer-wise feature extraction"""
@@ -166,105 +158,95 @@ class PersonalizedResNet(ResNet):
         # Apply L2 normalization if needed
         if self.l2_norm:
             self.fc.weight.data = F.normalize(self.fc.weight.data, p=2, dim=1)
-            if self.use_personalized_head:
-                if isinstance(self.personalized_head, nn.Linear):
-                    self.personalized_head.weight.data = F.normalize(self.personalized_head.weight.data, p=2, dim=1)
+            if isinstance(self.personalized_head, nn.Linear):
+                self.personalized_head.weight.data = F.normalize(self.personalized_head.weight.data, p=2, dim=1)
             out = F.normalize(out, dim=1)
         
-        # Choose between global and personalized head
-        if self.use_personalized_head:
-            logit = self.personalized_head(out)
-        else:
-            logit = self.fc(out)
+        # Global classification
+        global_logit = self.fc(out)
+        
+        # Personalized classification
+        personalized_logit = self.personalized_head(out)
+        
+        # Choose which logit to use as the default based on personalization flag
+        default_logit = personalized_logit if self.use_personalized_head else global_logit
+        
+        # Return a dictionary with all outputs
+        output_dict = {
+            "feature": out,  # Feature representation
+            "global_logit": global_logit,  # Global logits
+            "personalized_logit": personalized_logit,  # Personalized logits
+            "logit": default_logit,  # Default logit based on current mode
+            "use_personalized": self.use_personalized_head  # Flag for debugging
+        }
         
         if return_feature:
-            return features, logit
-        return logit
+            return output_dict, features
+        return output_dict
     
+    def freeze_backbone(self):
+        """Freeze all layers except the classifier"""
+        for name, param in self.named_parameters():
+            if 'fc' not in name and 'personalized_head' not in name:  # fc and personalized_head are classifier layers
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+
+    def unfreeze_backbone(self):
+        """Unfreeze all layers"""
+        for param in self.parameters():
+            param.requires_grad = True
+    
+    def enable_personalized_mode(self):
+        """Enable using the personalized head instead of the global head"""
+        self.use_personalized_head = True
+        
+    def disable_personalized_mode(self):
+        """Disable using the personalized head, revert to global head"""
+        self.use_personalized_head = False
+        
     def get_global_params(self):
-        """Return only global parameters for aggregation"""
+        """Get parameters that should be shared globally"""
         global_params = {}
         for name, param in self.named_parameters():
-            if 'personalized_head' not in name:
+            if 'personalized_head' not in name:  # Everything except personalized head
                 global_params[name] = param.data.clone()
         return global_params
     
     def get_local_params(self):
-        """Return only personalized parameters"""
+        """Get parameters that should be kept local to the client"""
         local_params = {}
         for name, param in self.named_parameters():
-            if 'personalized_head' in name:
+            if 'personalized_head' in name:  # Only personalized head
                 local_params[name] = param.data.clone()
         return local_params
     
-    def update_global_params(self, global_params):
-        """Update only global parameters"""
+    def setup_adaptive_freezing(self):
+        """Setup adaptive layer freezing for personalization"""
+        # Initially freeze all layers except the last one
+        self.frozen_layers = ['conv1', 'bn1', 'layer1', 'layer2', 'layer3']
+        self.freeze_layers(self.frozen_layers)
+        
+    def freeze_layers(self, layer_names):
+        """Freeze specific layers by name"""
         for name, param in self.named_parameters():
-            if name in global_params:
-                param.data.copy_(global_params[name])
-    
-    def compute_trust_score(self, prev_model=None):
-        """Compute trust score based on update consistency"""
-        if prev_model is None:
-            return 1.0
-            
-        # Calculate update norm
-        update_norm = 0.0
-        total_params = 0
-        
-        for name, param in self.named_parameters():
-            if 'personalized_head' not in name and name in prev_model:
-                diff = param.data - prev_model[name]
-                update_norm += torch.norm(diff).item() ** 2
-                total_params += diff.numel()
-        
-        if total_params > 0:
-            update_norm = (update_norm / total_params) ** 0.5
-            
-        self.update_norm = update_norm
-        
-        # Trust score is inversely related to update norm
-        # Normalize it to be between 0 and 1
-        self.trust_score = 1.0 / (1.0 + update_norm)
-        
-        return self.trust_score
-    
-    def update_learning_rate_scale(self, grad_variance=None):
-        """Update learning rate scale based on gradient variance"""
-        if grad_variance is None:
-            # Calculate gradient variance from history
-            if len(self.grad_history) > 1:
-                # Flatten all gradients
-                flat_grads = []
-                for grads in self.grad_history:
-                    flat_grad = torch.cat([g.flatten() for g in grads if g is not None])
-                    flat_grads.append(flat_grad)
-                
-                # Calculate variance
-                stacked_grads = torch.stack(flat_grads)
-                grad_variance = torch.var(stacked_grads, dim=0).mean().item()
+            if any(layer in name for layer in layer_names):
+                param.requires_grad = False
             else:
-                grad_variance = 0.0
-        
-        # Update learning rate scale
-        self.learning_rate_scale = 1.0 / (1.0 + grad_variance)
-        
-        return self.learning_rate_scale
+                param.requires_grad = True
     
-    def store_gradient(self):
-        """Store current gradients for variance calculation"""
-        current_grads = []
-        for param in self.parameters():
-            if param.grad is not None:
-                current_grads.append(param.grad.detach().clone())
-            else:
-                current_grads.append(None)
-        
-        self.grad_history.append(current_grads)
-        
-        # Keep only recent history
-        if len(self.grad_history) > 5:
-            self.grad_history.pop(0)
+    def forward_classifier(self, x):
+        """
+        Forward pass for the classifier head.
+        Args:
+            x (torch.Tensor): Input features (e.g., from the global model).
+        Returns:
+            torch.Tensor: Output logits.
+        """
+        if self.use_personalized_head:
+            return self.personalized_head(x)
+        else:
+            return self.fc(x)
 
 
 @ENCODER_REGISTRY.register()

@@ -334,7 +334,7 @@ def main(args: DictConfig) -> None:
     # Build datasets with balanced subset sharing if enabled
     if hasattr(args.split, 'share_balanced_subset') and args.split.share_balanced_subset:
         logger.info(f" Creating balanced subset to share across clients")
-        datasets = build_datasets(args, create_balanced_subset=True)
+        datasets = build_datasets(args)
     else:
         datasets = build_datasets(args)
     

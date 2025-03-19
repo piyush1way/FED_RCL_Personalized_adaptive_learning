@@ -7,18 +7,18 @@ from models.build import ENCODER_REGISTRY
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, in_planes, planes, stride=1, use_bn_layer=False, Conv2d=nn.Conv2d):
+    def __init__(self, in_planes, planes, stride=1, use_bn_layer=True, Conv2d=nn.Conv2d):
         super(BasicBlock, self).__init__()
         self.conv1 = Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)  # Changed to BatchNorm for better performance
+        self.bn1 = nn.BatchNorm2d(planes)  # Always use BatchNorm for better performance
         self.conv2 = Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)  # Changed to BatchNorm for better performance
+        self.bn2 = nn.BatchNorm2d(planes)  # Always use BatchNorm for better performance
 
         self.downsample = nn.Sequential()
         if stride != 1 or in_planes != self.expansion * planes:
             self.downsample = nn.Sequential(
                 Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion * planes)  # Changed to BatchNorm for better performance
+                nn.BatchNorm2d(self.expansion * planes)  # Always use BatchNorm for better performance
             )
 
     def forward(self, x: torch.Tensor, no_relu: bool = False) -> torch.Tensor:
@@ -33,20 +33,20 @@ class BasicBlock(nn.Module):
 class Bottleneck(nn.Module):
     expansion = 4
 
-    def __init__(self, in_planes, planes, stride=1, use_bn_layer=False, Conv2d=nn.Conv2d):
+    def __init__(self, in_planes, planes, stride=1, use_bn_layer=True, Conv2d=nn.Conv2d):
         super(Bottleneck, self).__init__()
         self.conv1 = Conv2d(in_planes, planes, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)  # Changed to BatchNorm for better performance
+        self.bn1 = nn.BatchNorm2d(planes)  # Always use BatchNorm for better performance
         self.conv2 = Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)  # Changed to BatchNorm for better performance
+        self.bn2 = nn.BatchNorm2d(planes)  # Always use BatchNorm for better performance
         self.conv3 = Conv2d(planes, self.expansion * planes, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(self.expansion * planes)  # Changed to BatchNorm for better performance
+        self.bn3 = nn.BatchNorm2d(self.expansion * planes)  # Always use BatchNorm for better performance
 
         self.downsample = nn.Sequential()
         if stride != 1 or in_planes != self.expansion * planes:
             self.downsample = nn.Sequential(
                 Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion * planes)  # Changed to BatchNorm for better performance
+                nn.BatchNorm2d(self.expansion * planes)  # Always use BatchNorm for better performance
             )
 
     def forward(self, x: torch.Tensor, no_relu: bool = False) -> torch.Tensor:
@@ -69,7 +69,7 @@ class ResNet(nn.Module):
 
         Conv2d = self.get_conv()
         self.conv1 = Conv2d(3, 64, kernel_size=conv1_kernel_size, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)  # Changed to BatchNorm for better performance
+        self.bn1 = nn.BatchNorm2d(64)  # Always use BatchNorm for better performance
 
         self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1, use_bn_layer=use_bn_layer)
         self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2, use_bn_layer=use_bn_layer)
@@ -86,6 +86,9 @@ class ResNet(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out')
+                nn.init.zeros_(m.bias)
 
     def get_conv(self):
         return nn.Conv2d
@@ -153,7 +156,7 @@ class PersonalizedResNet(ResNet):
                         nn.init.zeros_(m.bias)
         
         # Flag to control which head to use
-        self.use_personalized_head = False
+        self.use_personalized_head = True  # Default to using personalized head
         self.frozen_layers = []
 
     def forward(self, x, return_feature=False):

@@ -21,27 +21,20 @@ if "PersonalizedResNet18" not in ENCODER_REGISTRY._obj_map:
     ENCODER_REGISTRY.register(PersonalizedResNet18)
 
 def build_encoder(args):
-    """
-    Builds an encoder model based on the provided arguments.
-
-    Args:
-        args: Configuration arguments for model selection.
-
-    Returns:
-        An instance of the selected encoder model.
-    """
+    # Get the number of classes from the dataset configuration
     num_classes = get_numclasses(args)
-
-    if args.verbose:
-        print(ENCODER_REGISTRY)
-
-    print(f"=> Creating model '{args.model.name}, pretrained={args.model.pretrained}'")
-
-    # Ensure model exists in the registry before fetching it
-    if args.model.name not in ENCODER_REGISTRY._obj_map:
-        raise KeyError(
-            f"Model '{args.model.name}' not found in ENCODER_REGISTRY. Available models: {list(ENCODER_REGISTRY._obj_map.keys())}"
-        )
-
-    encoder_class = ENCODER_REGISTRY.get(args.model.name)
-    return encoder_class(args, num_classes, **args.model)
+    
+    # Get the encoder class from the registry
+    encoder_type = args.model.get('type', args.model.name)
+    encoder_class = ENCODER_REGISTRY.get(encoder_type)
+    
+    if encoder_class is None:
+        raise ValueError(f"Unknown encoder type: {encoder_type}")
+    
+    # Create a copy of the model args and remove 'num_classes' if it exists
+    model_args = dict(args.model)
+    if 'num_classes' in model_args:
+        del model_args['num_classes']
+    
+    # Pass num_classes as a separate argument to avoid duplication
+    return encoder_class(args, num_classes=num_classes, **model_args)

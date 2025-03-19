@@ -1,3 +1,63 @@
+# #################### Default Setup ####################
+# wandb: False
+# seed: 0
+# enable_benchmark: True
+# use_amp: True
+# multiprocessing: False
+# main_gpu: '0'
+# num_workers: 2
+# pin_memory: True
+# refactoring: True
+# verbose: False
+# remark: "personalized"
+
+# checkpoint_path: './checkpoints'
+# exp_name: "FedRCL-P"
+# output_model_path: 'fedrcl_p_model.pt'
+# save_freq: 10
+# batch_size: 64
+# save_test: True
+
+# ## Resume options
+# load_model_path: False
+# wandb_resume_id: False
+
+# ###### wandb && logging ######
+# project: "FedRCL-Personalized"
+# log_dir: './checkpoints'
+
+# #################### Data Split ####################
+# split:
+#   mode: 'dirichlet'  # Options: 'iid', 'dirichlet', 'skew'
+#   alpha: 0.3  # Lower alpha = more non-IID
+#   class_per_client: 0  # Only for skew mode
+#   unbalanced: False
+#   overlap_ratio: 0.0
+#   create_client_dataset: False
+
+# #################### Optimizer ####################
+# optimizer:
+#   name: sgd
+#   momentum: 0.9
+#   wd: 1e-4
+
+# #################### Eval ####################
+# eval:
+#   freq: 5  # Evaluate every 5 rounds
+#   batch_size: 128
+
+# analysis: True  # Enable analysis to track personalization benefits
+
+# #################### Default Configurations ####################
+# defaults:
+#   - _self_
+#   - trainer: personalized
+#   - client: personalized
+#   - evaler: base
+#   - dataset: cifar100
+#   - server: personalized
+#   - model: personalized_resnet18
+
 #################### Default Setup ####################
 wandb: False
 seed: 0
@@ -45,6 +105,30 @@ optimizer:
 eval:
   freq: 5  # Evaluate every 5 rounds
   batch_size: 128
+
+#################### Personalization Settings ####################
+personalization:
+  enable: true
+  freeze_backbone: true
+  adaptive_layer_freezing: false
+  
+#################### Cyclical Learning Rate ####################
+cyclical_lr:
+  enable: true
+  base_lr: 0.001
+  max_lr: 0.1
+  step_size: 10  # Number of rounds for half cycle
+
+#################### Knowledge Distillation ####################
+distillation:
+  enable: true
+  temperature: 2.0
+  weight: 0.5
+
+#################### FedProx Regularization ####################
+fedprox:
+  enable: true
+  mu: 0.01
 
 analysis: True  # Enable analysis to track personalization benefits
 

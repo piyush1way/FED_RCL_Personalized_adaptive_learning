@@ -33,15 +33,21 @@ feature_align_loss:
   weight: 0
   align_type: cosine
 
-# Add trust filtering configuration
+# Trust filtering configuration
 trust_filtering:
-  enable: True
+  enable: true
   trust_threshold: 0.5
 
 # Personalization configuration
 personalization:
-  enable: True
-  freeze_backbone: True
-  adaptive_layer_freezing: True
+  enable: true
+  freeze_backbone: true
+  adaptive_layer_freezing: true
   trust_threshold: 0.5
-      
+
+# Adaptive learning rate configuration
+adaptive_lr:
+  enable: true
+  beta: 0.1  # Factor for adaptive learning rate calculation
+  min_lr: 0.001  # Minimum learning rate
+  max_lr: 0.1  # Maximum learning rate

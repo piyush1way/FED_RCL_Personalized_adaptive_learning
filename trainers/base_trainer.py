@@ -396,7 +396,7 @@ class BaseTrainer:
             # Evaluate global model periodically
             if (round_num + 1) % self.args.eval.freq == 0 or round_num == num_rounds - 1:
                 eval_results = self.evaluate(self.model, DataLoader(
-                    self.datasets.test_data,
+                    self.datasets['test'],
                     batch_size=self.args.eval.batch_size,
                     shuffle=False,
                     num_workers=self.args.num_workers

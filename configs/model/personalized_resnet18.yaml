@@ -1,60 +1,14 @@
-# type: "PersonalizedResNet18"  # Changed from "build_personalized_resnet18"
-# name: "PersonalizedResNet18"
-# num_classes: 10
-# pretrained: False
-# l2_norm: False
-# use_bn_layer: False
-# last_feature_dim: 512
-# personalization_layers: 1
-type: "RCLClient"
+type: "PersonalizedResNet18"
+name: "PersonalizedResNet18"
+num_classes: 10
+pretrained: False
+l2_norm: True
+use_bn_layer: True
+last_feature_dim: 512
+personalization_layers: 2
 
-# Trust filtering settings
-trust_filtering:
+projection_head:
   enable: true
-  trust_threshold: 0.5
-
-# Personalization settings
-personalization:
-  enable: true
-  freeze_backbone: false  # Changed to false to allow backbone training in early rounds
-  adaptive_layer_freezing: true
-
-# Cyclical learning rate settings
-cyclical_lr:
-  enable: true
-  base_lr: 0.001
-  max_lr: 0.1
-  step_size: 10  # Number of rounds for half cycle
-
-# Knowledge distillation settings
-distillation:
-  enable: true
-  temperature: 3.0  # Increased from 2.0 for smoother probabilities
-  weight: 0.7  # Increased from 0.5 for stronger knowledge transfer
-
-# FedProx regularization
-fedprox:
-  enable: true
-  mu: 0.005  # Reduced from 0.01 for less aggressive regularization
-
-# EWC regularization to prevent catastrophic forgetting
-ewc:
-  enable: true
-  importance: 5000
-
-# Client contrastive loss settings
-rcl_loss:
-  temperature: 0.2  # Increased from 0.1 for more stable gradients
-  weight: 0.1
-  lambda_penalty: 0.03  # Reduced from 0.05
-  similarity_threshold: 0.4  # Reduced from 0.5
-  pairs:
-    - name: scl
-      loss_type: "supervised"
-      contrast_mode: "all"
-      lambda_weight: 0.5
-    - name: penalty
-      loss_type: "ssl"
-      contrast_mode: "all"
-      lambda_weight: 0.5
-
+  hidden_dim: 512
+  output_dim: 128
+  use_bn: true

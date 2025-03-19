@@ -126,20 +126,37 @@ class Server:
             logger.warning("No client models received. Global model unchanged.")
             return self.global_model.state_dict()
             
-        # Aggregate client models
-        aggregated_params = self.aggregate(client_models, client_weights, client_stats)
+        # Convert client_models to format expected by aggregate method
+        local_weights = {}
+        local_deltas = {}
+        client_ids = list(client_models.keys())
+        
+        for i, client_id in enumerate(client_ids):
+            local_weights[i] = client_models[client_id]
+            # Calculate deltas (can be empty for first round)
+            local_deltas[i] = {}
+            
+        # Get current model state
+        model_dict = self.global_model.state_dict()
+        
+        # Use a default current_lr if needed
+        current_lr = getattr(self.args.trainer, 'local_lr', 0.01)
+        
+        # Call the aggregate method with the prepared parameters
+        aggregated_params = self.aggregate(
+            local_weights, 
+            local_deltas, 
+            client_ids, 
+            model_dict, 
+            current_lr, 
+            client_stats
+        )
         
         # Update global model
-        global_state_dict = self.global_model.state_dict()
+        self.global_model.load_state_dict(aggregated_params)
         
-        # Only update keys that exist in the aggregated params
-        for key in global_state_dict.keys():
-            if key in aggregated_params:
-                global_state_dict[key] = aggregated_params[key]
-        
-        self.global_model.load_state_dict(global_state_dict)
-        
-        return global_state_dict
+        return aggregated_params
+
         
     def get_global_model(self):
         """Return the current global model"""

@@ -133,18 +133,21 @@ class BaseTrainer:
                     raise e
             
             # Aggregate client models
-            if self.enable_trust_filtering and client_trust_scores:
-                # Filter clients based on trust scores
-                trusted_clients = {k: v for k, v in client_models.items() 
-                                 if client_trust_scores.get(k, 0) >= self.args.client.trust_filtering.threshold}
+            if client_models:
+                client_ids = list(client_models.keys())
+                local_deltas = {i: {} for i in range(len(client_ids))}
+                local_weights = {i: client_models[cid] for i, cid in enumerate(client_ids)}
+                model_dict = self.server.get_global_model().state_dict()
+                current_lr = getattr(self.args.trainer, 'local_lr', 0.01)
                 
-                if not trusted_clients:
-                    logger.warning("No trusted clients found, using all clients")
-                    trusted_clients = client_models
-                
-                self.server.aggregate(trusted_clients)
-            else:
-                self.server.aggregate(client_models)
+                if self.enable_trust_filtering and client_trust_scores:
+                    # Convert client_stats to format expected by server
+                    client_metrics = {i: {"trust_score": client_trust_scores.get(cid, 0)} 
+                                     for i, cid in enumerate(client_ids)}
+                    
+                    self.server.aggregate(local_weights, local_deltas, client_ids, model_dict, current_lr, client_metrics)
+                else:
+                    self.server.aggregate(local_weights, local_deltas, client_ids, model_dict, current_lr)
             
             # Evaluate global model periodically
             if round_num % self.args.trainer.eval_every == 0:

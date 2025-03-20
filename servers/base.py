@@ -27,10 +27,12 @@ class Server:
         
         self.model = None
         self.global_model = None
+        self.global_model_state_dict = None
 
     def setup(self, model):
         self.model = model
         self.global_model = copy.deepcopy(model)
+        self.global_model_state_dict = copy.deepcopy(model.state_dict())
 
     def select_clients(self, clients, num_clients):
         if num_clients >= len(clients):
@@ -110,6 +112,10 @@ class Server:
             'client_history': self.client_history
         }
         
+        # Update global model state dict
+        self.global_model_state_dict = avg_state_dict
+        self.global_model.load_state_dict(avg_state_dict)
+        
         return avg_state_dict
 
     def update_global_model(self, client_models, client_weights=None, client_stats=None):
@@ -138,6 +144,7 @@ class Server:
                 global_state_dict[key] = aggregated_params[key]
         
         self.global_model.load_state_dict(global_state_dict)
+        self.global_model_state_dict = global_state_dict
         
         return global_state_dict
         
@@ -146,6 +153,10 @@ class Server:
         
     def get_round_stats(self):
         return self.round_stats
+
+    def initialize(self, model):
+        """Alias for setup to maintain compatibility"""
+        return self.setup(model)
 
 
 @SERVER_REGISTRY.register()
@@ -221,6 +232,9 @@ class ServerM(Server):
             'trust_scores': {k: v for k, v in trust_scores.items() if k in trusted_clients},
             'client_metrics': client_metrics
         }
+        
+        # Update global model state dict
+        self.global_model_state_dict = model_dict
                 
         return model_dict
 
@@ -230,6 +244,11 @@ class PersonalizedServer(ServerM):
     def __init__(self, args):
         super(PersonalizedServer, self).__init__(args)
         self.enable_personalization = True
+        
+    def setup(self, model):
+        super().setup(model)
+        if hasattr(self, 'set_momentum'):
+            self.set_momentum(model)
         
     def update_global_model(self, client_models, client_weights=None, client_stats=None):
         if not client_models:
@@ -262,6 +281,7 @@ class PersonalizedServer(ServerM):
         )
         
         self.global_model.load_state_dict(aggregated_params)
+        self.global_model_state_dict = aggregated_params
         
         return aggregated_params
         

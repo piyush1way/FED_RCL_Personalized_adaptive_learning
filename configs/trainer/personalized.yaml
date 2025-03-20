@@ -1,9 +1,31 @@
+# type: "BaseTrainer"
+
+# # Client participation settings
+# num_clients: 100  # Total number of clients
+# participation_rate: 0.05  # 5% participation rate (matches FedRCL paper)
+# global_rounds: 1000  # Total communication rounds
+
+# # Training settings
+# local_epochs: 5
+# batch_size: 64
+
+# # Learning rate settings
+# global_lr: 0.01  # Server-side learning rate
+# local_lr: 0.01  # Initial client-side learning rate
+# local_lr_decay: 0.998  # Matches FedRCL paper
+
+# # Personalization settings
+# personalization:
+#   enable: true
+#   adaptive_lr: true
+#   trust_filtering: true
 type: "BaseTrainer"
 
 # Client participation settings
 num_clients: 100  # Total number of clients
 participation_rate: 0.05  # 5% participation rate (matches FedRCL paper)
 global_rounds: 1000  # Total communication rounds
+eval_every: 5  # Evaluate model every 5 rounds
 
 # Training settings
 local_epochs: 5

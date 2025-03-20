@@ -67,7 +67,7 @@ class BaseTrainer:
         
         num_clients = self.args.trainer.num_clients
         clients_per_round = max(1, int(num_clients * self.args.trainer.participation_rate))
-        num_rounds = self.args.trainer.num_rounds
+        num_rounds = self.args.trainer.global_rounds if hasattr(self.args.trainer, 'global_rounds') else self.args.trainer.num_rounds
         
         logger.info(f"Training with {num_clients} clients, {clients_per_round} per round for {num_rounds} rounds")
         

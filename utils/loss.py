@@ -275,7 +275,9 @@ class RelaxedContrastiveLoss(nn.Module):
         pos_sim = torch.clamp((sim_matrix * pos_mask).sum() / (pos_mask.sum() + 1e-8), min=0.1, max=0.9)
         adaptive_threshold = pos_sim * 0.8
         
-        temp = torch.clamp(self.temperature_param, min=0.05, max=0.5)
+        # Move temperature to the same device as features
+        temp = self.temperature_param.to(features.device)
+        temp = torch.clamp(temp, min=0.05, max=0.5)
         sim_matrix_scaled = sim_matrix / temp
         
         logits_max, _ = torch.max(sim_matrix_scaled, dim=1, keepdim=True)

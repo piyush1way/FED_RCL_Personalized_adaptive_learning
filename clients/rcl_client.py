@@ -69,10 +69,11 @@ class RCLClient(Client):
         self.criterion = nn.CrossEntropyLoss()
         
         self.relaxed_contrastive_loss = RelaxedContrastiveLoss(
-            temperature=getattr(args.client, 'temperature', 0.05),
-            lambda_penalty=getattr(args.client, 'lambda_penalty', 0.03),
-            similarity_threshold=getattr(args.client, 'similarity_threshold', 0.4)
+            temperature=0.05,
+            beta=1.0,
+            lambda_threshold=0.7
         )
+
         
         self.ce_loss_avg = 0.0
         self.rcl_loss_avg = 0.0

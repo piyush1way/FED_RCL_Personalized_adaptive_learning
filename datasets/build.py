@@ -5,7 +5,7 @@ from torchvision.transforms import ToTensor, Normalize, CenterCrop
 import yaml
 import torch
 import numpy as np
-from torch.utils.data import Subset, Dataset
+from torch.utils.data import Subset, Dataset, DataLoader
 from utils.data import create_balanced_subset, share_balanced_data, DatasetSplit
 
 DATASET_REGISTRY = Registry("DATASET")
@@ -81,18 +81,31 @@ def split_data_dirichlet(dataset, num_clients, alpha):
         proportions = np.array([p * len(indices) for p in proportions])
         proportions = np.around(proportions).astype(int)
         
+        # Ensure we don't exceed the available indices
+        proportions = np.minimum(proportions, len(indices))
+        
+        # Adjust to match the total number of indices
         diff = len(indices) - np.sum(proportions)
-        proportions[0] += diff
+        if diff > 0:
+            # Distribute remaining indices
+            for i in range(diff):
+                proportions[i % num_clients] += 1
+        elif diff < 0:
+            # Remove excess indices
+            for i in range(-diff):
+                if proportions[i % num_clients] > 0:
+                    proportions[i % num_clients] -= 1
         
         index = 0
         for client_id, prop in enumerate(proportions):
-            client_indices[client_id].extend(indices[index:index + prop].tolist())
-            index += prop
+            if prop > 0:
+                client_indices[client_id].extend(indices[index:index + prop].tolist())
+                index += prop
     
     client_datasets = {}
     for client_id, indices in enumerate(client_indices):
         if len(indices) > 0:
-            client_datasets[client_id] = Subset(dataset, indices)
+            client_datasets[client_id] = DatasetSplit(dataset, indices)
     
     return client_datasets
 
@@ -115,7 +128,7 @@ def build_datasets(args):
             
             chunks = np.array_split(indices, num_clients)
             client_datasets = {
-                i: Subset(train_dataset, chunk) 
+                i: DatasetSplit(train_dataset, chunk.tolist()) 
                 for i, chunk in enumerate(chunks)
             }
         else:
@@ -124,24 +137,34 @@ def build_datasets(args):
             np.random.shuffle(indices)
             chunks = np.array_split(indices, num_clients)
             client_datasets = {
-                i: Subset(train_dataset, chunk) 
+                i: DatasetSplit(train_dataset, chunk.tolist()) 
                 for i, chunk in enumerate(chunks)
             }
         
+        # Create balanced subset if enabled
+        balanced_subset = None
         if hasattr(args.split, 'share_balanced_subset') and args.split.share_balanced_subset:
+            print("[__main__][INFO] -  Creating balanced subset to share across clients")
             samples_per_class = getattr(args.split, 'samples_per_class', 50)
             samples_per_client = getattr(args.split, 'samples_per_client', 20)
             
             balanced_indices = create_balanced_subset(train_dataset, samples_per_class=samples_per_class)
+            balanced_subset = Subset(train_dataset, balanced_indices)
             
-            client_datasets_with_split = {i: DatasetSplit(train_dataset, [idx for idx in client_datasets[i].indices]) 
-                                         for i in range(num_clients)}
-            
-            client_datasets, shared_data = share_balanced_data(
-                client_datasets_with_split, 
-                balanced_indices, 
-                samples_per_client=samples_per_client
-            )
+            # Share balanced data with clients
+            for client_id in range(num_clients):
+                if client_id not in client_datasets:
+                    client_datasets[client_id] = DatasetSplit(train_dataset, [])
+                
+                # Add balanced samples to each client
+                num_samples = min(samples_per_client, len(balanced_indices))
+                if num_samples > 0:
+                    selected_indices = np.random.choice(balanced_indices, num_samples, replace=False).tolist()
+                    client_datasets[client_id].add_indices(selected_indices)
+        
+        # Add eval_every parameter if missing
+        if not hasattr(args.trainer, 'eval_every'):
+            args.trainer.eval_every = 5
         
         print(f"Dataset split complete. Distribution:")
         for client_id, dataset in client_datasets.items():
@@ -151,6 +174,9 @@ def build_datasets(args):
             "train": client_datasets,
             "test": test_dataset,
         }
+        
+        if balanced_subset is not None:
+            datasets["balanced_test"] = balanced_subset
     else:
         datasets = {
             "train": {0: train_dataset},

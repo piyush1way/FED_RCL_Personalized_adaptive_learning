@@ -282,7 +282,6 @@ class RelaxedContrastiveLoss(nn.Module):
             return torch.tensor(0.0, device=features.device)
         
         # Standard supervised contrastive loss
-        # For each anchor i, compute log(exp(z_i·z_j/τ) / sum_k≠i exp(z_i·z_k/τ)) for all j where y_j = y_i
         exp_sim = torch.exp(sim_matrix)
         
         # For numerical stability, mask out self-similarity

@@ -165,6 +165,22 @@ class DatasetSplit(torch.utils.data.Dataset):
         weights = (1/class_counts)**pow
         weights /= weights.mean()
         return weights
+    
+    def add_indices(self, new_indices):
+        """Add new indices to the dataset split"""
+        for idx in new_indices:
+            idx = int(idx)
+            if idx not in self.idxs:
+                self.idxs.append(idx)
+                _, label = self.dataset[idx]
+                if torch.is_tensor(label):
+                    label = str(label.item())
+                else:
+                    label = str(label)
+                if label in self.class_dict:
+                    self.class_dict[str(label)] += 1
+                else:
+                    self.class_dict[str(label)] = 1
 
 class DatasetSplitSubset(DatasetSplit):
     def __init__(self, dataset, idxs, subset_classes=None):
@@ -286,11 +302,7 @@ def share_balanced_data(client_datasets, balanced_subset, samples_per_client=20)
         else:
             client_shared = balanced_subset
         
-        client_datasets[client_id] = torch.utils.data.ConcatDataset([
-            client_datasets[client_id],
-            DatasetSplit(client_datasets[client_id].dataset, client_shared)
-        ])
-        
+        client_datasets[client_id].add_indices(client_shared)
         shared_data[client_id] = client_shared
     
     return client_datasets, shared_data
@@ -338,224 +350,3 @@ def get_strong_augmentation_transforms(size=32):
     ])
     
     return train_transform
-
-def get_dataset(args, trainset, mode='iid'):
-    set = args.dataset.name
-    if 'leaf' not in set:
-        directory = args.dataset.client_path + '/' + set + '/' + ('un' if args.split.unbalanced==True else '') + 'balanced'
-        filepath = directory+'/' + mode + (str(args.split.class_per_client) if mode == 'skew' else '') + (str(args.split.alpha) if mode == 'dirichlet' else '') + (str(args.split.overlap_ratio) if mode == 'overlap' else '') + '_clients' +str(args.trainer.num_clients) +  (("_toyinform_" + str(args.split.toy_noniid_rate) + "_" + str(args.split.limit_total_classes)+ "_" +  str(args.split.limit_number_per_class)) if 'toy' in mode else "")   + '.txt'
-
-        check_already_exist = os.path.isfile(filepath) and (os.stat(filepath).st_size != 0)
-        create_new_client_data = not check_already_exist or args.split.create_client_dataset
-
-        if create_new_client_data == False:
-            try:
-                dataset = {}
-                with open(filepath) as f:
-                    for idx, line in enumerate(f):
-                        dataset = eval(line)
-            except:
-                print("Have problem to read client data")
-                create_new_client_data = True
-
-        if create_new_client_data == True:
-            if mode == 'iid':
-                dataset = cifar_iid(trainset, args.trainer.num_clients)
-            elif mode == 'overlap':
-                dataset = cifar_overlap(trainset, args.trainer.num_clients, args.split.overlap_ratio)
-            elif mode == 'skew':
-                class_per_client = args.split.class_per_client
-                dataset = cifar_noniid(trainset, args.trainer.num_clients, class_per_client)
-            elif mode == 'dirichlet':
-                if args.split.unbalanced==True:
-                    dataset = cifar_dirichlet_unbalanced(trainset, args.trainer.num_clients, alpha=args.split.alpha)
-                else:
-                    dataset = cifar_dirichlet_balanced(trainset, args.trainer.num_clients, alpha=args.split.alpha)
-            elif mode == 'toy_noniid':
-                dataset = cifar_toyset(trainset, args.trainer.num_clients, num_valid_classes=args.split.limit_total_classes, limit_number_per_class = args.split.limit_number_per_class, toy_noniid_rate = args.split.toy_noniid_rate, non_iid = True)
-            elif mode == 'toy_iid':
-                dataset = cifar_toyset(trainset, args.trainer.num_clients, num_valid_classes=args.split.limit_total_classes, limit_number_per_class = args.split.limit_number_per_class, toy_noniid_rate = args.split.toy_noniid_rate, non_iid = False)                
-            else:
-                print("Invalid mode ==> please select in iid, skewNclass, dirichlet")
-                return
-
-            try:
-                os.makedirs(directory, exist_ok=True)
-                with open(filepath, 'w') as f:
-                    print(dataset, file=f)
-            except:
-                print("Fail to write client data at " + directory)
-
-        if hasattr(args.split, 'share_balanced_subset') and args.split.share_balanced_subset:
-            balanced_indices = create_balanced_subset(trainset, samples_per_class=args.split.samples_per_class)
-            client_datasets = {i: DatasetSplit(trainset, dataset[i]) for i in range(args.trainer.num_clients)}
-            client_datasets, shared_data = share_balanced_data(
-                client_datasets, 
-                balanced_indices, 
-                samples_per_client=args.split.samples_per_client
-            )
-            return client_datasets
-        
-        return dataset
-    elif 'leaf' in set:
-        return trainset.get_train_idxs()
-    elif set == 'shakespeare':
-        return trainset.get_client_dic()
-def get_strong_augmentation(size=32, s=1.0):
-    color_jitter = transforms.ColorJitter(0.8*s, 0.8*s, 0.8*s, 0.2*s)
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-    
-    transform = transforms.Compose([
-        transforms.RandomResizedCrop(size, scale=(0.2, 1.0)),
-        transforms.RandomApply([color_jitter], p=0.8),
-        transforms.RandomGrayscale(p=0.2),
-        transforms.RandomApply([GaussianBlur(kernel_size=int(0.1 * size))], p=0.5),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        normalize
-    ])
-    return transform
-
-class MultiViewDataInjector(object):
-    def __init__(self, *args):
-        self.transforms = args[0]
-        self.random_flip = transforms.RandomHorizontalFlip()
-
-    def __call__(self, sample, *with_consistent_flipping):
-        if with_consistent_flipping:
-            sample = self.random_flip(sample)
-        output = [transform(sample) for transform in self.transforms]
-        return output
-
-def get_strong_augmentation_transforms(size=32):
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-    
-    color_jitter = transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
-    
-    train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(size=size, scale=(0.2, 1.0)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomApply([color_jitter], p=0.8),
-        transforms.RandomGrayscale(p=0.2),
-        transforms.ToTensor(),
-        normalize,
-    ])
-    
-    return train_transform
-
-def get_dataset(args, trainset, mode='iid'):
-    set = args.dataset.name
-    if 'leaf' not in set:
-        directory = args.dataset.client_path + '/' + set + '/' + ('un' if args.split.unbalanced==True else '') + 'balanced'
-        filepath = directory+'/' + mode + (str(args.split.class_per_client) if mode == 'skew' else '') + (str(args.split.alpha) if mode == 'dirichlet' else '') + (str(args.split.overlap_ratio) if mode == 'overlap' else '') + '_clients' +str(args.trainer.num_clients) +  (("_toyinform_" + str(args.split.toy_noniid_rate) + "_" + str(args.split.limit_total_classes)+ "_" +  str(args.split.limit_number_per_class)) if 'toy' in mode else "")   + '.txt'
-
-        check_already_exist = os.path.isfile(filepath) and (os.stat(filepath).st_size != 0)
-        create_new_client_data = not check_already_exist or args.split.create_client_dataset
-
-        if create_new_client_data == False:
-            try:
-                dataset = {}
-                with open(filepath) as f:
-                    for idx, line in enumerate(f):
-                        dataset = eval(line)
-            except:
-                print("Have problem to read client data")
-                create_new_client_data = True
-
-        if create_new_client_data == True:
-            if mode == 'iid':
-                dataset = cifar_iid(trainset, args.trainer.num_clients)
-            elif mode == 'overlap':
-                dataset = cifar_overlap(trainset, args.trainer.num_clients, args.split.overlap_ratio)
-            elif mode == 'skew':
-                class_per_client = args.split.class_per_client
-                dataset = cifar_noniid(trainset, args.trainer.num_clients, class_per_client)
-            elif mode == 'dirichlet':
-                if args.split.unbalanced==True:
-                    dataset = cifar_dirichlet_unbalanced(trainset, args.trainer.num_clients, alpha=args.split.alpha)
-                else:
-                    dataset = cifar_dirichlet_balanced(trainset, args.trainer.num_clients, alpha=args.split.alpha)
-            elif mode == 'toy_noniid':
-                dataset = cifar_toyset(trainset, args.trainer.num_clients, num_valid_classes=args.split.limit_total_classes, limit_number_per_class = args.split.limit_number_per_class, toy_noniid_rate = args.split.toy_noniid_rate, non_iid = True)
-            elif mode == 'toy_iid':
-                dataset = cifar_toyset(trainset, args.trainer.num_clients, num_valid_classes=args.split.limit_total_classes, limit_number_per_class = args.split.limit_number_per_class, toy_noniid_rate = args.split.toy_noniid_rate, non_iid = False)                
-            else:
-                print("Invalid mode ==> please select in iid, skewNclass, dirichlet")
-                return
-
-            try:
-                os.makedirs(directory, exist_ok=True)
-                with open(filepath, 'w') as f:
-                    print(dataset, file=f)
-            except:
-                print("Fail to write client data at " + directory)
-
-        if hasattr(args.split, 'share_balanced_subset') and args.split.share_balanced_subset:
-            balanced_indices = create_balanced_subset(trainset, samples_per_class=args.split.samples_per_class)
-            client_datasets = {i: DatasetSplit(trainset, dataset[i]) for i in range(args.trainer.num_clients)}
-            client_datasets, shared_data = share_balanced_data(
-                client_datasets, 
-                balanced_indices, 
-                samples_per_client=args.split.samples_per_client
-            )
-            return client_datasets
-        
-        return dataset
-    elif 'leaf' in set:
-        return trainset.get_train_idxs()
-    elif set == 'shakespeare':
-        return trainset.get_client_dic()
-
-
-
-# class MultiViewDataInjector(object):
-#     def __init__(self, *args):
-#         self.transforms = args[0]
-#         self.random_flip = transforms.RandomHorizontalFlip()
-
-#     def __call__(self, sample, *with_consistent_flipping):
-#         if with_consistent_flipping:
-#             sample = self.random_flip(sample)
-#         output = [transform(sample) for transform in self.transforms]
-#         return output
-
-
-# class GaussianBlur(object):
-#     def __init__(self, kernel_size):
-#         radias = kernel_size // 2
-#         kernel_size = radias * 2 + 1
-#         self.blur_h = nn.Conv2d(3, 3, kernel_size=(kernel_size, 1),
-#                                 stride=1, padding=0, bias=False, groups=3)
-#         self.blur_v = nn.Conv2d(3, 3, kernel_size=(1, kernel_size),
-#                                 stride=1, padding=0, bias=False, groups=3)
-#         self.k = kernel_size
-#         self.r = radias
-
-#         self.blur = nn.Sequential(
-#             nn.ReflectionPad2d(radias),
-#             self.blur_h,
-#             self.blur_v
-#         )
-
-#         self.pil_to_tensor = transforms.ToTensor()
-#         self.tensor_to_pil = transforms.ToPILImage()
-
-
-# def get_strong_augmentation_transforms(size=32):
-#     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-#                                      std=[0.229, 0.224, 0.225])
-    
-#     color_jitter = transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
-    
-#     train_transform = transforms.Compose([
-#         transforms.RandomResizedCrop(size=size, scale=(0.2, 1.0)),
-#         transforms.RandomHorizontalFlip(),
-#         transforms.RandomApply([color_jitter], p=0.8),
-#         transforms.RandomGrayscale(p=0.2),
-#         transforms.ToTensor(),
-#         normalize,
-#     ])
-    
-#     return train_transform

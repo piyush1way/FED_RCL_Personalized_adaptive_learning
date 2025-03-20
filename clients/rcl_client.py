@@ -227,16 +227,14 @@ class RCLClient(Client):
         return logit_distillation + 0.5 * feature_distillation
 
     def compute_ewc_loss(self):
-        if not self.ewc_enabled or self.fisher_information is None or self.optimal_parameters is None:
-            return 0.0
-            
-        loss = 0.0
+        loss = 0
         for name, param in self.model.named_parameters():
-            if name in self.fisher_information and name in self.optimal_parameters:
-                if 'personalized_head' not in name:
-                    loss += (self.fisher_information[name] * (param - self.optimal_parameters[name]).pow(2)).sum()
-                    
-        return self.ewc_importance * loss
+            if name in self.fisher_information:
+                fisher = self.fisher_information[name].to(param.device)
+                optimal_param = self.optimal_parameters[name].to(param.device)
+                loss += (fisher * (param - optimal_param).pow(2)).sum()
+        return loss
+
 
     def compute_trust_score(self):
         if self.previous_model_state is None:

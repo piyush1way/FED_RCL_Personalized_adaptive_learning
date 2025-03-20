@@ -63,7 +63,7 @@ class BaseTrainer:
         logger.info("Starting federated training...")
         
         # Initialize server and clients
-        self.server.initialize(self.model)
+        self.server.setup(self.model)
         
         num_clients = self.args.trainer.num_clients
         clients_per_round = max(1, int(num_clients * self.args.trainer.participation_rate))

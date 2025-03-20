@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 import logging
 from evalers.build import EVALER_REGISTRY
-from utils import DatasetSplit
+from utils.data import DatasetSplit
 from torch.utils.data import DataLoader
 from collections import defaultdict
 
@@ -16,9 +16,9 @@ logger = logging.getLogger(__name__)
 class Evaler:
     def __init__(
         self,
-        test_loader: DataLoader,
-        device: torch.device,
-        args: Dict,
+        test_loader: DataLoader = None,
+        device: torch.device = None,
+        args: Dict = None,
         gallery_loader: DataLoader = None,
         query_loader: DataLoader = None,
         distance_metric: str = 'cosine',
@@ -30,6 +30,55 @@ class Evaler:
         self.gallery_loader = gallery_loader
         self.query_loader = query_loader
         self.criterion = nn.CrossEntropyLoss(reduction="none")
+
+    @torch.no_grad()
+    def evaluate(self, model: nn.Module, test_dataset=None, batch_size=128, device=None):
+        """Evaluate model on test dataset and return accuracy"""
+        model.eval()
+        device = device or self.device
+        if device is None:
+            device = next(model.parameters()).device
+            
+        model = model.to(device)
+        
+        if test_dataset is None and self.test_loader is None:
+            logger.error("No test dataset or test loader provided")
+            return 0.0
+            
+        if self.test_loader is None:
+            test_loader = DataLoader(
+                test_dataset, 
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=2,
+                pin_memory=True
+            )
+        else:
+            test_loader = self.test_loader
+            
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for data, target in test_loader:
+                data, target = data.to(device), target.to(device)
+                
+                outputs = model(data)
+                
+                if isinstance(outputs, dict):
+                    if "logit" in outputs:
+                        outputs = outputs["logit"]
+                    elif "global_logit" in outputs:
+                        outputs = outputs["global_logit"]
+                    else:
+                        outputs = list(outputs.values())[0]
+                
+                _, predicted = outputs.max(1)
+                total += target.size(0)
+                correct += predicted.eq(target).sum().item()
+                
+        accuracy = 100.0 * correct / total if total > 0 else 0.0
+        return accuracy
 
     @torch.no_grad()
     def eval(self, model: nn.Module, epoch: int, device: torch.device = None, **kwargs) -> Dict:

@@ -31,9 +31,12 @@ class Evaler:
         self.query_loader = query_loader
         self.criterion = nn.CrossEntropyLoss(reduction="none")
 
-    @torch.no_grad()
-    def evaluate(self, model: nn.Module, test_dataset=None, batch_size=128, device=None):
+    def evaluate(self, model, test_dataset=None, batch_size=128, device=None):
         """Evaluate model on test dataset and return accuracy"""
+        if not isinstance(model, nn.Module):
+            logger.error(f"Expected model to be nn.Module, got {type(model)}")
+            return 0.0
+            
         model.eval()
         device = device or self.device
         if device is None:

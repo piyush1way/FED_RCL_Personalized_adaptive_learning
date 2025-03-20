@@ -69,9 +69,9 @@ class RCLClient(Client):
         self.criterion = nn.CrossEntropyLoss()
         
         self.relaxed_contrastive_loss = RelaxedContrastiveLoss(
-            temperature=0.2,
-            lambda_penalty=0.03,
-            similarity_threshold=0.4
+            temperature=getattr(args.client, 'temperature', 0.05),
+            lambda_penalty=getattr(args.client, 'lambda_penalty', 0.03),
+            similarity_threshold=getattr(args.client, 'similarity_threshold', 0.4)
         )
         
         self.ce_loss_avg = 0.0
@@ -227,13 +227,20 @@ class RCLClient(Client):
         return logit_distillation + 0.5 * feature_distillation
 
     def compute_ewc_loss(self):
-        loss = 0
+        """Compute EWC regularization loss with device consistency"""
+        if not self.ewc_enabled or not self.fisher_information:
+            return torch.tensor(0.0, device=self.device)
+        
+        loss = torch.tensor(0.0, device=self.device)
         for name, param in self.model.named_parameters():
             if name in self.fisher_information:
+                # Ensure all tensors are on the same device
                 fisher = self.fisher_information[name].to(param.device)
                 optimal_param = self.optimal_parameters[name].to(param.device)
                 loss += (fisher * (param - optimal_param).pow(2)).sum()
-        return loss
+        
+        return self.ewc_lambda * loss
+
 
 
     def compute_trust_score(self):

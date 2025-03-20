@@ -188,8 +188,8 @@ class BaseTrainer:
         else:
             test_model.load_state_dict(self.server.model.state_dict())
         
-        # Evaluate global model
-        global_acc = self.evaler_type.evaluate(test_model, test_dataset=self.datasets['test'])
+        # Evaluate global model - use model as first argument explicitly
+        global_acc = self.evaler_type.evaluate(model=test_model, test_dataset=self.datasets['test'])
         
         # Evaluate personalized model if enabled
         personalized_acc = 0.0
@@ -207,8 +207,8 @@ class BaseTrainer:
                 # Fine-tune on client's data
                 clients[client_id].personalize(personalized_model)
                 
-                # Evaluate personalized model
-                client_acc = self.evaler_type.evaluate(personalized_model, test_dataset=self.datasets['test'])
+                # Evaluate personalized model - use model as first argument explicitly
+                client_acc = self.evaler_type.evaluate(model=personalized_model, test_dataset=self.datasets['test'])
                 personalized_accs.append(client_acc)
             
             personalized_acc = np.mean(personalized_accs)
@@ -218,7 +218,7 @@ class BaseTrainer:
         
         # Also evaluate on balanced test set if available
         if 'balanced_test' in self.datasets:
-            balanced_global_acc = self.evaler_type.evaluate(test_model, test_dataset=self.datasets['balanced_test'])
+            balanced_global_acc = self.evaler_type.evaluate(model=test_model, test_dataset=self.datasets['balanced_test'])
             
             balanced_personalized_acc = 0.0
             if self.enable_personalization:
@@ -226,7 +226,7 @@ class BaseTrainer:
                 for client_id in eval_clients:
                     personalized_model = copy.deepcopy(test_model)
                     clients[client_id].personalize(personalized_model)
-                    client_acc = self.evaler_type.evaluate(personalized_model, test_dataset=self.datasets['balanced_test'])
+                    client_acc = self.evaler_type.evaluate(model=personalized_model, test_dataset=self.datasets['balanced_test'])
                     balanced_personalized_accs.append(client_acc)
                 
                 balanced_personalized_acc = np.mean(balanced_personalized_accs)

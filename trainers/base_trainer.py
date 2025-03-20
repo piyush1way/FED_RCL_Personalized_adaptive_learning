@@ -67,7 +67,14 @@ class BaseTrainer:
         
         num_clients = self.args.trainer.num_clients
         clients_per_round = max(1, int(num_clients * self.args.trainer.participation_rate))
-        num_rounds = self.args.trainer.global_rounds if hasattr(self.args.trainer, 'global_rounds') else self.args.trainer.num_rounds
+        
+        # Check for num_rounds in config, with fallback to global_rounds
+        if hasattr(self.args.trainer, 'num_rounds'):
+            num_rounds = self.args.trainer.num_rounds
+        elif hasattr(self.args.trainer, 'global_rounds'):
+            num_rounds = self.args.trainer.global_rounds
+        else:
+            num_rounds = 100  # Default fallback
         
         logger.info(f"Training with {num_clients} clients, {clients_per_round} per round for {num_rounds} rounds")
         
@@ -100,17 +107,25 @@ class BaseTrainer:
             for client_id in selected_clients:
                 try:
                     # Send global model to client
-                    clients[client_id].model.load_state_dict(self.server.global_model_state_dict)
+                    if hasattr(self.server, 'global_model_state_dict'):
+                        clients[client_id].model.load_state_dict(self.server.global_model_state_dict)
+                    elif hasattr(self.server, 'get_global_model'):
+                        global_model = self.server.get_global_model()
+                        clients[client_id].model.load_state_dict(global_model.state_dict())
+                    else:
+                        # Fallback to the model stored in the server object
+                        clients[client_id].model.load_state_dict(self.server.model.state_dict())
                     
                     # Perform local training
                     client_state_dict, stats = clients[client_id].local_train(round_num)
                     
                     # Store client results
-                    client_models[client_id] = client_state_dict
-                    client_stats[client_id] = stats
+                    if client_state_dict is not None:
+                        client_models[client_id] = client_state_dict
+                        client_stats[client_id] = stats
                     
                     # Get trust score if trust filtering is enabled
-                    if self.enable_trust_filtering and 'trust_score' in stats:
+                    if self.enable_trust_filtering and stats and 'trust_score' in stats:
                         client_trust_scores[client_id] = stats['trust_score']
                     
                 except Exception as e:
@@ -138,13 +153,13 @@ class BaseTrainer:
                 # Save best models
                 if global_acc > self.best_global_acc:
                     self.best_global_acc = global_acc
-                    self.best_global_model = copy.deepcopy(self.server.global_model_state_dict)
+                    self.best_global_model = copy.deepcopy(self.server.get_global_model().state_dict())
                     torch.save(self.best_global_model, f"./checkpoints/model_{round_num}_best_global.pt")
                     logger.info(f"Model saved to ./checkpoints/model_{round_num}_best_global.pt")
                 
                 if personalized_acc > self.best_personalized_acc:
                     self.best_personalized_acc = personalized_acc
-                    self.best_personalized_model = copy.deepcopy(self.server.global_model_state_dict)
+                    self.best_personalized_model = copy.deepcopy(self.server.get_global_model().state_dict())
                     torch.save(self.best_personalized_model, f"./checkpoints/model_{round_num}_best_personalized.pt")
                     logger.info(f"Model saved to ./checkpoints/model_{round_num}_best_personalized.pt")
         
@@ -158,7 +173,13 @@ class BaseTrainer:
         """Evaluate the global and personalized models"""
         # Create a test model with the global parameters
         test_model = copy.deepcopy(self.model).to(self.device)
-        test_model.load_state_dict(self.server.global_model_state_dict)
+        if hasattr(self.server, 'global_model_state_dict'):
+            test_model.load_state_dict(self.server.global_model_state_dict)
+        elif hasattr(self.server, 'get_global_model'):
+            global_model = self.server.get_global_model()
+            test_model.load_state_dict(global_model.state_dict())
+        else:
+            test_model.load_state_dict(self.server.model.state_dict())
         
         # Evaluate global model
         global_acc = self.evaler_type.evaluate(test_model, self.datasets['test'])

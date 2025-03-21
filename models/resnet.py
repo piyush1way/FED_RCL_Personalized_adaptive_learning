@@ -4,9 +4,10 @@ import torch.nn.functional as F
 from models.build import ENCODER_REGISTRY
 from typing import Dict, List, Optional
 from omegaconf import DictConfig
-from models.resnet_base import ResNet18_base
-from models.build import ENCODER_REGISTRY
-from omegaconf import DictConfig
+import logging
+
+logger = logging.getLogger(__name__)
+
 class BasicBlock(nn.Module):
     expansion = 1
 
@@ -84,8 +85,10 @@ class ResNet(nn.Module):
         
         self.use_personalized_head = True
         self.frozen_layers = []
+        self.trust_score = 1.0  # Initialize trust score for adaptive learning rate
         
         self.projection_head = self._create_projection_head()
+        self.multi_level_projections = self._create_multi_level_projections()
         
         self._initialize_weights()
 
@@ -123,6 +126,36 @@ class ResNet(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(256, 128)
         )
+    
+    def _create_multi_level_projections(self):
+        """Create projection heads for intermediate layers to support multi-level contrastive learning"""
+        projections = nn.ModuleDict({
+            'layer1': nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(64 * self.expansion, 128),
+                nn.BatchNorm1d(128) if self.use_bn_layer else nn.Identity(),
+                nn.ReLU(inplace=True),
+                nn.Linear(128, 128)
+            ),
+            'layer2': nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(128 * self.expansion, 128),
+                nn.BatchNorm1d(128) if self.use_bn_layer else nn.Identity(),
+                nn.ReLU(inplace=True),
+                nn.Linear(128, 128)
+            ),
+            'layer3': nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(256 * self.expansion, 128),
+                nn.BatchNorm1d(128) if self.use_bn_layer else nn.Identity(),
+                nn.ReLU(inplace=True),
+                nn.Linear(128, 128)
+            )
+        })
+        return projections
 
     def _initialize_weights(self):
         for m in self.modules():
@@ -147,13 +180,17 @@ class ResNet(nn.Module):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor, return_feature: bool = False, get_projection: bool = False) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, return_feature: bool = False, get_projection: bool = False, 
+                get_multi_level: bool = False) -> Dict[str, torch.Tensor]:
+        results = {}
+
         out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
-        
+        results['layer0'] = out
+
+        for i, layer in enumerate([self.layer1, self.layer2, self.layer3, self.layer4]):
+            out = layer(out)
+            results[f'layer{i+1}'] = out
+
         out = F.adaptive_avg_pool2d(out, 1)
         features = out.view(out.size(0), -1)
         
@@ -164,26 +201,36 @@ class ResNet(nn.Module):
             projection_features = self.projection_head(features)
             projection_features = F.normalize(projection_features, p=2, dim=1)
         
+        # Get multi-level projections if requested
+        if get_multi_level:
+            multi_level_projections = {}
+            for layer_name in ['layer1', 'layer2', 'layer3']:
+                if layer_name in results:
+                    proj = self.multi_level_projections[layer_name](results[layer_name])
+                    multi_level_projections[layer_name] = F.normalize(proj, p=2, dim=1)
+            results['multi_level_projections'] = multi_level_projections
+        
         global_logit = self.fc(features)
         personalized_logit = self.personalized_head(features)
         default_logit = personalized_logit if self.use_personalized_head else global_logit
         
-        output_dict = {
+        results.update({
             "feature": features,
             "feature_normalized": features_normalized,
             "global_logit": global_logit,
             "personalized_logit": personalized_logit,
             "logit": default_logit,
             "use_personalized": self.use_personalized_head,
-            "temperature": self.temperature
-        }
+            "temperature": self.temperature,
+            "trust_score": self.trust_score
+        })
         
         if projection_features is not None:
-            output_dict["projection"] = projection_features
+            results["projection"] = projection_features
         
         if return_feature:
-            return output_dict, {"pooled": features}
-        return output_dict
+            return results, {"pooled": features}
+        return results
 
     def freeze_backbone(self):
         for name, param in self.named_parameters():
@@ -191,10 +238,12 @@ class ResNet(nn.Module):
                 param.requires_grad = False
             else:
                 param.requires_grad = True
+        logger.info('Froze backbone parameters (except fc, personalized_head, projection_head, and temperature)')
 
     def unfreeze_backbone(self):
         for param in self.parameters():
             param.requires_grad = True
+        logger.info('Unfroze all parameters')
     
     def enable_personalized_mode(self):
         self.use_personalized_head = True
@@ -213,6 +262,7 @@ class ResNet(nn.Module):
         num_to_freeze = int(len(all_layers) * freeze_ratio)
         self.frozen_layers = all_layers[:num_to_freeze]
         self.freeze_layers(self.frozen_layers)
+        logger.info(f"Adaptively freezing layers: {self.frozen_layers}")
         
     def freeze_layers(self, layer_names):
         for name, param in self.named_parameters():
@@ -224,7 +274,7 @@ class ResNet(nn.Module):
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
-    
+        
         out = F.adaptive_avg_pool2d(out, 1)
         features = out.view(out.size(0), -1)
         
@@ -232,6 +282,41 @@ class ResNet(nn.Module):
         projected = F.normalize(projected, p=2, dim=1)
         
         return projected
+    
+    def get_multi_level_contrastive_features(self, x):
+        """Extract contrastive features from multiple network levels"""
+        results = {}
+        
+        out = F.relu(self.bn1(self.conv1(x)))
+        layer_features = {}
+        
+        # Get features from each layer
+        out1 = self.layer1(out)
+        layer_features['layer1'] = self.multi_level_projections['layer1'](out1)
+        
+        out2 = self.layer2(out1)
+        layer_features['layer2'] = self.multi_level_projections['layer2'](out2)
+        
+        out3 = self.layer3(out2)
+        layer_features['layer3'] = self.multi_level_projections['layer3'](out3)
+        
+        out4 = self.layer4(out3)
+        out = F.adaptive_avg_pool2d(out4, 1)
+        features = out.view(out.size(0), -1)
+        
+        # Final layer projection
+        layer_features['layer4'] = self.projection_head(features)
+        
+        # Normalize all features
+        for layer_name in layer_features:
+            layer_features[layer_name] = F.normalize(layer_features[layer_name], p=2, dim=1)
+            
+        return layer_features
+    
+    def update_trust_score(self, new_score):
+        """Update the trust score for adaptive learning rate"""
+        self.trust_score = new_score
+        logger.debug(f"Updated trust score to {self.trust_score}")
 
 @ENCODER_REGISTRY.register()
 class ResNet18(ResNet):
@@ -251,6 +336,28 @@ class ResNet34(ResNet):
                          personalization_layers=args.model.personalization_layers,
                          **kwargs)
 
-class PersonalizedResNet18(ResNet18_base):
+@ENCODER_REGISTRY.register()
+class PersonalizedResNet18(ResNet18):
     def __init__(self, args: DictConfig, num_classes: int = 10, **kwargs):
         super().__init__(args, num_classes=num_classes, **kwargs)
+        # Enable personalized mode by default
+        self.use_personalized_head = True
+        
+        # Enhanced personalization options
+        personalization_config = getattr(args.model, "personalization", {})
+        self.use_distillation = getattr(personalization_config, "knowledge_distillation", True)
+        self.distillation_temp = getattr(personalization_config, "kd_temperature", 3.0)
+        
+        # Trust-based settings
+        self.trust_score = 1.0  # Initialize with full trust
+        
+        # Adaptive layer freezing
+        adaptive_config = getattr(args.model, "adaptive_freezing", {})
+        self.use_adaptive_freezing = getattr(adaptive_config, "enable", False)
+        self.initial_freeze_ratio = getattr(adaptive_config, "initial_freeze_ratio", 0.5)
+        self.freeze_decay_rate = getattr(adaptive_config, "decay_rate", 0.05)
+        
+        if self.use_adaptive_freezing:
+            self.setup_adaptive_freezing(self.initial_freeze_ratio)
+            
+        logger.info(f"Initialized PersonalizedResNet18 with personalization_layers={args.model.personalization_layers}")

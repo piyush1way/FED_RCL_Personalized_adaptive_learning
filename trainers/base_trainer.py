@@ -19,17 +19,19 @@ logger = logging.getLogger(__name__)
 
 @TRAINER_REGISTRY.register()
 class BaseTrainer:
-    def __init__(self, model=None, client_type=None, server=None, evaler_type=None, 
-                datasets=None, device=None, args=None, config=None):
-        self.model = model
-        self.client_type = client_type
-        self.server = server
-        self.evaler_type = evaler_type
-        self.datasets = datasets
-        self.device = device
+    def __init__(self, args, model=None, trainset=None, testset=None, clients=None, server=None, evaler=None):
         self.args = args
-        self.config = config
+        self.model = model
+        self.trainset = trainset
+        self.testset = testset
+        self.clients = clients
+        self.server = server
+        self.evaler = evaler
         
+        # Set device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Basic setup
         self.optimizer = None
         self.scheduler = None
         self.criterion = nn.CrossEntropyLoss()
@@ -109,457 +111,152 @@ class BaseTrainer:
         self.round_metrics = defaultdict(list)
         
     def train(self):
-        """Main training loop for federated learning with FedRCL novelties"""
-        logger.info("Starting FedRCL training with novel features...")
+        """Generic training loop"""
+        # Setup trackers
+        metrics_history = defaultdict(list)
+        best_acc = 0.0
         
-        # Initialize server and clients
-        self.server.setup(self.model)
-        
-        num_clients = self.args.trainer.num_clients
-        clients_per_round = max(1, int(num_clients * self.args.trainer.participation_rate))
-        
-        # Determine number of training rounds
-        if hasattr(self.args.trainer, 'num_rounds'):
-            num_rounds = self.args.trainer.num_rounds
-        elif hasattr(self.args.trainer, 'global_rounds'):
-            num_rounds = self.args.trainer.global_rounds
-        else:
-            num_rounds = 100  # Default fallback
-        
-        # Set evaluation frequency
-        if not hasattr(self.args.trainer, 'eval_every'):
-            setattr(self.args.trainer, 'eval_every', 5)
-        
-        logger.info(f"Training with {num_clients} clients, {clients_per_round} per round for {num_rounds} rounds")
-        logger.info(f"Personalization enabled: {self.enable_personalization}")
-        logger.info(f"Trust-based filtering enabled: {self.enable_trust_filtering}")
-        logger.info(f"Trust-based adaptive LR enabled: {self.enable_cyclical_lr}")
-        logger.info(f"Multi-level contrastive learning enabled: {self.multi_level_rcl}")
-        
-        # Create clients
-        clients = {}
-        for i in range(num_clients):
-            try:
-                # Ensure model is on CPU before deepcopy to avoid CUDA issues
-                cpu_model = copy.deepcopy(self.model).cpu()
-                clients[i] = self.client_type(self.args, i, cpu_model)
-                # Move model back to device after client initialization
-                clients[i].model = clients[i].model.to(self.device)
-            except Exception as e:
-                logger.error(f"Error creating client {i}: {str(e)}")
-                raise e
-        
-        # Client trust score tracking for adaptive sampling
-        client_trust_history = {i: 1.0 for i in range(num_clients)}
+        # Setup server
+        if self.server is not None:
+            self.server.setup(self.model)
         
         # Training loop
-        for round_num in range(1, num_rounds + 1):
-            logger.info(f"Round {round_num}/{num_rounds}")
+        for round_idx in range(self.args.trainer.global_rounds):
+            logger.info(f"=== Round {round_idx+1}/{self.args.trainer.global_rounds} ===")
             
-            # Select clients for this round - use trust-based selection if enabled
-            if round_num > 10 and self.enable_trust_filtering:
-                # Use trust scores to bias selection (higher trust = higher chance)
-                selection_weights = np.array([max(0.1, client_trust_history.get(i, 1.0)) for i in range(num_clients)])
-                selection_weights = selection_weights / selection_weights.sum()
-                selected_clients = np.random.choice(
-                    range(num_clients), 
-                    clients_per_round, 
-                    replace=False, 
-                    p=selection_weights
-                )
-            else:
-                # Standard random selection
-                selected_clients = np.random.choice(range(num_clients), clients_per_round, replace=False)
-                
-            logger.info(f"Selected clients: {selected_clients.tolist()}")
+            # Select clients for this round
+            selected_clients = self.select_clients(round_idx)
+            logger.info(f"Selected {len(selected_clients)} clients for training")
             
-            # Train selected clients
+            # Client updates
             client_models = {}
-            client_stats = {}
-            client_trust_scores = {}
+            client_weights = {}
             
-            local_lr = self.args.trainer.local_lr
-            
-            for client_id in selected_clients:
-                try:
-                    # Compute trust-based adaptive learning rate if enabled
-                    if self.enable_cyclical_lr and round_num > 1:
-                        # Get trust score from history or default to high trust
-                        trust_score = client_trust_history.get(client_id, 0.8)
-                        
-                        # Calculate cyclical learning rate with trust adjustment
-                        cycle_step = round_num % (2 * self.step_size)
-                        x = abs(cycle_step / self.step_size - 1)
-                        
-                        # Adjust max_lr based on trust score
-                        adjusted_max_lr = self.max_lr * (0.5 + 0.5 * trust_score)
-                        
-                        # Calculate final LR
-                        adjusted_lr = self.base_lr + (adjusted_max_lr - self.base_lr) * max(0, (1 - x))
-                        
-                        logger.info(f"Client {client_id} Trust-Adjusted LR: {adjusted_lr:.6f} (trust: {trust_score:.2f})")
-                        local_lr = adjusted_lr
-                    
-                    # Get latest global model state dict
-                    global_state_dict = None
-                    if hasattr(self.server, 'global_model_state_dict'):
-                        global_state_dict = self.server.global_model_state_dict
-                    elif hasattr(self.server, 'get_global_model'):
-                        global_model = self.server.get_global_model()
-                        global_state_dict = global_model.state_dict()
-                    else:
-                        global_state_dict = self.server.model.state_dict()
-                    
-                    # Setup client for training
-                    clients[client_id].setup(
-                        state_dict=global_state_dict,
+            for client_idx in selected_clients:
+                client = self.clients[client_idx]
+                
+                # Setup client
+                if hasattr(client, 'setup'):
+                    current_global_model = self.server.get_global_model() if self.server is not None else self.model
+                    client.setup(
+                        state_dict=current_global_model.state_dict(),
                         device=self.device,
-                        local_dataset=self.datasets.get(f'train_{client_id}', None),
-                        global_epoch=round_num,
-                        local_lr=local_lr,
-                        trainer=self
+                        local_dataset=self.trainset[client_idx],
+                        global_epoch=round_idx,
+                        local_lr=self.args.trainer.local_lr  # Use base learning rate
                     )
-                    
-                    # Perform local training
-                    client_state_dict, stats = clients[client_id].local_train(round_num)
-                    
-                    # Store client results if training was successful
-                    if client_state_dict is not None:
-                        client_models[client_id] = client_state_dict
-                        client_stats[client_id] = stats
-                    
-                    # Update trust score history if available
-                    if stats and 'trust_score' in stats:
-                        trust_score = stats['trust_score']
-                        client_trust_history[client_id] = trust_score
-                        client_trust_scores[client_id] = trust_score
-                        
-                        # Log metrics
-                        if stats:
-                            for key, value in stats.items():
-                                if isinstance(value, (int, float)):
-                                    self.round_metrics[f"client_{client_id}_{key}"].append(value)
-                    
-                except Exception as e:
-                    logger.error(f"Client {client_id} Training Failed: {str(e)}")
-                    import traceback
-                    logger.error(traceback.format_exc())
+                
+                # Train client
+                client_model_dict, stats = client.local_train(round_idx)
+                
+                # Store results
+                if client_model_dict is not None:
+                    client_models[client_idx] = client_model_dict
+                    client_weights[client_idx] = len(self.trainset[client_idx])
             
-            # Aggregate client models with trust-based weighting
-            if client_models:
-                client_ids = list(client_models.keys())
-                local_weights = {i: client_models[cid] for i, cid in enumerate(client_ids)}
-                
-                # Prepare for aggregation
-                model_dict = None
-                if hasattr(self.server, 'get_global_model'):
-                    model_dict = self.server.get_global_model().state_dict()
-                else:
-                    model_dict = self.server.model.state_dict()
-                
-                # Prepare client metrics for trust-based aggregation
-                if self.enable_trust_filtering and client_trust_scores:
-                    # Filter clients with trust scores below threshold
-                    trusted_ids = []
-                    trusted_weights = {}
-                    trusted_metrics = {}
-                    
-                    for i, cid in enumerate(client_ids):
-                        if client_trust_scores.get(cid, 0) >= self.trust_threshold:
-                            trusted_ids.append(i)
-                            trusted_weights[len(trusted_ids)-1] = local_weights[i]
-                            trusted_metrics[len(trusted_ids)-1] = {"trust_score": client_trust_scores.get(cid, 0)}
-                    
-                    # Ensure we have minimum number of clients
-                    if len(trusted_ids) >= self.min_trust_clients:
-                        logger.info(f"Using {len(trusted_ids)} trusted clients for aggregation")
-                        
-                        # Check if server supports trust-based aggregation
-                        if hasattr(self.server, 'aggregate_with_trust_scores'):
-                            self.server.aggregate_with_trust_scores(
-                                trusted_weights, trusted_ids, model_dict, 
-                                local_lr, trusted_metrics
-                            )
-                        else:
-                            # Fallback to standard aggregation but with only trusted clients
-                            local_deltas = {i: {} for i in range(len(trusted_ids))}
-                            self.server.aggregate(
-                                trusted_weights, local_deltas, trusted_ids, 
-                                model_dict, local_lr
-                            )
-                    else:
-                        # Not enough trusted clients, use all clients
-                        logger.warning(f"Not enough trusted clients ({len(trusted_ids)}), using all {len(client_ids)} clients")
-                        local_deltas = {i: {} for i in range(len(client_ids))}
-                        self.server.aggregate(
-                            local_weights, local_deltas, client_ids,
-                            model_dict, local_lr
-                        )
-                else:
-                    # Standard aggregation without trust filtering
-                    local_deltas = {i: {} for i in range(len(client_ids))}
-                    self.server.aggregate(
-                        local_weights, local_deltas, client_ids,
-                        model_dict, local_lr
-                    )
-                    
-                # Track metrics for visualization
-                self.round_metrics["round"].append(round_num)
-                if client_trust_scores:
-                    self.round_metrics["avg_trust_score"].append(np.mean(list(client_trust_scores.values())))
-                    
-                # Track loss metrics if available
-                loss_types = ["ce_loss", "rcl_loss", "distillation_loss", "fedprox_loss", "ewc_loss"]
-                for loss_type in loss_types:
-                    losses = [stats.get(loss_type, 0) for stats in client_stats.values() if stats]
-                    if losses:
-                        self.round_metrics[f"avg_{loss_type}"].append(np.mean(losses))
+            # Server update
+            if self.server is not None and client_models:
+                updated_model_dict = self.server.update_global_model(client_models, client_weights)
+                self.model.load_state_dict(updated_model_dict)
             
-            # Evaluate global and personalized models periodically
-            if round_num % self.args.trainer.eval_every == 0:
-                global_acc, personalized_acc = self.evaluate(round_num, clients)
+            # Evaluate
+            if (round_idx + 1) % self.args.trainer.eval_every == 0:
+                metrics = self.evaluate(round_idx)
                 
-                # Track accuracy metrics
-                self.round_metrics["global_acc"].append(global_acc)
-                if self.enable_personalization:
-                    self.round_metrics["personalized_acc"].append(personalized_acc)
+                # Track metrics
+                for k, v in metrics.items():
+                    metrics_history[k].append(v)
                 
-                # Save best models
-                if global_acc > self.best_global_acc:
-                    self.best_global_acc = global_acc
-                    if hasattr(self.server, 'get_global_model'):
-                        self.best_global_model = copy.deepcopy(self.server.get_global_model().state_dict())
-                    else:
-                        self.best_global_model = copy.deepcopy(self.server.model.state_dict())
-                    torch.save(self.best_global_model, f"./checkpoints/model_{round_num}_best_global.pt")
-                    logger.info(f"New best global model saved: {global_acc:.2f}%")
-                
-                if self.enable_personalization and personalized_acc > self.best_personalized_acc:
-                    self.best_personalized_acc = personalized_acc
-                    if hasattr(self.server, 'get_global_model'):
-                        self.best_personalized_model = copy.deepcopy(self.server.get_global_model().state_dict())
-                    else:
-                        self.best_personalized_model = copy.deepcopy(self.server.model.state_dict())
-                    torch.save(self.best_personalized_model, f"./checkpoints/model_{round_num}_best_personalized.pt")
-                    logger.info(f"New best personalized model saved: {personalized_acc:.2f}%")
-                
-                # Generate visualizations periodically
-                if round_num % (self.args.trainer.eval_every * 5) == 0:
-                    self.generate_visualizations()
+                # Save best model
+                if metrics['acc'] > best_acc:
+                    best_acc = metrics['acc']
+                    self.save_model(f"best_model_r{round_idx}.pt")
         
-        # Generate final visualizations
-        self.generate_visualizations()
-        
-        # Save final model
-        final_model = None
-        if hasattr(self.server, 'get_global_model'):
-            final_model = copy.deepcopy(self.server.get_global_model().state_dict())
-        else:
-            final_model = copy.deepcopy(self.server.model.state_dict())
-            
-        torch.save(final_model, f"./checkpoints/model_final.pt")
-        
-        # Return best model based on configuration
-        if self.enable_personalization:
-            return self.best_personalized_model if self.best_personalized_model is not None else final_model
-        else:
-            return self.best_global_model if self.best_global_model is not None else final_model
+        return self.model, metrics_history
     
-    def evaluate(self, round_num, clients):
-        """Evaluate the global and personalized models"""
-        # Create a test model with the global parameters
-        test_model = copy.deepcopy(self.model).to(self.device)
-        if hasattr(self.server, 'global_model_state_dict'):
-            test_model.load_state_dict(self.server.global_model_state_dict)
-        elif hasattr(self.server, 'get_global_model'):
-            global_model = self.server.get_global_model()
-            test_model.load_state_dict(global_model.state_dict())
-        else:
-            test_model.load_state_dict(self.server.model.state_dict())
+    def evaluate(self, round_idx):
+        """Evaluate the model on test data"""
+        metrics = {}
         
-        # Evaluate global model
-        global_acc = self.evaler_type.evaluate(model=test_model, test_dataset=self.datasets['test'])
+        # Prepare model for evaluation
+        test_model = copy.deepcopy(self.model)
+        test_model.eval()
+        test_model.to(self.device)
         
-        # Evaluate personalized model if enabled
-        personalized_acc = 0.0
-        if self.enable_personalization:
-            # Sample a subset of clients for personalization evaluation
-            eval_clients = np.random.choice(list(clients.keys()), 
-                                          min(10, len(clients)), 
-                                          replace=False)
+        # Global model evaluation
+        with torch.no_grad():
+            if self.evaler:
+                global_acc = self.evaler.evaluate(model=test_model, test_dataset=self.testset)
+                metrics['acc'] = global_acc
+                logger.info(f"Round {round_idx} | Global Model Accuracy: {global_acc:.2f}%")
             
-            personalized_accs = []
-            for client_id in eval_clients:
-                # Create personalized model for this client
+        # Personalized evaluation if supported
+        if hasattr(self.args.trainer, 'personalization') and getattr(self.args.trainer.personalization, 'enable', False):
+            client_accs = []
+            num_eval_clients = min(10, len(self.clients))  # Limit number of clients to evaluate
+            
+            for client_idx in list(self.clients.keys())[:num_eval_clients]:
+                # Create personalized model
                 personalized_model = copy.deepcopy(test_model)
                 
-                # Setup personalization mode if available
-                if hasattr(personalized_model, 'enable_personalized_mode'):
-                    personalized_model.enable_personalized_mode()
-                elif hasattr(personalized_model, 'use_personalized_head'):
-                    personalized_model.use_personalized_head = True
-                
-                # Get client's training data
-                client_dataset = self.datasets.get(f'train_{client_id}', None)
-                if client_dataset is None or len(client_dataset) == 0:
-                    logger.warning(f"Client {client_id} has no training data for personalization")
-                    continue
-                
-                # Create data loader for personalization
-                train_loader = DataLoader(
-                    client_dataset, 
-                    batch_size=self.args.batch_size,
-                    shuffle=True,
-                    num_workers=0,
-                    pin_memory=False,
-                    drop_last=False
-                )
-                
-                # Fine-tune personalized head on client's data
-                personalized_model.train()
-                optimizer = torch.optim.SGD(
-                    [p for n, p in personalized_model.named_parameters() if 'personalized_head' in n],
-                    lr=self.personalization_lr,
-                    momentum=0.9
-                )
-                
-                # Freeze backbone if specified
-                if self.freeze_backbone:
-                    for name, param in personalized_model.named_parameters():
-                        if 'personalized_head' not in name:
-                            param.requires_grad = False
-                
-                # Personalization training loop
-                for epoch in range(self.personalization_epochs):
-                    for images, labels in train_loader:
-                        images = images.to(self.device)
-                        labels = labels.to(self.device)
-                        
-                        optimizer.zero_grad()
-                        outputs = personalized_model(images)
-                        
-                        if isinstance(outputs, dict):
-                            logits = outputs.get("personalized_logit", outputs.get("logit", None))
-                        else:
-                            logits = outputs
-                            
-                        if logits is not None:
-                            loss = self.criterion(logits, labels)
-                            loss.backward()
-                            optimizer.step()
-                
-                # Evaluate personalized model
-                personalized_model.eval()
-                client_acc = self.evaler_type.evaluate(model=personalized_model, test_dataset=self.datasets['test'])
-                personalized_accs.append(client_acc)
-                
-                # Free memory
-                del personalized_model
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            
-            if personalized_accs:
-                personalized_acc = np.mean(personalized_accs)
-        
-        # Log results
-        logger.info(f"Round {round_num} - " +
-                    f"Global Acc: {global_acc:.2f}%, " +
-                    f"Personalized Acc: {personalized_acc:.2f}%")
-        
-        # Also evaluate on balanced test set if available
-        if 'balanced_test' in self.datasets:
-            balanced_global_acc = self.evaler_type.evaluate(model=test_model, test_dataset=self.datasets['balanced_test'])
-            
-            balanced_personalized_acc = 0.0
-            if self.enable_personalization and 'eval_clients' in locals():
-                balanced_personalized_accs = []
-                for client_id in eval_clients:
-                    personalized_model = copy.deepcopy(test_model)
-                    
-                    # Setup personalization mode
-                    if hasattr(personalized_model, 'enable_personalized_mode'):
-                        personalized_model.enable_personalized_mode()
-                    elif hasattr(personalized_model, 'use_personalized_head'):
-                        personalized_model.use_personalized_head = True
-                    
-                    # Personalize
-                    client_dataset = self.datasets.get(f'train_{client_id}', None)
-                    if client_dataset is not None and len(client_dataset) > 0:
-                        # Create data loader
-                        train_loader = DataLoader(
+                # Get client dataset
+                client_dataset = self.trainset.get(client_idx, None)
+                if client_dataset and len(client_dataset) > 0:
+                    # Train on client data
+                    try:
+                        # Simple fine-tuning
+                        client_loader = DataLoader(
                             client_dataset, 
-                            batch_size=self.args.batch_size,
-                            shuffle=True,
-                            num_workers=0,
-                            pin_memory=False,
-                            drop_last=False
+                            batch_size=32, 
+                            shuffle=True
                         )
                         
-                        # Fine-tune
-                        personalized_model.train()
                         optimizer = torch.optim.SGD(
-                            [p for n, p in personalized_model.named_parameters() if 'personalized_head' in n],
-                            lr=self.personalization_lr,
+                            personalized_model.parameters(),
+                            lr=0.01,
                             momentum=0.9
                         )
                         
-                        if self.freeze_backbone:
-                            for name, param in personalized_model.named_parameters():
-                                if 'personalized_head' not in name:
-                                    param.requires_grad = False
-                        
-                        for epoch in range(self.personalization_epochs):
-                            for images, labels in train_loader:
-                                images = images.to(self.device)
-                                labels = labels.to(self.device)
-                                
+                        personalized_model.train()
+                        for _ in range(5):  # Few epochs of fine-tuning
+                            for inputs, targets in client_loader:
+                                inputs, targets = inputs.to(self.device), targets.to(self.device)
                                 optimizer.zero_grad()
-                                outputs = personalized_model(images)
-                                
-                                if isinstance(outputs, dict):
-                                    logits = outputs.get("personalized_logit", outputs.get("logit", None))
-                                else:
-                                    logits = outputs
-                                    
-                                if logits is not None:
-                                    loss = self.criterion(logits, labels)
-                                    loss.backward()
-                                    optimizer.step()
+                                outputs = personalized_model(inputs)
+                                loss = self.criterion(outputs, targets)
+                                loss.backward()
+                                optimizer.step()
                         
-                        # Evaluate
+                        # Evaluate personalized model
                         personalized_model.eval()
-                        client_acc = self.evaler_type.evaluate(
-                            model=personalized_model, 
-                            test_dataset=self.datasets['balanced_test']
-                        )
-                        balanced_personalized_accs.append(client_acc)
-                        
-                        # Free memory
-                        del personalized_model
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                
-                if balanced_personalized_accs:
-                    balanced_personalized_acc = np.mean(balanced_personalized_accs)
+                        if self.evaler:
+                            client_acc = self.evaler.evaluate(model=personalized_model, test_dataset=self.testset)
+                            client_accs.append(client_acc)
+                    except Exception as e:
+                        logger.error(f"Error personalizing for client {client_idx}: {str(e)}")
             
-            logger.info(f"Round {round_num} - " +
-                        f"Balanced Global Acc: {balanced_global_acc:.2f}%, " +
-                        f"Balanced Personalized Acc: {balanced_personalized_acc:.2f}%")
-            
-            # Track balanced metrics
-            self.round_metrics["balanced_global_acc"].append(balanced_global_acc)
-            if self.enable_personalization:
-                self.round_metrics["balanced_personalized_acc"].append(balanced_personalized_acc)
+            if client_accs:
+                personalized_acc = sum(client_accs) / len(client_accs)
+                metrics['acc_personalized'] = personalized_acc
+                logger.info(f"Round {round_idx} | Personalized Model Avg Accuracy: {personalized_acc:.2f}%")
         
-        # Free memory
-        del test_model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        return global_acc, personalized_acc
+        return metrics
+    
+    def select_clients(self, round_idx):
+        """Select clients for the current round"""
+        num_clients = len(self.clients)
+        clients_per_round = max(1, int(num_clients * self.args.trainer.participation_rate))
+        return np.random.choice(list(self.clients.keys()), clients_per_round, replace=False).tolist()
+    
+    def save_model(self, filename):
+        """Save the current model"""
+        save_path = os.path.join(self.args.log_dir, filename)
+        try:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            torch.save(self.model.state_dict(), save_path)
+            logger.info(f"Model saved to {save_path}")
+        except Exception as e:
+            logger.error(f"Failed to save model: {str(e)}")
     
     def generate_visualizations(self):
         """Generate visualizations of training metrics"""

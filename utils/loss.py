@@ -7,11 +7,22 @@ from utils.helper import *
 from utils.logging_utils import AverageMeter
 import math
 
-__all__ = ['MultiLabelCrossEntropyLoss', 'CLLoss', 'KL_u_p_loss', 'compute_personalized_loss', 'RelaxedContrastiveLoss']
+__all__ = [
+    'MultiLabelCrossEntropyLoss', 
+    'CLLoss', 
+    'KL_u_p_loss', 
+    'compute_personalized_loss', 
+    'RelaxedContrastiveLoss',
+    'MultiLevelContrastiveLoss',
+    'HybridPersonalizationLoss',
+    'TrustBasedLoss',
+    'KnowledgeDistillationLoss',
+    'FedProxLoss',
+    'EWCLoss'
+]
 
 
 class MultiLabelCrossEntropyLoss(nn.Module):
-
     def __init__(self, eps: float=0, alpha: float=0.2, topk_pos: int=-1, temp: float=1., **kwargs):
         super(MultiLabelCrossEntropyLoss, self).__init__()
         self.eps = eps
@@ -22,7 +33,7 @@ class MultiLabelCrossEntropyLoss(nn.Module):
     def __repr__(self):
         return "MultiLabelCrossEntropyLoss(eps={}, alpha={})".format(self.eps, self.alpha)
 
-    def forward(self, input: torch.Tensor, targets: torch.Tensor, reduction: bool = True, beta: float = None, ) -> torch.Tensor:
+    def forward(self, input: torch.Tensor, targets: torch.Tensor, reduction: bool = True, beta: float = None) -> torch.Tensor:
         N, C = input.size()
         E = self.eps
 
@@ -52,7 +63,6 @@ class MultiLabelCrossEntropyLoss(nn.Module):
 
     
 class CLLoss(nn.Module):
-
     def __init__(self, topk_pos=-1, topk_neg=-1, temp=1, eps=0., pair=None, loss_type=None, beta=None,
                  pos_sample_type=None, neg_sample_type=None, pos_loss_type=None, neg_loss_type=None,
                  threshold=1, **kwargs):
@@ -73,8 +83,7 @@ class CLLoss(nn.Module):
 
         self.threshold = self.pair.get('threshold') or threshold
 
-        self.criterion = MultiLabelCrossEntropyLoss(topk_pos=topk_pos, temp=temp, eps=eps,) 
-
+        self.criterion = MultiLabelCrossEntropyLoss(topk_pos=topk_pos, temp=temp, eps=eps)
 
     def __set_num_classes__(self, num_classes):
         self.num_classes = num_classes
@@ -88,8 +97,7 @@ class CLLoss(nn.Module):
         classwise_mask = target.expand(B, B).eq(target.expand(B, B).T)
         return classwise_mask
     
-
-    def get_topk_neg(self, sim, pos_mask=None, topk_neg=None, topk_pos=None, labels=None,):
+    def get_topk_neg(self, sim, pos_mask=None, topk_neg=None, topk_pos=None, labels=None):
         B = sim.size(0)
         if B < 2:
             return torch.tensor([], device=sim.device)
@@ -130,7 +138,6 @@ class CLLoss(nn.Module):
 
         return sim_neg
     
-
     def get_topk_pos(self, sim, topk_pos=None, labels=None, uncertainty=None):
         B = sim.size(0)
         if B < 2:
@@ -290,9 +297,6 @@ class RelaxedContrastiveLoss(nn.Module):
         # Compute denominators (sum over all samples except self)
         denominators = exp_sim.sum(dim=1, keepdim=True)
         
-        # Compute positive terms only
-        pos_exp_sim = exp_sim * pos_mask
-        
         # Compute standard SCL loss
         eps = 1e-8  # Small epsilon to avoid log(0)
         scl_loss = 0
@@ -343,8 +347,253 @@ class RelaxedContrastiveLoss(nn.Module):
         return total_loss
 
 
+class MultiLevelContrastiveLoss(nn.Module):
+    """
+    Multi-level contrastive learning loss that applies RCL across multiple network layers
+    """
+    def __init__(self, temperature=0.05, beta=1.0, lambda_threshold=0.7, layer_weights=None):
+        super(MultiLevelContrastiveLoss, self).__init__()
+        self.rcl = RelaxedContrastiveLoss(temperature, beta, lambda_threshold)
+        
+        # Default layer weights if none provided
+        if layer_weights is None:
+            self.layer_weights = [0.2, 0.2, 0.2, 0.2, 0.2]  # Equal weights for 5 layers
+        else:
+            self.layer_weights = layer_weights
+    
+    def forward(self, features_dict, labels):
+        """
+        Apply RCL to multiple feature levels
+        
+        Args:
+            features_dict: Dictionary of features from different layers
+                          e.g., {'layer0': tensor, 'layer1': tensor, ...}
+            labels: Class labels for the batch
+        """
+        total_loss = 0.0
+        
+        # Apply contrastive loss to each layer with corresponding weight
+        for i, layer_name in enumerate([f'layer{j}' for j in range(len(self.layer_weights))]):
+            if layer_name in features_dict:
+                features = features_dict[layer_name]
+                
+                # For convolutional features, apply global average pooling
+                if len(features.shape) > 2:
+                    features = F.adaptive_avg_pool2d(features, 1)
+                    features = features.view(features.size(0), -1)
+                
+                # L2 normalize features
+                features = F.normalize(features, p=2, dim=1)
+                
+                # Apply RCL with corresponding weight
+                layer_loss = self.rcl(features, labels)
+                total_loss += self.layer_weights[i] * layer_loss
+        
+        return total_loss
+
+
+class KnowledgeDistillationLoss(nn.Module):
+    """
+    Knowledge distillation loss between student and teacher models
+    """
+    def __init__(self, temperature=3.0, alpha=0.5):
+        super(KnowledgeDistillationLoss, self).__init__()
+        self.temperature = temperature
+        self.alpha = alpha  # Weight for balancing distillation and CE loss
+        self.ce_loss = nn.CrossEntropyLoss()
+    
+    def forward(self, student_logits, teacher_logits, labels=None, 
+                student_features=None, teacher_features=None):
+        """
+        Args:
+            student_logits: Output logits from student model
+            teacher_logits: Output logits from teacher model
+            labels: Ground truth labels (optional, for CE loss)
+            student_features: Feature outputs from student model (optional)
+            teacher_features: Feature outputs from teacher model (optional)
+        """
+        # Logit-based distillation
+        temp = self.temperature
+        soft_targets = F.softmax(teacher_logits / temp, dim=1)
+        log_probs = F.log_softmax(student_logits / temp, dim=1)
+        kd_loss = -(soft_targets * log_probs).sum(dim=1).mean() * (temp ** 2)
+        
+        # Feature-based distillation (optional)
+        feature_loss = 0.0
+        if student_features is not None and teacher_features is not None:
+            student_features = F.normalize(student_features, dim=1)
+            teacher_features = F.normalize(teacher_features, dim=1)
+            feature_loss = (1 - (student_features * teacher_features).sum(dim=1)).mean()
+        
+        # Cross-entropy loss with true labels (optional)
+        ce_loss = 0.0
+        if labels is not None:
+            ce_loss = self.ce_loss(student_logits, labels)
+            
+            # Combined loss with alpha weighting
+            total_loss = (1 - self.alpha) * ce_loss + self.alpha * (kd_loss + 0.5 * feature_loss)
+        else:
+            total_loss = kd_loss + 0.5 * feature_loss
+        
+        return total_loss
+
+
+class HybridPersonalizationLoss(nn.Module):
+    """
+    Loss for the hybrid personalized head that combines:
+    1. Cross-entropy for classification
+    2. Knowledge distillation from global to personalized head
+    3. L2 regularization on personalized parameters
+    """
+    def __init__(self, distillation_temp=3.0, distillation_weight=0.7, l2_reg_weight=0.001):
+        super(HybridPersonalizationLoss, self).__init__()
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.distillation_temp = distillation_temp
+        self.distillation_weight = distillation_weight
+        self.l2_reg_weight = l2_reg_weight
+    
+    def forward(self, outputs, targets, global_outputs=None, personalized_params=None):
+        """
+        Args:
+            outputs: Output from personalized head (logits)
+            targets: Target labels
+            global_outputs: Output from global head (logits) for distillation
+            personalized_params: Parameters of personalized head for L2 regularization
+        """
+        ce_loss = self.ce_loss(outputs, targets)
+        
+        # Knowledge distillation loss
+        distillation_loss = 0.0
+        if global_outputs is not None:
+            temp = self.distillation_temp
+            soft_targets = F.softmax(global_outputs / temp, dim=1)
+            log_probs = F.log_softmax(outputs / temp, dim=1)
+            distillation_loss = -(soft_targets * log_probs).sum(dim=1).mean() * (temp ** 2)
+        
+        # L2 regularization loss
+        l2_loss = 0.0
+        if personalized_params is not None:
+            for param in personalized_params:
+                l2_loss += torch.norm(param)**2
+        
+        # Combined loss
+        total_loss = ce_loss + self.distillation_weight * distillation_loss + self.l2_reg_weight * l2_loss
+        
+        return total_loss, {
+            'ce_loss': ce_loss,
+            'distillation_loss': distillation_loss,
+            'l2_loss': l2_loss
+        }
+
+
+class FedProxLoss(nn.Module):
+    """
+    FedProx regularization term for federated learning
+    """
+    def __init__(self, mu=0.01):
+        super(FedProxLoss, self).__init__()
+        self.mu = mu
+    
+    def forward(self, current_params, global_params, trust_score=1.0):
+        """
+        Compute FedProx regularization term
+        
+        Args:
+            current_params: Parameters of the current model
+            global_params: Parameters of the global model
+            trust_score: Client trust score to adjust regularization (higher trust = lower reg)
+        """
+        proximal_term = 0.0
+        for w, w_t in zip(current_params, global_params):
+            if w.data.shape == w_t.data.shape:
+                proximal_term += (w - w_t).norm(2)**2
+        
+        # Adjust mu based on trust score if provided
+        effective_mu = self.mu
+        if trust_score < 1.0:
+            # Lower trust score means stronger regularization
+            effective_mu = self.mu * (2.0 - trust_score)
+            
+        return effective_mu * proximal_term / 2
+
+
+class EWCLoss(nn.Module):
+    """
+    Elastic Weight Consolidation (EWC) loss for continual learning
+    """
+    def __init__(self, lambda_ewc=0.4):
+        super(EWCLoss, self).__init__()
+        self.lambda_ewc = lambda_ewc
+    
+    def forward(self, model, fisher_info, optimal_params):
+        """
+        Compute EWC regularization loss
+        
+        Args:
+            model: Current model
+            fisher_info: Dictionary of Fisher information matrices {param_name: tensor}
+            optimal_params: Dictionary of optimal parameters {param_name: tensor}
+        """
+        if not fisher_info or not optimal_params:
+            return torch.tensor(0.0, device=next(model.parameters()).device)
+        
+        loss = torch.tensor(0.0, device=next(model.parameters()).device)
+        
+        # Calculate EWC loss for each parameter
+        for name, param in model.named_parameters():
+            if name in fisher_info and name in optimal_params:
+                # Ensure tensors are on the same device
+                fisher = fisher_info[name].to(param.device)
+                optimal_param = optimal_params[name].to(param.device)
+                
+                # Calculate squared difference weighted by Fisher information
+                loss += (fisher * (param - optimal_param).pow(2)).sum()
+        
+        return self.lambda_ewc * loss
+
+
+class TrustBasedLoss(nn.Module):
+    """
+    Trust-based loss for federated learning that incorporates:
+    1. FedProx regularization based on trust score
+    2. EWC regularization for continual learning
+    """
+    def __init__(self, fedprox_mu=0.01, ewc_lambda=0.4):
+        super(TrustBasedLoss, self).__init__()
+        self.fedprox_loss = FedProxLoss(fedprox_mu)
+        self.ewc_loss = EWCLoss(ewc_lambda)
+    
+    def forward(self, model, global_model, task_loss, fisher_information=None, 
+                optimal_params=None, trust_score=1.0):
+        """
+        Combine task loss with FedProx and EWC regularization
+        """
+        # Compute FedProx term
+        fedprox_loss = self.fedprox_loss(
+            model.parameters(), 
+            global_model.parameters(),
+            trust_score
+        )
+        
+        # Compute EWC loss
+        ewc_loss = 0.0
+        if fisher_information is not None and optimal_params is not None:
+            ewc_loss = self.ewc_loss(model, fisher_information, optimal_params)
+        
+        # Combine losses
+        total_loss = task_loss + fedprox_loss + ewc_loss
+        
+        return total_loss, {
+            'task_loss': task_loss,
+            'fedprox_loss': fedprox_loss,
+            'ewc_loss': ewc_loss
+        }
+
 
 def compute_personalized_loss(output, target, model=None, reduction='mean'):
+    """
+    Compute personalized loss with class weighting for imbalanced data
+    """
     if isinstance(output, dict):
         if "personalized_logit" in output:
             logits = output["personalized_logit"]
@@ -353,10 +602,12 @@ def compute_personalized_loss(output, target, model=None, reduction='mean'):
     else:
         logits = output
         
+    # Compute class weights based on frequency in the batch
     class_counts = torch.bincount(target)
     class_weights = 1.0 / torch.clamp(class_counts[target], min=1.0)
     class_weights = class_weights / class_weights.mean()
     
+    # Apply weighted cross-entropy loss
     loss = F.cross_entropy(logits, target, reduction='none')
     weighted_loss = loss * class_weights
     
@@ -367,6 +618,7 @@ def compute_personalized_loss(output, target, model=None, reduction='mean'):
     else:
         loss = weighted_loss
     
+    # Add L2 regularization for personalized head if available
     if model is not None and hasattr(model, 'personalized_head'):
         l2_reg = 0
         for param in model.personalized_head.parameters():
@@ -378,6 +630,10 @@ def compute_personalized_loss(output, target, model=None, reduction='mean'):
 
 
 def KL_u_p_loss(outputs):
+    """
+    Compute KL divergence between predictions and uniform distribution
+    to encourage exploration and feature diversity
+    """
     num_classes = outputs.size(1)
     uniform_tensors = torch.ones(outputs.size())
     uniform_dists = torch.autograd.Variable(uniform_tensors / num_classes).cuda()

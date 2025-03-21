@@ -1,3 +1,4 @@
+# configs/server/personalized.yaml
 type: "PersonalizedServer"  # Use the new server class that supports personalization
 
 # Server optimizer configuration
@@ -11,3 +12,24 @@ trust_filtering:
   enable: true
   threshold: 0.5  # Minimum trust score for client updates to be included
   min_trusted_clients: 1  # Minimum number of trusted clients required
+  soft_filtering: true  # Use soft trust-based weighting instead of hard filtering
+
+# Personalization settings
+personalization:
+  enable: true
+  knowledge_distillation: true
+  kd_temperature: 3.0
+  kd_alpha: 0.5  # Weight for balancing KD loss and task loss
+
+# Adaptive learning rate configuration
+adaptive_lr:
+  enable: true
+  base_lr: 0.001
+  max_lr: 0.1
+  trust_factor: 0.5  # Factor to adjust LR based on trust score
+
+# Multi-level contrastive learning configuration
+multi_level_cl:
+  enable: true
+  layer_weights: [0.1, 0.2, 0.3, 0.4]  # Weights for different layers (should match model config)
+

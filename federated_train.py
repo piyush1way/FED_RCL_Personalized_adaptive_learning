@@ -96,8 +96,11 @@ def main(args: DictConfig) -> None:
     server_type = get_server_type(args)
     
     # Create server instance
-    server = server_type(args)
-    server.setup(model)  # Initialize the server with the model
+    # server = server_type(args)
+    # server.setup(model)  # Initialize the server with the model
+    # Create server instance
+    server = build_server(args)  # Use build_server instead of direct instantiation
+    server.setup(model)
     
     # Build datasets with balanced subset sharing if enabled
     if hasattr(args.split, 'share_balanced_subset') and args.split.share_balanced_subset:

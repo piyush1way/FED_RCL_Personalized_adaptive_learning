@@ -2,23 +2,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from models.build import ENCODER_REGISTRY
-
+from typing import Dict, List, Optional
+from omegaconf import DictConfig
 
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, in_planes, planes, stride=1, use_bn_layer=True, Conv2d=nn.Conv2d):
+    def __init__(self, in_planes, planes, stride=1, use_bn_layer=True):
         super(BasicBlock, self).__init__()
-        self.conv1 = Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes) if use_bn_layer else nn.Identity()
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes) if use_bn_layer else nn.Identity()
 
         self.downsample = nn.Sequential()
         if stride != 1 or in_planes != self.expansion * planes:
             self.downsample = nn.Sequential(
-                Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion * planes)
+                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion * planes) if use_bn_layer else nn.Identity()
             )
 
     def forward(self, x: torch.Tensor, no_relu: bool = False) -> torch.Tensor:
@@ -29,24 +30,23 @@ class BasicBlock(nn.Module):
             out = F.relu(out)
         return out
 
-
 class Bottleneck(nn.Module):
     expansion = 4
 
-    def __init__(self, in_planes, planes, stride=1, use_bn_layer=True, Conv2d=nn.Conv2d):
+    def __init__(self, in_planes, planes, stride=1, use_bn_layer=True):
         super(Bottleneck, self).__init__()
-        self.conv1 = Conv2d(in_planes, planes, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.conv3 = Conv2d(planes, self.expansion * planes, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(self.expansion * planes)
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes) if use_bn_layer else nn.Identity()
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes) if use_bn_layer else nn.Identity()
+        self.conv3 = nn.Conv2d(planes, self.expansion * planes, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(self.expansion * planes) if use_bn_layer else nn.Identity()
 
         self.downsample = nn.Sequential()
         if stride != 1 or in_planes != self.expansion * planes:
             self.downsample = nn.Sequential(
-                Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion * planes)
+                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion * planes) if use_bn_layer else nn.Identity()
             )
 
     def forward(self, x: torch.Tensor, no_relu: bool = False) -> torch.Tensor:
@@ -58,28 +58,69 @@ class Bottleneck(nn.Module):
             out = F.relu(out)
         return out
 
-
 class ResNet(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10, l2_norm=False, use_pretrained=False, use_bn_layer=True,
-                 last_feature_dim=512, **kwargs):
+    def __init__(self, block, num_blocks, num_classes=10, l2_norm=False, use_bn_layer=True,
+                 last_feature_dim=512, personalization_layers=2, **kwargs):
         super(ResNet, self).__init__()
         self.l2_norm = l2_norm
         self.in_planes = 64
-        conv1_kernel_size = 3 if not use_pretrained else 7
+        self.num_classes = num_classes
+        self.use_bn_layer = use_bn_layer
 
-        Conv2d = self.get_conv()
-        self.conv1 = Conv2d(3, 64, kernel_size=conv1_kernel_size, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-
-        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1, use_bn_layer=use_bn_layer)
-        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2, use_bn_layer=use_bn_layer)
-        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2, use_bn_layer=use_bn_layer)
-        self.layer4 = self._make_layer(block, last_feature_dim, num_blocks[3], stride=2, use_bn_layer=use_bn_layer)
-
-        self.num_layers = 6
-        self.fc = nn.Linear(last_feature_dim * block.expansion, num_classes)
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64) if use_bn_layer else nn.Identity()
+        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
+        self.layer4 = self._make_layer(block, last_feature_dim, num_blocks[3], stride=2)
+        
+        self.feature_dim = last_feature_dim * block.expansion
+        self.fc = nn.Linear(self.feature_dim, num_classes)
+        
+        self.temperature = nn.Parameter(torch.ones(1) * 0.07)
+        self._create_personalized_head(personalization_layers)
+        
+        self.use_personalized_head = True
+        self.frozen_layers = []
+        
+        self.projection_head = self._create_projection_head()
         
         self._initialize_weights()
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride, use_bn_layer=self.use_bn_layer))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def _create_personalized_head(self, personalization_layers):
+        if personalization_layers == 1:
+            self.personalized_head = nn.Linear(self.feature_dim, self.num_classes)
+        else:
+            layers = []
+            for i in range(personalization_layers-1):
+                layers.extend([
+                    nn.Linear(self.feature_dim, self.feature_dim),
+                    nn.BatchNorm1d(self.feature_dim) if self.use_bn_layer else nn.Identity(),
+                    nn.ReLU(inplace=True)
+                ])
+            layers.append(nn.Linear(self.feature_dim, self.num_classes))
+            self.personalized_head = nn.Sequential(*layers)
+        
+        self._initialize_head(self.personalized_head)
+
+    def _create_projection_head(self):
+        return nn.Sequential(
+            nn.Linear(self.feature_dim, self.feature_dim),
+            nn.BatchNorm1d(self.feature_dim) if self.use_bn_layer else nn.Identity(),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.feature_dim, 256),
+            nn.BatchNorm1d(256) if self.use_bn_layer else nn.Identity(),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 128)
+        )
 
     def _initialize_weights(self):
         for m in self.modules():
@@ -93,89 +134,18 @@ class ResNet(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def get_conv(self):
-        return nn.Conv2d
-    
-    def _make_layer(self, block, planes, num_blocks, stride, use_bn_layer=True):
-        strides = [stride] + [1] * (num_blocks - 1)
-        layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride, use_bn_layer=use_bn_layer, Conv2d=self.get_conv()))
-            self.in_planes = planes * block.expansion
-        return nn.Sequential(*layers)
-
-    def forward(self, x, return_feature=False):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
-
-        out = F.adaptive_avg_pool2d(out, 1)
-        features = out.view(out.size(0), -1)
-        
-        features_normalized = F.normalize(features, p=2, dim=1) if self.l2_norm else features
-        logit = self.fc(features)
-
-        if return_feature:
-            return features, logit
-            
-        return {"feature": features, "feature_normalized": features_normalized, "logit": logit}
-
-
-class PersonalizedResNet(ResNet):
-    def __init__(self, block, num_blocks, num_classes=10, last_feature_dim=512, l2_norm=False, 
-                 personalization_layers=2, use_bn_layer=True, **kwargs):
-        super().__init__(block, num_blocks, num_classes=num_classes, last_feature_dim=last_feature_dim, 
-                         l2_norm=l2_norm, use_bn_layer=use_bn_layer, **kwargs)
-        
-        self.feature_dim = last_feature_dim * block.expansion
-        self.temperature = nn.Parameter(torch.ones(1) * 0.07)
-        self._create_personalized_head(personalization_layers, num_classes)
-        
-        self.use_personalized_head = True
-        self.frozen_layers = []
-        
-        self.projection_head = nn.Sequential(
-            nn.Linear(self.feature_dim, self.feature_dim),
-            nn.BatchNorm1d(self.feature_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.feature_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 128)
-        )
-        
-        for m in self.projection_head.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def _create_personalized_head(self, personalization_layers, num_classes):
-        if personalization_layers == 1:
-            self.personalized_head = nn.Linear(self.feature_dim, num_classes)
-            nn.init.normal_(self.personalized_head.weight, mean=0.0, std=0.01)
-            nn.init.zeros_(self.personalized_head.bias)
-        else:
-            layers = []
-            for i in range(personalization_layers-1):
-                if i == 0:
-                    layers.append(nn.Linear(self.feature_dim, self.feature_dim))
-                else:
-                    layers.append(nn.Linear(self.feature_dim, self.feature_dim))
-                layers.append(nn.BatchNorm1d(self.feature_dim))
-                layers.append(nn.ReLU(inplace=True))
-            layers.append(nn.Linear(self.feature_dim, num_classes))
-            self.personalized_head = nn.Sequential(*layers)
-            
-            for m in self.personalized_head.modules():
+    def _initialize_head(self, head):
+        if isinstance(head, nn.Linear):
+            nn.init.normal_(head.weight, mean=0.0, std=0.01)
+            nn.init.zeros_(head.bias)
+        elif isinstance(head, nn.Sequential):
+            for m in head.modules():
                 if isinstance(m, nn.Linear):
                     nn.init.normal_(m.weight, mean=0.0, std=0.01)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
-    def forward(self, x, return_feature=False, get_projection=False):
+    def forward(self, x: torch.Tensor, return_feature: bool = False, get_projection: bool = False) -> Dict[str, torch.Tensor]:
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
@@ -212,7 +182,7 @@ class PersonalizedResNet(ResNet):
         if return_feature:
             return output_dict, {"pooled": features}
         return output_dict
-    
+
     def freeze_backbone(self):
         for name, param in self.named_parameters():
             if 'fc' not in name and 'personalized_head' not in name and 'projection_head' not in name and 'temperature' not in name:
@@ -231,18 +201,10 @@ class PersonalizedResNet(ResNet):
         self.use_personalized_head = False
         
     def get_global_params(self):
-        global_params = {}
-        for name, param in self.named_parameters():
-            if 'personalized_head' not in name:
-                global_params[name] = param.data.clone()
-        return global_params
+        return {name: param.data.clone() for name, param in self.named_parameters() if 'personalized_head' not in name}
     
     def get_local_params(self):
-        local_params = {}
-        for name, param in self.named_parameters():
-            if 'personalized_head' in name:
-                local_params[name] = param.data.clone()
-        return local_params
+        return {name: param.data.clone() for name, param in self.named_parameters() if 'personalized_head' in name}
     
     def setup_adaptive_freezing(self, freeze_ratio=0.5):
         all_layers = ['conv1', 'bn1', 'layer1', 'layer2', 'layer3', 'layer4']
@@ -252,10 +214,7 @@ class PersonalizedResNet(ResNet):
         
     def freeze_layers(self, layer_names):
         for name, param in self.named_parameters():
-            if any(layer in name for layer in layer_names):
-                param.requires_grad = False
-            else:
-                param.requires_grad = True
+            param.requires_grad = not any(layer in name for layer in layer_names)
     
     def get_contrastive_features(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
@@ -272,20 +231,20 @@ class PersonalizedResNet(ResNet):
         
         return projected
 
-
 @ENCODER_REGISTRY.register()
 class ResNet18(ResNet):
-    def __init__(self, args, num_classes=10, **kwargs):
-        super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, **kwargs)
-
+    def __init__(self, args: DictConfig, num_classes: int = 10, **kwargs):
+        super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, 
+                         l2_norm=args.model.l2_norm,
+                         use_bn_layer=args.model.use_bn_layer,
+                         personalization_layers=args.model.personalization_layers,
+                         **kwargs)
 
 @ENCODER_REGISTRY.register()
-class PersonalizedResNet18(PersonalizedResNet):
-    def __init__(self, args, num_classes=10, **kwargs):
-        personalization_layers = kwargs.pop('personalization_layers', None)
-        
-        if personalization_layers is None:
-            personalization_layers = getattr(args, 'personalization_layers', 2)
-        
-        super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, 
-                         personalization_layers=personalization_layers, **kwargs)
+class ResNet34(ResNet):
+    def __init__(self, args: DictConfig, num_classes: int = 10, **kwargs):
+        super().__init__(BasicBlock, [3, 4, 6, 3], num_classes=num_classes, 
+                         l2_norm=args.model.l2_norm,
+                         use_bn_layer=args.model.use_bn_layer,
+                         personalization_layers=args.model.personalization_layers,
+                         **kwargs)

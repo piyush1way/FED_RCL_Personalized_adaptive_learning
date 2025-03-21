@@ -46,4 +46,3 @@ adaptive_freezing:
   enable: true
   initial_freeze_ratio: 0.5
   decay_rate: 0.05
-

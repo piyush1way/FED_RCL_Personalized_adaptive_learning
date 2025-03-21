@@ -1,3 +1,4 @@
+# fedrcl_p.yaml
 #################### Default Setup ####################
 wandb: False
 seed: 0
@@ -49,35 +50,32 @@ eval:
   freq: 5  # Evaluate every 5 rounds
   batch_size: 128
 
+#################### Trust-Based Client Filtering ####################
+trust_filtering:
+  enable: true
+  threshold: 0.5
+  min_trusted_clients: 1
+  soft_filtering: true  # Use soft weighting instead of hard filtering
+
 #################### Personalization Settings ####################
 personalization:
   enable: true
-  freeze_backbone: false  # Changed to false to allow backbone training in early rounds
-  adaptive_layer_freezing: true
+  layers: 2  # Number of personalized layers
+  knowledge_distillation: true
+  kd_temperature: 3.0
 
-#################### Cyclical Learning Rate ####################
-cyclical_lr:
+#################### Adaptive Learning Rate ####################
+adaptive_lr:
   enable: true
   base_lr: 0.001
   max_lr: 0.1
-  step_size: 10  # Number of rounds for half cycle
 
-#################### Knowledge Distillation ####################
-distillation:
-  enable: true
-  temperature: 3.0  # Increased from 2.0 for smoother probabilities
-  weight: 0.7  # Increased from 0.5 for stronger knowledge transfer
+#################### Multi-Level Contrastive Learning ####################
+contrastive:
+  multi_level: true
+  layer_weights: [0.1, 0.2, 0.2, 0.2, 0.3]
 
-#################### FedProx Regularization ####################
-fedprox:
-  enable: true
-  mu: 0.005  # Reduced from 0.01 for less aggressive regularization
-
-#################### EWC Regularization ####################
-ewc:
-  enable: true
-  importance: 5000  # Importance weight for EWC regularization
-
+#################### Analysis Settings ####################
 analysis: True  # Enable analysis to track personalization benefits
 
 #################### Default Configurations ####################

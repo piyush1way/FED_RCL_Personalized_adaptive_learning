@@ -31,6 +31,15 @@ class BaseTrainer:
         # Set device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
+        # Create test loader
+        self.testloader = DataLoader(
+            self.testset,
+            batch_size=128,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True
+        ) if self.testset is not None else None
+        
         # Basic setup
         self.optimizer = None
         self.scheduler = None
@@ -185,19 +194,11 @@ class BaseTrainer:
         
         # Global model evaluation
         with torch.no_grad():
-            if self.evaler:
-                test_loader = DataLoader(
-                    self.testset,
-                    batch_size=128,
-                    shuffle=False,
-                    num_workers=2,
-                    pin_memory=True
-                )
-                
+            if self.testloader is not None:
                 correct = 0
                 total = 0
                 
-                for data in test_loader:
+                for data in self.testloader:
                     if isinstance(data, (tuple, list)) and len(data) >= 2:
                         images, labels = data[0], data[1]
                     else:
@@ -245,8 +246,9 @@ class BaseTrainer:
                         # Simple fine-tuning
                         client_loader = DataLoader(
                             client_dataset, 
-                            batch_size=32, 
-                            shuffle=True
+                            batch_size=min(32, len(client_dataset)),  # Ensure batch size isn't larger than dataset
+                            shuffle=True,
+                            drop_last=True  # Drop last batch if incomplete to avoid BN issues
                         )
                         
                         optimizer = torch.optim.SGD(
@@ -255,7 +257,11 @@ class BaseTrainer:
                             momentum=0.9
                         )
                         
-                        personalized_model.train()
+                        # Set model to eval mode for batch norm (use accumulated statistics)
+                        personalized_model.eval()
+                        for param in personalized_model.parameters():
+                            param.requires_grad = True
+                            
                         for _ in range(5):  # Few epochs of fine-tuning
                             for batch in client_loader:
                                 if isinstance(batch, (tuple, list)) and len(batch) >= 2:
@@ -265,7 +271,7 @@ class BaseTrainer:
                                     targets = torch.zeros(inputs.size(0))  # Default labels if not provided
                                 
                                 inputs = inputs.to(self.device)
-                                targets = targets.to(self.device)
+                                targets = targets.to(self.device).long()  # Ensure targets are long type
                                 
                                 optimizer.zero_grad()
                                 outputs = personalized_model(inputs)
@@ -288,7 +294,7 @@ class BaseTrainer:
                         total = 0
                         
                         with torch.no_grad():
-                            for batch in test_loader:
+                            for batch in self.testloader:
                                 if isinstance(batch, (tuple, list)) and len(batch) >= 2:
                                     inputs, targets = batch[0], batch[1]
                                 else:
@@ -296,7 +302,7 @@ class BaseTrainer:
                                     targets = torch.zeros(inputs.size(0))  # Default labels if not provided
                                 
                                 inputs = inputs.to(self.device)
-                                targets = targets.to(self.device)
+                                targets = targets.to(self.device).long()  # Ensure targets are long type
                                 
                                 outputs = personalized_model(inputs)
                                 
@@ -317,6 +323,8 @@ class BaseTrainer:
                             
                     except Exception as e:
                         logger.error(f"Error personalizing for client {client_idx}: {str(e)}")
+                        import traceback
+                        logger.error(traceback.format_exc())
             
             if client_accs:
                 personalized_acc = sum(client_accs) / len(client_accs)

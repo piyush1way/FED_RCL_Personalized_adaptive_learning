@@ -4,7 +4,9 @@ import torch.nn.functional as F
 from models.build import ENCODER_REGISTRY
 from typing import Dict, List, Optional
 from omegaconf import DictConfig
-
+from models.resnet_base import ResNet18_base
+from models.build import ENCODER_REGISTRY
+from omegaconf import DictConfig
 class BasicBlock(nn.Module):
     expansion = 1
 
@@ -248,3 +250,7 @@ class ResNet34(ResNet):
                          use_bn_layer=args.model.use_bn_layer,
                          personalization_layers=args.model.personalization_layers,
                          **kwargs)
+
+class PersonalizedResNet18(ResNet18_base):
+    def __init__(self, args: DictConfig, num_classes: int = 10, **kwargs):
+        super().__init__(args, num_classes=num_classes, **kwargs)

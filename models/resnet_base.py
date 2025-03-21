@@ -64,7 +64,7 @@ class ResNet_base(ResNet):
             'layer1': nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
-                nn.Linear(64 * block.expansion, 128),
+                nn.Linear(64 * self.expansion, 128),
                 nn.BatchNorm1d(128) if self.use_bn_layer else nn.Identity(),
                 nn.ReLU(inplace=True),
                 nn.Linear(128, 128)
@@ -72,7 +72,7 @@ class ResNet_base(ResNet):
             'layer2': nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
-                nn.Linear(128 * block.expansion, 128),
+                nn.Linear(128 * self.expansion, 128),
                 nn.BatchNorm1d(128) if self.use_bn_layer else nn.Identity(),
                 nn.ReLU(inplace=True),
                 nn.Linear(128, 128)
@@ -80,7 +80,7 @@ class ResNet_base(ResNet):
             'layer3': nn.Sequential(
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
-                nn.Linear(256 * block.expansion, 128),
+                nn.Linear(256 * self.expansion, 128),
                 nn.BatchNorm1d(128) if self.use_bn_layer else nn.Identity(),
                 nn.ReLU(inplace=True),
                 nn.Linear(128, 128)
@@ -120,7 +120,6 @@ class ResNet_base(ResNet):
             projection_features = self.projection_head(features)
             projection_features = F.normalize(projection_features, p=2, dim=1)
         
-        # Get multi-level projections if requested
         if get_multi_level:
             multi_level_projections = {}
             for layer_name in ['layer1', 'layer2', 'layer3']:

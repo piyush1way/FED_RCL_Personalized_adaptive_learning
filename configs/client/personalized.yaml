@@ -1,3 +1,4 @@
+# configs/client/personalized.yaml
 type: "RCLClient"
 
 # Trust filtering settings
@@ -10,36 +11,38 @@ personalization:
   enable: true
   freeze_backbone: false  # Changed to false to allow backbone training in early rounds
   adaptive_layer_freezing: true
+  freeze_ratio: 0.5  # Starting freeze ratio that decreases over time
 
 # Cyclical learning rate settings
-cyclical_lr:
-  enable: true
-  base_lr: 0.001
-  max_lr: 0.1
-  step_size: 10  # Number of rounds for half cycle
+cyclical_lr: true
+base_lr: 0.001
+max_lr: 0.1
+step_size: 10  # Number of rounds for half cycle
 
 # Knowledge distillation settings
-distillation:
-  enable: true
-  temperature: 3.0  # Increased from 2.0 for smoother probabilities
-  weight: 0.7  # Increased from 0.5 for stronger knowledge transfer
+distillation: true
+distillation_temp: 3.0  # Increased from 2.0 for smoother probabilities
+distillation_weight: 0.7  # Increased from 0.5 for stronger knowledge transfer
 
 # FedProx regularization
-fedprox:
-  enable: true
-  mu: 0.005  # Reduced from 0.01 for less aggressive regularization
+fedprox: true
+fedprox_mu: 0.005  # Reduced from 0.01 for less aggressive regularization
 
 # EWC regularization to prevent catastrophic forgetting
-ewc:
-  enable: true
-  importance: 5000
+ewc_enabled: true
+ewc_lambda: 0.4
+ewc_importance: 5000
+
+# Multi-level contrastive learning
+multi_level_rcl: true
+layer_weights: [0.1, 0.2, 0.2, 0.2, 0.3]  # Weights for different layers, higher for deeper layers
 
 # Client contrastive loss settings
 rcl_loss:
-  temperature: 0.2  # Increased from 0.1 for more stable gradients
+  temperature: 0.05  # Temperature parameter for contrastive loss
+  beta: 1.0  # Weight for the divergence penalty term
+  lambda_threshold: 0.7  # Similarity threshold for identifying too-similar pairs
   weight: 0.1
-  lambda_penalty: 0.03  # Reduced from 0.05
-  similarity_threshold: 0.4  # Reduced from 0.5
   pairs:
     - name: scl
       loss_type: "supervised"

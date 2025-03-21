@@ -341,6 +341,7 @@ class PersonalizedResNet18(ResNet18):
     def __init__(self, args: DictConfig, num_classes: int = 10, **kwargs):
         super().__init__(args, num_classes=num_classes, **kwargs)
         # Enable personalized mode by default
+        self.expansion = 1 
         self.use_personalized_head = True
         
         # Enhanced personalization options

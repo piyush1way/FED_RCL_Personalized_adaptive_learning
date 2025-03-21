@@ -17,6 +17,14 @@ class PersonalizedTrainer(BaseTrainer):
     def __init__(self, args, model, trainset, testset, clients, server, evaler):
         super().__init__(args, model, trainset, testset, clients, server, evaler)
         
+        # Ensure server is properly initialized
+        if isinstance(server, dict):
+            from servers.build import build_server
+            logger.warning("Server passed as dict, converting to proper server instance")
+            self.server = build_server(args)
+            if self.model is not None:
+                self.server.setup(self.model)
+        
         # Personalization settings
         personalization_config = getattr(args.trainer, "personalization", {})
         self.enable_personalization = personalization_config.get("enable", True)

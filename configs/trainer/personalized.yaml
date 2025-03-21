@@ -1,25 +1,5 @@
-# type: "BaseTrainer"
-
-# # Client participation settings
-# num_clients: 100  # Total number of clients
-# participation_rate: 0.05  # 5% participation rate (matches FedRCL paper)
-# global_rounds: 1000  # Total communication rounds
-
-# # Training settings
-# local_epochs: 5
-# batch_size: 64
-
-# # Learning rate settings
-# global_lr: 0.01  # Server-side learning rate
-# local_lr: 0.01  # Initial client-side learning rate
-# local_lr_decay: 0.998  # Matches FedRCL paper
-
-# # Personalization settings
-# personalization:
-#   enable: true
-#   adaptive_lr: true
-#   trust_filtering: true
-type: "BaseTrainer"
+# configs/trainer/personalized.yaml
+type: "PersonalizedTrainer"
 
 # Client participation settings
 num_clients: 100  # Total number of clients
@@ -41,3 +21,29 @@ personalization:
   enable: true
   adaptive_lr: true
   trust_filtering: true
+  fedprox:
+    enable: true
+    mu: 0.005  # FedProx regularization strength
+  ewc:
+    enable: true
+    lambda: 0.4  # EWC regularization strength
+    fisher_sample_size: 1000  # Number of samples to estimate Fisher Information
+
+# Relaxed Contrastive Loss settings
+rcl:
+  enable: true
+  temperature: 0.05
+  beta: 1.0
+  lambda_threshold: 0.7
+
+# Multi-level contrastive learning
+multi_level_cl:
+  enable: true
+  layer_weights: [0.1, 0.2, 0.3, 0.4]
+
+# Adaptive freezing
+adaptive_freezing:
+  enable: true
+  initial_freeze_ratio: 0.5
+  decay_rate: 0.05
+

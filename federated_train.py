@@ -3,6 +3,7 @@ from pathlib import Path
 import time
 import json
 import numpy as np
+import copy
 
 import torch
 import wandb
@@ -93,7 +94,10 @@ def main(args: DictConfig) -> None:
     # Get client and server types
     client_type = get_client_type(args)
     server_type = get_server_type(args)
+    
+    # Create server instance
     server = server_type(args)
+    server.setup(model)  # Initialize the server with the model
     
     # Build datasets with balanced subset sharing if enabled
     if hasattr(args.split, 'share_balanced_subset') and args.split.share_balanced_subset:
@@ -101,6 +105,11 @@ def main(args: DictConfig) -> None:
         datasets = build_datasets(args)
     else:
         datasets = build_datasets(args)
+    
+    # Create client instances
+    client_instances = {}
+    for client_idx in range(args.trainer.num_clients):
+        client_instances[client_idx] = client_type(args, client_idx, copy.deepcopy(model))
     
     # Get evaler and trainer types
     evaler_type = get_evaler_type(args)
@@ -138,8 +147,8 @@ def main(args: DictConfig) -> None:
         model=model,
         trainset=datasets['train'],
         testset=datasets['test'],
-        clients=client_type,
-        server=server,
+        clients=client_instances,  # Pass the dictionary of client instances
+        server=server,             # Pass the server instance
         evaler=evaler
     )
 

@@ -26,7 +26,7 @@ import omegaconf
 import coloredlogs, logging
 
 logger = logging.getLogger(__name__)
-coloredlogs.install(level='INFO', fmt='%(asctime)s %(name)s[%(process)d] %(message)s', datefmt='%m-%d %H:%M:%S')
+coloredlogs.install(level='INFO', fmt='%(asctime)s[%(name)s][%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
 wandb.require("service")
 
@@ -90,8 +90,10 @@ def main(args: DictConfig) -> None:
         else:
             logger.warning("Model does not support personalization. Using standard model.")
     
+    # Get client and server types
     client_type = get_client_type(args)
-    server = build_server(args)
+    server_type = get_server_type(args)
+    server = server_type(args)
     
     # Build datasets with balanced subset sharing if enabled
     if hasattr(args.split, 'share_balanced_subset') and args.split.share_balanced_subset:
@@ -100,6 +102,7 @@ def main(args: DictConfig) -> None:
     else:
         datasets = build_datasets(args)
     
+    # Get evaler and trainer types
     evaler_type = get_evaler_type(args)
     trainer_type = get_trainer_type(args)
 
@@ -111,7 +114,7 @@ def main(args: DictConfig) -> None:
     cyclical_lr_enabled = getattr(args.client, "cyclical_lr", False)
     fedprox_enabled = getattr(args.client, "fedprox", False)
     distillation_enabled = getattr(args.client, "distillation", False)
-    trust_filtering_enabled = getattr(args.client.trust_filtering, "enable", False)
+    trust_filtering_enabled = getattr(args.client.trust_filtering, "enable", False) if hasattr(args.client, "trust_filtering") else False
     multi_level_rcl = getattr(args.client, "multi_level_rcl", False)
     ewc_enabled = getattr(args.client, "ewc_enabled", False)
     
@@ -124,16 +127,20 @@ def main(args: DictConfig) -> None:
     logger.info(f"EWC Regularization: {ewc_enabled}")
     logger.info(f"Data Split Mode: {args.split.mode}, Alpha: {args.split.alpha}")
 
-    # Initialize trainer with all components
+    # Create evaler
+    evaler = evaler_type(args)
+    logger.info(f"=> Creating evaler '{evaler_type.__name__}'")
+    
+    # Create trainer
+    logger.info(f"=> Creating trainer '{trainer_type.__name__}'")
     trainer = trainer_type(
-        model=model,
-        client_type=client_type,
-        server=server,
-        evaler_type=evaler_type,
-        datasets=datasets,
-        device=device,
         args=args,
-        config=None,
+        model=model,
+        trainset=datasets['train'],
+        testset=datasets['test'],
+        clients=client_type,
+        server=server,
+        evaler=evaler
     )
 
     # Track metrics during training
@@ -151,14 +158,15 @@ def main(args: DictConfig) -> None:
 
     try:
         # Train the model
-        trained_model, metrics = trainer.train(track_metrics=True)
-        training_metrics.update(metrics)
+        trained_model, metrics = trainer.train()
+        if metrics:
+            training_metrics.update(metrics)
     except RuntimeError as e:
         logger.error(f"Training Failed: {e}")
         raise e
     
     logger.info("Training completed. Running final evaluation...")
-    final_results = trainer.evaluate(epoch=args.trainer.global_rounds)
+    final_results = trainer.evaluate(round_idx=args.trainer.global_rounds-1)
     
     # Log final results
     if args.wandb:
@@ -175,30 +183,22 @@ def main(args: DictConfig) -> None:
         logger.info(f"Personalization Improvement: {improvement:.2f}%")
     
     # Save final model
-    trainer.save_model(epoch=args.trainer.global_rounds-1, suffix="final")
+    if hasattr(trainer, 'save_model'):
+        trainer.save_model(suffix="final")
     
     # Evaluate personalization benefits if enabled
     if personalization_enabled:
-        logger.info("Evaluating per-client personalized models...")
-        per_client_results = track_trust_scores(trainer, args.trainer.num_clients)
+        logger.info("Evaluating personalization benefits...")
+        personalization_metrics = evaluate_personalization_benefits(
+            args, model, trainer.testloader, device
+        )
         
-        if args.analysis:
-            logger.info("Analyzing personalization benefits...")
-            personalization_analysis = evaluate_personalization_benefits(
-                trainer, 
-                datasets['test'], 
-                num_clients=min(20, args.trainer.num_clients)  # Analyze a subset of clients
-            )
-            
-            # Save analysis results
-            analysis_path = args.log_dir / "personalization_analysis.json"
-            save_dict_to_json(personalization_analysis, analysis_path)
-            
-            if args.wandb:
-                wandb.log({"personalization_analysis": personalization_analysis})
+        # Save personalization metrics
+        metrics_path = args.log_dir / "personalization_metrics.json"
+        save_dict_to_json(personalization_metrics, metrics_path)
         
         if args.wandb:
-            wandb.log({"per_client_results": per_client_results})
+            wandb.log({"personalization_metrics": personalization_metrics})
     
     # Save training metrics
     metrics_path = args.log_dir / "training_metrics.json"
@@ -207,22 +207,19 @@ def main(args: DictConfig) -> None:
     # Log novelty effectiveness
     if multi_level_rcl and "acc_personalized" in final_results:
         logger.info("Novelty Effectiveness:")
-        logger.info(f"1. Hybrid Personalized Head: {improvement:.2f}% accuracy improvement")
+        if "acc_personalized" in final_results and "acc" in final_results:
+            improvement = final_results['acc_personalized'] - final_results['acc']
+            logger.info(f"1. Hybrid Personalized Head: {improvement:.2f}% accuracy improvement")
         
-        if len(training_metrics["trust_scores"]) > 0:
-            avg_trust = np.mean(training_metrics["trust_scores"][-5:])  # Last 5 rounds
-            logger.info(f"2. Trust-Based Adaptive LR: Average trust score {avg_trust:.4f}")
+        if hasattr(trainer.server, 'trust_scores') and len(trainer.server.trust_scores) > 0:
+            trust_stats = track_trust_scores(trainer)
+            logger.info(f"2. Trust-Based Adaptive LR: Mean trust score {trust_stats['mean_trust']:.4f}")
+            logger.info(f"3. Soft Trust-Based Filtering: {trust_stats['trusted_clients']}/{trust_stats['total_clients']} trusted clients")
         
-        if len(training_metrics["client_participation"]) > 0:
-            avg_participation = np.mean(training_metrics["client_participation"][-5:])
-            logger.info(f"3. Soft Trust-Based Filtering: {avg_participation:.1f}% client participation")
-        
-        if len(training_metrics["rcl_loss"]) > 0:
-            rcl_improvement = training_metrics["rcl_loss"][0] - training_metrics["rcl_loss"][-1]
-            logger.info(f"4. Multi-Level Contrastive Learning: {rcl_improvement:.4f} RCL loss reduction")
+        if "bop" in personalization_metrics:
+            logger.info(f"4. Multi-Level Contrastive Learning: {personalization_metrics['bop']:.4f} benefit of personalization")
     
     logger.info(f"Experiment completed successfully! Total time: {(time.time() - start_time)/60:.2f} minutes")
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

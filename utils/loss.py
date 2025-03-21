@@ -21,7 +21,6 @@ __all__ = [
     'EWCLoss'
 ]
 
-
 class MultiLabelCrossEntropyLoss(nn.Module):
     def __init__(self, eps: float=0, alpha: float=0.2, topk_pos: int=-1, temp: float=1., **kwargs):
         super(MultiLabelCrossEntropyLoss, self).__init__()
@@ -206,7 +205,7 @@ class CLLoss(nn.Module):
             pair = self.pair
 
         pair_poss, pair_negs = [], []
-
+        
         for pos_name in pair['pos'].split(' '):
             if pos_name in sim_poss and sim_poss[pos_name].numel() > 0:
                 pair_poss.append(sim_poss[pos_name])
@@ -639,3 +638,4 @@ def KL_u_p_loss(outputs):
     uniform_dists = torch.autograd.Variable(uniform_tensors / num_classes).cuda()
     instance_losses = F.kl_div(F.log_softmax(outputs, dim=1), uniform_dists, reduction='none').sum(dim=1)
     return instance_losses
+

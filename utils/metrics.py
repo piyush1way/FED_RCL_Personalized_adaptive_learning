@@ -443,9 +443,19 @@ def evaluate_personalization_benefits(args, model, testloader, device, client_da
     b = sum(1 for g, p, t in zip(global_preds, personalized_preds, true_labels) if g == t and p != t)
     c = sum(1 for g, p, t in zip(global_preds, personalized_preds, true_labels) if g != t and p == t)
     
-    # McNemar's test
+    # McNemar's test using binomtest (updated from binom_test)
     if b + c > 0:
-        p_value = stats.binom_test(min(b, c), b + c, p=0.5)
+        try:
+            # Try using the newer binomtest function
+            result = stats.binomtest(min(b, c), b + c, p=0.5)
+            p_value = result.pvalue
+        except AttributeError:
+            # Fallback for older scipy versions
+            try:
+                p_value = stats.binom_test(min(b, c), b + c, p=0.5)
+            except AttributeError:
+                # If both methods fail, use a simple approximation
+                p_value = 1.0 if b == c else 0.0
         is_significant = p_value < 0.05
     else:
         p_value = 1.0

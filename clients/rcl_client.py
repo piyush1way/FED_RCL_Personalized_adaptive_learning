@@ -118,7 +118,7 @@ class RCLClient(Client):
         
         self._update_model(state_dict)
         self._update_global_model(state_dict)
-
+        
         self.model.to(self.device)
         self.global_model.to(self.device)
 
@@ -243,6 +243,22 @@ class RCLClient(Client):
             lr_lambda=lambda epoch: self.args.trainer.local_lr_decay ** epoch
         )
 
+    def _update_model(self, state_dict):
+        """Update local model with server state dict"""
+        if state_dict is not None:
+            if isinstance(self.model, torch.nn.DataParallel):
+                self.model.module.load_state_dict(state_dict, strict=False)
+            else:
+                self.model.load_state_dict(state_dict, strict=False)
+
+    def _update_global_model(self, state_dict):
+        """Update global model copy with server state dict"""
+        if state_dict is not None:
+            if isinstance(self.global_model, torch.nn.DataParallel):
+                self.global_model.module.load_state_dict(state_dict, strict=False)
+            else:
+                self.global_model.load_state_dict(state_dict, strict=False)
+
     def compute_fedprox_term(self):
         """Compute FedProx regularization term"""
         proximal_term = 0.0
@@ -324,254 +340,254 @@ class RCLClient(Client):
         
         return max(0.0, min(1.0, trust_score))
 
-    def compute_fisher_information(self):
-        """Compute Fisher Information Matrix for EWC regularization"""
-        if not self.ewc_enabled or self.loader is None:
-            return
-            
-        fisher_information = {}
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and 'personalized_head' not in name:
-                fisher_information[name] = torch.zeros_like(param)
+        def compute_fisher_information(self):
+            """Compute Fisher Information Matrix for EWC regularization"""
+            if not self.ewc_enabled or self.loader is None:
+                return
                 
-        self.model.eval()
-        for images, labels in self.loader:
-            images = images.to(self.device)
-            labels = labels.to(self.device)
-            
-            self.model.zero_grad()
-            output = self.model(images)
-            if isinstance(output, dict):
-                logits = output["logit"]
-            else:
-                logits = output
-                
-            log_probs = F.log_softmax(logits, dim=1)
-            samples = torch.multinomial(torch.exp(log_probs), 1).squeeze()
-            loss = F.nll_loss(log_probs, samples)
-            loss.backward()
-            
+            fisher_information = {}
             for name, param in self.model.named_parameters():
-                if param.requires_grad and param.grad is not None and 'personalized_head' not in name:
-                    fisher_information[name] += param.grad.pow(2).detach()
+                if param.requires_grad and 'personalized_head' not in name:
+                    fisher_information[name] = torch.zeros_like(param)
                     
-        for name in fisher_information:
-            fisher_information[name] /= len(self.loader) if len(self.loader) > 0 else 1.0
-            
-        self.fisher_information = fisher_information
-        self.optimal_parameters = {name: param.clone().detach() for name, param in self.model.named_parameters() 
-                                  if name in fisher_information}
-        self.model.train()
-
-    def compute_multi_level_rcl_loss(self, output, labels):
-        """Compute RCL loss across multiple feature levels"""
-        if not self.multi_level_rcl or not isinstance(output, dict):
-            return 0.0
-            
-        total_loss = 0.0
-        
-        # Get features from different layers
-        layer_features = []
-        for i in range(5):  # Assuming 5 layers (0-4)
-            layer_key = f"layer{i}"
-            if layer_key in output:
-                layer_features.append(output[layer_key])
-                
-        # If no layer features found, return 0
-        if not layer_features:
-            return 0.0
-            
-        # Apply RCL to each layer with weights
-        for i, features in enumerate(layer_features):
-            if i < len(self.layer_weights):
-                weight = self.layer_weights[i]
-                # Reshape features if needed
-                if len(features.shape) > 2:
-                    # Global average pooling for conv features
-                    features = F.adaptive_avg_pool2d(features, 1).view(features.size(0), -1)
-                
-                # Apply L2 normalization
-                features = F.normalize(features, p=2, dim=1)
-                
-                # Compute RCL loss for this layer
-                layer_loss = self.relaxed_contrastive_loss(features, labels)
-                total_loss += weight * layer_loss
-                
-        return total_loss
-
-    def local_train(self, global_epoch, **kwargs):
-        self.global_epoch = global_epoch
-    
-        scaler = GradScaler(enabled=self.device.type == "cuda")
-        start_time = time.time()
-        loss_meter = AverageMeter('Loss', ':.4f')
-        ce_loss_meter = AverageMeter('CE Loss', ':.4f')
-        rcl_loss_meter = AverageMeter('RCL Loss', ':.4f')
-        distillation_loss_meter = AverageMeter('Distill Loss', ':.4f')
-        fedprox_loss_meter = AverageMeter('FedProx Loss', ':.4f')
-        ewc_loss_meter = AverageMeter('EWC Loss', ':.4f')
-        multi_level_rcl_meter = AverageMeter('Multi-Level RCL', ':.4f')
-    
-        if self.loader is None or len(self.loader) == 0:
-            logger.warning(f"[C{self.client_index}] No data for training!")
-            return None, None
-    
-        for local_epoch in range(self.local_epochs):
-            epoch_loss = 0.0
-            samples_processed = 0
-            
+            self.model.eval()
             for images, labels in self.loader:
-                if len(images) < 2:
-                    continue
-                    
-                images = images.to(self.device, non_blocking=True)
-                labels = labels.to(self.device, non_blocking=True)
-    
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+                
                 self.model.zero_grad()
+                output = self.model(images)
+                if isinstance(output, dict):
+                    logits = output["logit"]
+                else:
+                    logits = output
+                    
+                log_probs = F.log_softmax(logits, dim=1)
+                samples = torch.multinomial(torch.exp(log_probs), 1).squeeze()
+                loss = F.nll_loss(log_probs, samples)
+                loss.backward()
+                
+                for name, param in self.model.named_parameters():
+                    if param.requires_grad and param.grad is not None and 'personalized_head' not in name:
+                        fisher_information[name] += param.grad.pow(2).detach()
+                        
+            for name in fisher_information:
+                fisher_information[name] /= len(self.loader) if len(self.loader) > 0 else 1.0
+                
+            self.fisher_information = fisher_information
+            self.optimal_parameters = {name: param.clone().detach() for name, param in self.model.named_parameters() 
+                                      if name in fisher_information}
+            self.model.train()
     
-                with autocast(enabled=self.device.type == "cuda"):
-                    output = self.model(images, get_projection=True)
+        def compute_multi_level_rcl_loss(self, output, labels):
+            """Compute RCL loss across multiple feature levels"""
+            if not self.multi_level_rcl or not isinstance(output, dict):
+                return 0.0
+                
+            total_loss = 0.0
+            
+            # Get features from different layers
+            layer_features = []
+            for i in range(5):  # Assuming 5 layers (0-4)
+                layer_key = f"layer{i}"
+                if layer_key in output:
+                    layer_features.append(output[layer_key])
                     
-                    if isinstance(output, dict):
-                        logits = output["logit"] if "logit" in output else output.get("personalized_logit", output)
-                        features = output.get("feature", None)
-                        projection = output.get("projection", None)
+            # If no layer features found, return 0
+            if not layer_features:
+                return 0.0
+                
+            # Apply RCL to each layer with weights
+            for i, features in enumerate(layer_features):
+                if i < len(self.layer_weights):
+                    weight = self.layer_weights[i]
+                    # Reshape features if needed
+                    if len(features.shape) > 2:
+                        # Global average pooling for conv features
+                        features = F.adaptive_avg_pool2d(features, 1).view(features.size(0), -1)
+                    
+                    # Apply L2 normalization
+                    features = F.normalize(features, p=2, dim=1)
+                    
+                    # Compute RCL loss for this layer
+                    layer_loss = self.relaxed_contrastive_loss(features, labels)
+                    total_loss += weight * layer_loss
+                    
+            return total_loss
+    
+        def local_train(self, global_epoch, **kwargs):
+            self.global_epoch = global_epoch
+        
+            scaler = GradScaler(enabled=self.device.type == "cuda")
+            start_time = time.time()
+            loss_meter = AverageMeter('Loss', ':.4f')
+            ce_loss_meter = AverageMeter('CE Loss', ':.4f')
+            rcl_loss_meter = AverageMeter('RCL Loss', ':.4f')
+            distillation_loss_meter = AverageMeter('Distill Loss', ':.4f')
+            fedprox_loss_meter = AverageMeter('FedProx Loss', ':.4f')
+            ewc_loss_meter = AverageMeter('EWC Loss', ':.4f')
+            multi_level_rcl_meter = AverageMeter('Multi-Level RCL', ':.4f')
+        
+            if self.loader is None or len(self.loader) == 0:
+                logger.warning(f"[C{self.client_index}] No data for training!")
+                return None, None
+        
+            for local_epoch in range(self.local_epochs):
+                epoch_loss = 0.0
+                samples_processed = 0
+                
+                for images, labels in self.loader:
+                    if len(images) < 2:
+                        continue
+                        
+                    images = images.to(self.device, non_blocking=True)
+                    labels = labels.to(self.device, non_blocking=True)
+        
+                    self.model.zero_grad()
+        
+                    with autocast(enabled=self.device.type == "cuda"):
+                        output = self.model(images, get_projection=True)
+                        
+                        if isinstance(output, dict):
+                            logits = output["logit"] if "logit" in output else output.get("personalized_logit", output)
+                            features = output.get("feature", None)
+                            projection = output.get("projection", None)
+                        else:
+                            logits = output
+                            features = None
+                            projection = None
+                        
+                        ce_loss = self.criterion(logits, labels)
+                        
+                        rcl_loss = 0.0
+                        if hasattr(self.args.client, 'rcl_loss') and getattr(self.args.client.rcl_loss, 'weight', 0) > 0:
+                            contrastive_features = projection if projection is not None else features
+                            
+                            if contrastive_features is not None and len(contrastive_features) >= 2:
+                                rcl_weight = getattr(self.args.client.rcl_loss, 'weight', 0.1)
+                                rcl_loss = self.relaxed_contrastive_loss(contrastive_features, labels) * rcl_weight
+                        
+                        # Multi-level contrastive learning
+                        multi_level_rcl_loss = 0.0
+                        if self.multi_level_rcl and isinstance(output, dict):
+                            multi_level_rcl_loss = self.compute_multi_level_rcl_loss(output, labels)
+                            multi_level_rcl_meter.update(multi_level_rcl_loss.item(), images.size(0))
+                        
+                        distillation_loss = 0.0
+                        if self.enable_distillation:
+                            with torch.no_grad():
+                                global_output = self.global_model(images)
+                                if isinstance(global_output, dict):
+                                    global_logits = global_output.get("global_logit", global_output.get("logit", None))
+                                    global_features = global_output.get("feature", None)
+                                else:
+                                    global_logits = global_output
+                                    global_features = None
+                                    
+                            if global_logits is not None:
+                                distillation_loss = self.compute_distillation_loss(
+                                    logits, global_logits, features, global_features
+                                ) * self.distillation_weight
+                        
+                        fedprox_loss = 0.0
+                        if self.enable_fedprox:
+                            fedprox_loss = self.compute_fedprox_term()
+                            
+                        ewc_loss = 0.0
+                        if self.ewc_enabled and self.fisher_information is not None:
+                            ewc_loss = self.compute_ewc_loss()
+                        
+                        loss = ce_loss + rcl_loss + multi_level_rcl_loss + distillation_loss + fedprox_loss + ewc_loss
+                        
+                        ce_loss_meter.update(ce_loss.item(), images.size(0))
+                        if rcl_loss > 0:
+                            rcl_loss_meter.update(rcl_loss.item(), images.size(0))
+                        if distillation_loss > 0:
+                            distillation_loss_meter.update(distillation_loss.item(), images.size(0))
+                        if fedprox_loss > 0:
+                            fedprox_loss_meter.update(fedprox_loss.item(), images.size(0))
+                        if ewc_loss > 0:
+                            ewc_loss_meter.update(ewc_loss.item(), images.size(0))
+                    
+                    if not torch.isfinite(loss):
+                        logger.warning(f"[C{self.client_index}] Loss is {loss}, skipping batch")
+                        continue
+                        
+                    if self.device.type == "cuda":
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(self.optimizer)
                     else:
-                        logits = output
-                        features = None
-                        projection = None
+                        loss.backward()
                     
-                    ce_loss = self.criterion(logits, labels)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
                     
-                    rcl_loss = 0.0
-                    if hasattr(self.args.client, 'rcl_loss') and getattr(self.args.client.rcl_loss, 'weight', 0) > 0:
-                        contrastive_features = projection if projection is not None else features
+                    if self.device.type == "cuda":
+                        scaler.step(self.optimizer)
+                        scaler.update()
+                    else:
+                        self.optimizer.step()
                         
-                        if contrastive_features is not None and len(contrastive_features) >= 2:
-                            rcl_weight = getattr(self.args.client.rcl_loss, 'weight', 0.1)
-                            rcl_loss = self.relaxed_contrastive_loss(contrastive_features, labels) * rcl_weight
+                    batch_size = images.size(0)
+                    loss_meter.update(loss.item(), batch_size)
+                    epoch_loss += loss.item() * batch_size
+                    samples_processed += batch_size
                     
-                    # Multi-level contrastive learning
-                    multi_level_rcl_loss = 0.0
-                    if self.multi_level_rcl and isinstance(output, dict):
-                        multi_level_rcl_loss = self.compute_multi_level_rcl_loss(output, labels)
-                        multi_level_rcl_meter.update(multi_level_rcl_loss.item(), images.size(0))
-                    
-                    distillation_loss = 0.0
-                    if self.enable_distillation:
-                        with torch.no_grad():
-                            global_output = self.global_model(images)
-                            if isinstance(global_output, dict):
-                                global_logits = global_output.get("global_logit", global_output.get("logit", None))
-                                global_features = global_output.get("feature", None)
-                            else:
-                                global_logits = global_output
-                                global_features = None
-                                
-                        if global_logits is not None:
-                            distillation_loss = self.compute_distillation_loss(
-                                logits, global_logits, features, global_features
-                            ) * self.distillation_weight
-                    
-                    fedprox_loss = 0.0
-                    if self.enable_fedprox:
-                        fedprox_loss = self.compute_fedprox_term()
-                        
-                    ewc_loss = 0.0
-                    if self.ewc_enabled and self.fisher_information is not None:
-                        ewc_loss = self.compute_ewc_loss()
-                    
-                    loss = ce_loss + rcl_loss + multi_level_rcl_loss + distillation_loss + fedprox_loss + ewc_loss
-                    
-                    ce_loss_meter.update(ce_loss.item(), images.size(0))
-                    if rcl_loss > 0:
-                        rcl_loss_meter.update(rcl_loss.item(), images.size(0))
-                    if distillation_loss > 0:
-                        distillation_loss_meter.update(distillation_loss.item(), images.size(0))
-                    if fedprox_loss > 0:
-                        fedprox_loss_meter.update(fedprox_loss.item(), images.size(0))
-                    if ewc_loss > 0:
-                        ewc_loss_meter.update(ewc_loss.item(), images.size(0))
-                
-                if not torch.isfinite(loss):
-                    logger.warning(f"[C{self.client_index}] Loss is {loss}, skipping batch")
-                    continue
-                    
-                if self.device.type == "cuda":
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(self.optimizer)
+                if samples_processed > 0:
+                    logger.info(f"[C{self.client_index}] Epoch {local_epoch+1}/{self.local_epochs}, Loss: {epoch_loss/samples_processed:.4f}")
                 else:
-                    loss.backward()
+                    logger.warning(f"[C{self.client_index}] No samples processed in epoch {local_epoch+1}")
                 
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
+                self.scheduler.step()
                 
-                if self.device.type == "cuda":
-                    scaler.step(self.optimizer)
-                    scaler.update()
+            end_time = time.time()
+            training_time = end_time - start_time
+            
+            self.ce_loss_avg = ce_loss_meter.avg
+            self.rcl_loss_avg = rcl_loss_meter.avg
+            self.distillation_loss_avg = distillation_loss_meter.avg
+            self.fedprox_loss_avg = fedprox_loss_meter.avg
+            self.ewc_loss_avg = ewc_loss_meter.avg
+            self.multi_level_rcl_avg = multi_level_rcl_meter.avg
+            
+            if self.ewc_enabled and self.rounds_trained > 1:
+                self.compute_fisher_information()
+            
+            trust_score = self.compute_trust_score() if self.enable_trust_filtering else 1.0
+            logger.info(f"[C{self.client_index}] Training Complete. Time: {training_time:.2f}s, Loss: {loss_meter.avg:.4f}, Trust Score: {trust_score:.3f}")
+            
+            if self.enable_personalization:
+                if isinstance(self.model, torch.nn.DataParallel):
+                    model_module = self.model.module
                 else:
-                    self.optimizer.step()
+                    model_module = self.model
                     
-                batch_size = images.size(0)
-                loss_meter.update(loss.item(), batch_size)
-                epoch_loss += loss.item() * batch_size
-                samples_processed += batch_size
+                if hasattr(model_module, 'get_global_params'):
+                    global_params = model_module.get_global_params()
+                    return_dict = {k: v.cpu() for k, v in global_params.items()}
+                else:
+                    return_dict = {k: v.cpu() for k, v in self.model.state_dict().items() 
+                                  if 'personalized_head' not in k}
+            else:
+                return_dict = {k: v.cpu() for k, v in self.model.state_dict().items()}
                 
-            if samples_processed > 0:
-                logger.info(f"[C{self.client_index}] Epoch {local_epoch+1}/{self.local_epochs}, Loss: {epoch_loss/samples_processed:.4f}")
-            else:
-                logger.warning(f"[C{self.client_index}] No samples processed in epoch {local_epoch+1}")
-            
-            self.scheduler.step()
-            
-        end_time = time.time()
-        training_time = end_time - start_time
-        
-        self.ce_loss_avg = ce_loss_meter.avg
-        self.rcl_loss_avg = rcl_loss_meter.avg
-        self.distillation_loss_avg = distillation_loss_meter.avg
-        self.fedprox_loss_avg = fedprox_loss_meter.avg
-        self.ewc_loss_avg = ewc_loss_meter.avg
-        self.multi_level_rcl_avg = multi_level_rcl_meter.avg
-        
-        if self.ewc_enabled and self.rounds_trained > 1:
-            self.compute_fisher_information()
-        
-        trust_score = self.compute_trust_score() if self.enable_trust_filtering else 1.0
-        logger.info(f"[C{self.client_index}] Training Complete. Time: {training_time:.2f}s, Loss: {loss_meter.avg:.4f}, Trust Score: {trust_score:.3f}")
-        
-        if self.enable_personalization:
-            if isinstance(self.model, torch.nn.DataParallel):
-                model_module = self.model.module
-            else:
-                model_module = self.model
+            if self.enable_trust_filtering and trust_score < self.trust_threshold:
+                logger.warning(f"[C{self.client_index}] Skipped in Aggregation (Trust Score {trust_score:.3f} < {self.trust_threshold})")
+                return None, None
                 
-            if hasattr(model_module, 'get_global_params'):
-                global_params = model_module.get_global_params()
-                return_dict = {k: v.cpu() for k, v in global_params.items()}
-            else:
-                return_dict = {k: v.cpu() for k, v in self.model.state_dict().items() 
-                              if 'personalized_head' not in k}
-        else:
-            return_dict = {k: v.cpu() for k, v in self.model.state_dict().items()}
-            
-        if self.enable_trust_filtering and trust_score < self.trust_threshold:
-            logger.warning(f"[C{self.client_index}] Skipped in Aggregation (Trust Score {trust_score:.3f} < {self.trust_threshold})")
-            return None, None
-            
-        self.model = self.model.cpu()
-        self.global_model = self.global_model.cpu()
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
-        return return_dict, {
-            "loss": float(loss_meter.avg), 
-            "trust_score": trust_score, 
-            "ce_loss": float(self.ce_loss_avg),
-            "rcl_loss": float(self.rcl_loss_avg),
-            "multi_level_rcl": float(self.multi_level_rcl_avg),
-            "distillation_loss": float(self.distillation_loss_avg),
-            "fedprox_loss": float(self.fedprox_loss_avg),
-            "ewc_loss": float(self.ewc_loss_avg)
-        }
+            self.model = self.model.cpu()
+            self.global_model = self.global_model.cpu()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            return return_dict, {
+                "loss": float(loss_meter.avg), 
+                "trust_score": trust_score, 
+                "ce_loss": float(self.ce_loss_avg),
+                "rcl_loss": float(self.rcl_loss_avg),
+                "multi_level_rcl": float(self.multi_level_rcl_avg),
+                "distillation_loss": float(self.distillation_loss_avg),
+                "fedprox_loss": float(self.fedprox_loss_avg),
+                "ewc_loss": float(self.ewc_loss_avg)
+            }
 

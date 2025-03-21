@@ -186,7 +186,43 @@ class BaseTrainer:
         # Global model evaluation
         with torch.no_grad():
             if self.evaler:
-                global_acc = self.evaler.evaluate(model=test_model, test_dataset=self.testset)
+                test_loader = DataLoader(
+                    self.testset,
+                    batch_size=128,
+                    shuffle=False,
+                    num_workers=2,
+                    pin_memory=True
+                )
+                
+                correct = 0
+                total = 0
+                
+                for data in test_loader:
+                    if isinstance(data, (tuple, list)) and len(data) >= 2:
+                        images, labels = data[0], data[1]
+                    else:
+                        images = data
+                        labels = torch.zeros(images.size(0))  # Default labels if not provided
+                        
+                    images = images.to(self.device)
+                    labels = labels.to(self.device)
+                    
+                    outputs = test_model(images)
+                    
+                    # Handle different output formats
+                    if isinstance(outputs, dict):
+                        logits = outputs.get("logit", outputs.get("global_logit", None))
+                        if logits is None:
+                            # If no logits found in dict, use the first tensor
+                            logits = next(tensor for tensor in outputs.values() if isinstance(tensor, torch.Tensor))
+                    else:
+                        logits = outputs
+                    
+                    _, predicted = torch.max(logits.data, 1)
+                    total += labels.size(0)
+                    correct += (predicted == labels).sum().item()
+                
+                global_acc = 100.0 * correct / total
                 metrics['acc'] = global_acc
                 logger.info(f"Round {round_idx} | Global Model Accuracy: {global_acc:.2f}%")
             
@@ -198,6 +234,8 @@ class BaseTrainer:
             for client_idx in list(self.clients.keys())[:num_eval_clients]:
                 # Create personalized model
                 personalized_model = copy.deepcopy(test_model)
+                if hasattr(personalized_model, 'enable_personalized_mode'):
+                    personalized_model.enable_personalized_mode()
                 
                 # Get client dataset
                 client_dataset = self.trainset.get(client_idx, None)
@@ -219,19 +257,64 @@ class BaseTrainer:
                         
                         personalized_model.train()
                         for _ in range(5):  # Few epochs of fine-tuning
-                            for inputs, targets in client_loader:
-                                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                            for batch in client_loader:
+                                if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+                                    inputs, targets = batch[0], batch[1]
+                                else:
+                                    inputs = batch
+                                    targets = torch.zeros(inputs.size(0))  # Default labels if not provided
+                                
+                                inputs = inputs.to(self.device)
+                                targets = targets.to(self.device)
+                                
                                 optimizer.zero_grad()
                                 outputs = personalized_model(inputs)
-                                loss = self.criterion(outputs, targets)
+                                
+                                # Handle different output formats
+                                if isinstance(outputs, dict):
+                                    logits = outputs.get("logit", outputs.get("personalized_logit", None))
+                                    if logits is None:
+                                        logits = next(tensor for tensor in outputs.values() if isinstance(tensor, torch.Tensor))
+                                else:
+                                    logits = outputs
+                                
+                                loss = self.criterion(logits, targets)
                                 loss.backward()
                                 optimizer.step()
                         
                         # Evaluate personalized model
                         personalized_model.eval()
-                        if self.evaler:
-                            client_acc = self.evaler.evaluate(model=personalized_model, test_dataset=self.testset)
+                        correct = 0
+                        total = 0
+                        
+                        with torch.no_grad():
+                            for batch in test_loader:
+                                if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+                                    inputs, targets = batch[0], batch[1]
+                                else:
+                                    inputs = batch
+                                    targets = torch.zeros(inputs.size(0))  # Default labels if not provided
+                                
+                                inputs = inputs.to(self.device)
+                                targets = targets.to(self.device)
+                                
+                                outputs = personalized_model(inputs)
+                                
+                                # Handle different output formats
+                                if isinstance(outputs, dict):
+                                    logits = outputs.get("logit", outputs.get("personalized_logit", None))
+                                    if logits is None:
+                                        logits = next(tensor for tensor in outputs.values() if isinstance(tensor, torch.Tensor))
+                                else:
+                                    logits = outputs
+                                
+                                _, predicted = torch.max(logits.data, 1)
+                                total += targets.size(0)
+                                correct += (predicted == targets).sum().item()
+                            
+                            client_acc = 100.0 * correct / total
                             client_accs.append(client_acc)
+                            
                     except Exception as e:
                         logger.error(f"Error personalizing for client {client_idx}: {str(e)}")
             

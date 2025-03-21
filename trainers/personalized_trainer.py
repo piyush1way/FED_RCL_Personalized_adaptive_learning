@@ -94,6 +94,19 @@ class PersonalizedTrainer(BaseTrainer):
             for client_idx in selected_clients:
                 client = self.clients[client_idx]
                 
+                # Determine learning rate (adaptive if enabled)
+                local_lr = self.args.trainer.local_lr
+                if self.adaptive_lr and hasattr(client, 'trust_score'):
+                    trust_score = getattr(client, 'trust_score', 1.0)
+                    local_lr = setup_adaptive_learning_rate(
+                        base_lr=self.args.trainer.local_lr,
+                        max_lr=self.args.trainer.local_lr * 2,
+                        trust_score=trust_score,
+                        step=round_idx,
+                        step_size=10
+                    )
+                    logger.debug(f"Client {client_idx} adaptive LR: {local_lr:.6f} (trust: {trust_score:.2f})")
+                
                 # Setup client for training
                 if hasattr(client, 'setup'):
                     client.setup(
@@ -101,7 +114,8 @@ class PersonalizedTrainer(BaseTrainer):
                         device=self.device,
                         local_dataset=self.trainset[client_idx],
                         global_epoch=round_idx,
-                        local_lr=self.args.trainer.local_lr  # Use base learning rate
+                        local_lr=local_lr,
+                        trainer=self  # Add back the trainer parameter
                     )
                 
                 # Train client

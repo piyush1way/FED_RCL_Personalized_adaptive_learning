@@ -26,35 +26,46 @@ class RCLClient(Client):
         self.client_index = client_index
         self.loader = None
 
+        # Trust-based client filtering configuration
         trust_filtering_config = getattr(args.client, "trust_filtering", {})
         self.enable_trust_filtering = getattr(trust_filtering_config, "enable", False)
         self.trust_threshold = getattr(trust_filtering_config, "trust_threshold", 0.5)
+        self.trust_score_history = []
         
+        # Client state tracking
         self.rounds_trained = 0
         self.previous_model_state = None
         self.update_history = []
+        self.gradient_history = []
 
+        # Personalization configuration
         personalization_config = getattr(args.client, "personalization", {})
         self.enable_personalization = getattr(personalization_config, "enable", False)
         self.freeze_backbone = getattr(personalization_config, "freeze_backbone", False)
         self.adaptive_layer_freezing = getattr(personalization_config, "adaptive_layer_freezing", False)
+        self.freeze_ratio = getattr(personalization_config, "freeze_ratio", 0.5)
 
-        self.enable_cyclical_lr = True
-        self.base_lr = 0.001
-        self.max_lr = 0.1
-        self.step_size = 10
+        # Trust-based adaptive learning rate
+        self.enable_cyclical_lr = getattr(args.client, "cyclical_lr", True)
+        self.base_lr = getattr(args.client, "base_lr", 0.001)
+        self.max_lr = getattr(args.client, "max_lr", 0.1)
+        self.step_size = getattr(args.client, "step_size", 10)
         
-        self.enable_fedprox = True
-        self.fedprox_mu = 0.005
+        # Regularization options
+        self.enable_fedprox = getattr(args.client, "fedprox", True)
+        self.fedprox_mu = getattr(args.client, "fedprox_mu", 0.005)
 
-        self.enable_distillation = True
-        self.distillation_temp = 3.0
-        self.distillation_weight = 0.7
+        # Knowledge distillation for personalized heads
+        self.enable_distillation = getattr(args.client, "distillation", True)
+        self.distillation_temp = getattr(args.client, "distillation_temp", 3.0)
+        self.distillation_weight = getattr(args.client, "distillation_weight", 0.7)
 
+        # Model setup
         self.model = model
         self.global_model = copy.deepcopy(model)
         self.device = torch.device("cpu")
 
+        # Multi-level contrastive learning setup
         self.rcl_criterions = {'scl': None, 'penalty': None}
         args_rcl = getattr(args.client, "rcl_loss", None)
         if args_rcl:
@@ -68,30 +79,39 @@ class RCLClient(Client):
         self.global_epoch = 0
         self.criterion = nn.CrossEntropyLoss()
         
+        # Relaxed contrastive loss with divergence penalty
         self.relaxed_contrastive_loss = RelaxedContrastiveLoss(
-            temperature=0.05,
-            beta=1.0,
-            lambda_threshold=0.7
+            temperature=getattr(args.client, "temperature", 0.05),
+            beta=getattr(args.client, "beta", 1.0),
+            lambda_threshold=getattr(args.client, "lambda_threshold", 0.7)
         )
-
         
+        # Loss tracking
         self.ce_loss_avg = 0.0
         self.rcl_loss_avg = 0.0
         self.distillation_loss_avg = 0.0
         self.fedprox_loss_avg = 0.0
         
-        self.ewc_importance = 5000
-        self.ewc_enabled = True
+        # EWC parameters for continual learning
+        self.ewc_importance = getattr(args.client, "ewc_importance", 5000)
+        self.ewc_enabled = getattr(args.client, "ewc_enabled", True)
+        self.ewc_lambda = getattr(args.client, "ewc_lambda", 0.4)
         self.fisher_information = None
         self.optimal_parameters = None
+        
+        # Multi-level contrastive learning configuration
+        self.multi_level_rcl = getattr(args.client, "multi_level_rcl", True)
+        self.layer_weights = getattr(args.client, "layer_weights", [0.2, 0.2, 0.2, 0.2, 0.2])
 
     def setup(self, state_dict, device, local_dataset, global_epoch, local_lr, trainer, **kwargs):
         self.device = device
         self.rounds_trained += 1
         
+        # Save previous model state for trust score calculation
         if self.enable_trust_filtering and hasattr(self.model, 'state_dict'):
             self.previous_model_state = {k: v.to(device) for k, v in self.model.state_dict().items()}
         
+        # Save optimal parameters for EWC
         if self.ewc_enabled and self.fisher_information is not None:
             self.optimal_parameters = {k: v.clone().detach() for k, v in self.model.state_dict().items() 
                                       if 'personalized_head' not in k}
@@ -102,9 +122,11 @@ class RCLClient(Client):
         self.model.to(self.device)
         self.global_model.to(self.device)
 
+        # Freeze global model for distillation
         for param in self.global_model.parameters():
             param.requires_grad = False
 
+        # Configure personalization if enabled
         if self.enable_personalization:
             if isinstance(self.model, torch.nn.DataParallel):
                 model_module = self.model.module
@@ -116,19 +138,22 @@ class RCLClient(Client):
             elif hasattr(model_module, 'use_personalized_head'):
                 model_module.use_personalized_head = True
                 
+            # Freeze backbone for faster personalization
             if self.freeze_backbone and hasattr(model_module, 'freeze_backbone'):
                 if self.rounds_trained < 3:
                     model_module.unfreeze_backbone()
                 else:
                     model_module.freeze_backbone()
                 
+            # Adaptive layer freezing based on training progress
             if self.adaptive_layer_freezing and hasattr(model_module, 'setup_adaptive_freezing'):
-                freeze_ratio = max(0.0, 0.8 - (self.rounds_trained / 50.0))
+                freeze_ratio = max(0.0, self.freeze_ratio - (self.rounds_trained / 50.0))
                 model_module.setup_adaptive_freezing(freeze_ratio=freeze_ratio)
 
         self.trainer = trainer
         self.global_epoch = global_epoch
 
+        # Create data loader
         if local_dataset is None or len(local_dataset) == 0:
             logger.warning(f"[C{self.client_index}] Empty dataset provided. Creating a dummy loader.")
             self.loader = None
@@ -146,15 +171,25 @@ class RCLClient(Client):
                 drop_last=True
             )
 
+        # Trust-based adaptive learning rate
         if self.enable_cyclical_lr:
+            # Calculate trust-adjusted learning rate
+            trust_score = self.compute_trust_score() if len(self.trust_score_history) > 0 else 0.8
+            
+            # Cyclical LR with trust adjustment
             cycle_step = self.rounds_trained % (2 * self.step_size)
             x = abs(cycle_step / self.step_size - 1)
-            adjusted_lr = self.base_lr + (self.max_lr - self.base_lr) * max(0, (1 - x))
-            logger.info(f"[C{self.client_index}] Cyclical LR: {adjusted_lr:.6f} (cycle step: {cycle_step})")
+            
+            # Adjust max_lr based on trust score
+            adjusted_max_lr = self.max_lr * (0.5 + 0.5 * trust_score)
+            
+            adjusted_lr = self.base_lr + (adjusted_max_lr - self.base_lr) * max(0, (1 - x))
+            logger.info(f"[C{self.client_index}] Trust-based Cyclical LR: {adjusted_lr:.6f} (trust: {trust_score:.2f}, cycle step: {cycle_step})")
             local_lr = adjusted_lr
         else:
             logger.info(f"[C{self.client_index}] Using base LR: {local_lr:.6f}")
 
+        # Configure optimizer with different learning rates for personalized and backbone parameters
         if self.enable_personalization:
             if hasattr(model_module, 'get_local_params'):
                 personalized_params = []
@@ -197,6 +232,7 @@ class RCLClient(Client):
                 weight_decay=self.args.optimizer.wd
             )
             
+        # Increase local epochs for early rounds to improve convergence
         if self.rounds_trained < 5:
             self.local_epochs = min(30, self.args.trainer.local_epochs * 3)
         else:
@@ -208,12 +244,14 @@ class RCLClient(Client):
         )
 
     def compute_fedprox_term(self):
+        """Compute FedProx regularization term"""
         proximal_term = 0.0
         for w, w_t in zip(self.model.parameters(), self.global_model.parameters()):
             proximal_term += (w - w_t).norm(2)**2
         return self.fedprox_mu * proximal_term / 2
 
     def compute_distillation_loss(self, student_logits, teacher_logits, features=None, teacher_features=None):
+        """Compute knowledge distillation loss with feature alignment"""
         temp = self.distillation_temp
         soft_targets = F.softmax(teacher_logits / temp, dim=1)
         log_probs = F.log_softmax(student_logits / temp, dim=1)
@@ -242,9 +280,8 @@ class RCLClient(Client):
         
         return self.ewc_lambda * loss
 
-
-
     def compute_trust_score(self):
+        """Compute trust score based on update magnitude and consistency"""
         if self.previous_model_state is None:
             return 1.0
         
@@ -270,16 +307,25 @@ class RCLClient(Client):
             
         update_variance = np.var(self.update_history) if len(self.update_history) > 1 else 0.0
         
+        # Compute trust score components
         magnitude_score = 1.0 / (1.0 + update_norm)
         consistency_score = 1.0 / (1.0 + update_variance)
         
+        # Combine scores with weights
         trust_score = 0.7 * magnitude_score + 0.3 * consistency_score
         
+        # Save current state for next round
         self.previous_model_state = {k: v.detach().clone().to(self.device) for k, v in current_state.items()}
+        
+        # Add to history for tracking
+        self.trust_score_history.append(trust_score)
+        if len(self.trust_score_history) > 10:
+            self.trust_score_history.pop(0)
         
         return max(0.0, min(1.0, trust_score))
 
     def compute_fisher_information(self):
+        """Compute Fisher Information Matrix for EWC regularization"""
         if not self.ewc_enabled or self.loader is None:
             return
             
@@ -317,9 +363,45 @@ class RCLClient(Client):
                                   if name in fisher_information}
         self.model.train()
 
+    def compute_multi_level_rcl_loss(self, output, labels):
+        """Compute RCL loss across multiple feature levels"""
+        if not self.multi_level_rcl or not isinstance(output, dict):
+            return 0.0
+            
+        total_loss = 0.0
+        
+        # Get features from different layers
+        layer_features = []
+        for i in range(5):  # Assuming 5 layers (0-4)
+            layer_key = f"layer{i}"
+            if layer_key in output:
+                layer_features.append(output[layer_key])
+                
+        # If no layer features found, return 0
+        if not layer_features:
+            return 0.0
+            
+        # Apply RCL to each layer with weights
+        for i, features in enumerate(layer_features):
+            if i < len(self.layer_weights):
+                weight = self.layer_weights[i]
+                # Reshape features if needed
+                if len(features.shape) > 2:
+                    # Global average pooling for conv features
+                    features = F.adaptive_avg_pool2d(features, 1).view(features.size(0), -1)
+                
+                # Apply L2 normalization
+                features = F.normalize(features, p=2, dim=1)
+                
+                # Compute RCL loss for this layer
+                layer_loss = self.relaxed_contrastive_loss(features, labels)
+                total_loss += weight * layer_loss
+                
+        return total_loss
+
     def local_train(self, global_epoch, **kwargs):
         self.global_epoch = global_epoch
-
+    
         scaler = GradScaler(enabled=self.device.type == "cuda")
         start_time = time.time()
         loss_meter = AverageMeter('Loss', ':.4f')
@@ -328,11 +410,12 @@ class RCLClient(Client):
         distillation_loss_meter = AverageMeter('Distill Loss', ':.4f')
         fedprox_loss_meter = AverageMeter('FedProx Loss', ':.4f')
         ewc_loss_meter = AverageMeter('EWC Loss', ':.4f')
-
+        multi_level_rcl_meter = AverageMeter('Multi-Level RCL', ':.4f')
+    
         if self.loader is None or len(self.loader) == 0:
             logger.warning(f"[C{self.client_index}] No data for training!")
             return None, None
-
+    
         for local_epoch in range(self.local_epochs):
             epoch_loss = 0.0
             samples_processed = 0
@@ -343,9 +426,9 @@ class RCLClient(Client):
                     
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
-
+    
                 self.model.zero_grad()
-
+    
                 with autocast(enabled=self.device.type == "cuda"):
                     output = self.model(images, get_projection=True)
                     
@@ -367,6 +450,12 @@ class RCLClient(Client):
                         if contrastive_features is not None and len(contrastive_features) >= 2:
                             rcl_weight = getattr(self.args.client.rcl_loss, 'weight', 0.1)
                             rcl_loss = self.relaxed_contrastive_loss(contrastive_features, labels) * rcl_weight
+                    
+                    # Multi-level contrastive learning
+                    multi_level_rcl_loss = 0.0
+                    if self.multi_level_rcl and isinstance(output, dict):
+                        multi_level_rcl_loss = self.compute_multi_level_rcl_loss(output, labels)
+                        multi_level_rcl_meter.update(multi_level_rcl_loss.item(), images.size(0))
                     
                     distillation_loss = 0.0
                     if self.enable_distillation:
@@ -392,7 +481,7 @@ class RCLClient(Client):
                     if self.ewc_enabled and self.fisher_information is not None:
                         ewc_loss = self.compute_ewc_loss()
                     
-                    loss = ce_loss + rcl_loss + distillation_loss + fedprox_loss + ewc_loss
+                    loss = ce_loss + rcl_loss + multi_level_rcl_loss + distillation_loss + fedprox_loss + ewc_loss
                     
                     ce_loss_meter.update(ce_loss.item(), images.size(0))
                     if rcl_loss > 0:
@@ -415,23 +504,25 @@ class RCLClient(Client):
                     loss.backward()
                 
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
-
+                
                 if self.device.type == "cuda":
                     scaler.step(self.optimizer)
                     scaler.update()
                 else:
                     self.optimizer.step()
-
+                    
                 batch_size = images.size(0)
                 loss_meter.update(loss.item(), batch_size)
                 epoch_loss += loss.item() * batch_size
                 samples_processed += batch_size
+                
             if samples_processed > 0:
                 logger.info(f"[C{self.client_index}] Epoch {local_epoch+1}/{self.local_epochs}, Loss: {epoch_loss/samples_processed:.4f}")
             else:
                 logger.warning(f"[C{self.client_index}] No samples processed in epoch {local_epoch+1}")
             
             self.scheduler.step()
+            
         end_time = time.time()
         training_time = end_time - start_time
         
@@ -439,13 +530,15 @@ class RCLClient(Client):
         self.rcl_loss_avg = rcl_loss_meter.avg
         self.distillation_loss_avg = distillation_loss_meter.avg
         self.fedprox_loss_avg = fedprox_loss_meter.avg
-        self.ewc_loss_avg = ewc_loss_meter.avg if hasattr(self, 'ewc_loss_avg') else 0.0
+        self.ewc_loss_avg = ewc_loss_meter.avg
+        self.multi_level_rcl_avg = multi_level_rcl_meter.avg
         
         if self.ewc_enabled and self.rounds_trained > 1:
             self.compute_fisher_information()
         
         trust_score = self.compute_trust_score() if self.enable_trust_filtering else 1.0
         logger.info(f"[C{self.client_index}] Training Complete. Time: {training_time:.2f}s, Loss: {loss_meter.avg:.4f}, Trust Score: {trust_score:.3f}")
+        
         if self.enable_personalization:
             if isinstance(self.model, torch.nn.DataParallel):
                 model_module = self.model.module
@@ -460,18 +553,25 @@ class RCLClient(Client):
                               if 'personalized_head' not in k}
         else:
             return_dict = {k: v.cpu() for k, v in self.model.state_dict().items()}
+            
         if self.enable_trust_filtering and trust_score < self.trust_threshold:
             logger.warning(f"[C{self.client_index}] Skipped in Aggregation (Trust Score {trust_score:.3f} < {self.trust_threshold})")
             return None, None
+            
         self.model = self.model.cpu()
         self.global_model = self.global_model.cpu()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return return_dict, {"loss": float(loss_meter.avg), 
-                            "trust_score": trust_score, 
-                            "ce_loss": float(self.ce_loss_avg),
-                            "rcl_loss": float(self.rcl_loss_avg),
-                            "distillation_loss": float(self.distillation_loss_avg),
-                            "fedprox_loss": float(self.fedprox_loss_avg),
-                            "ewc_loss": float(self.ewc_loss_avg) if hasattr(self, 'ewc_loss_avg') else 0.0}
+            
+        return return_dict, {
+            "loss": float(loss_meter.avg), 
+            "trust_score": trust_score, 
+            "ce_loss": float(self.ce_loss_avg),
+            "rcl_loss": float(self.rcl_loss_avg),
+            "multi_level_rcl": float(self.multi_level_rcl_avg),
+            "distillation_loss": float(self.distillation_loss_avg),
+            "fedprox_loss": float(self.fedprox_loss_avg),
+            "ewc_loss": float(self.ewc_loss_avg)
+        }
+

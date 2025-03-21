@@ -7,6 +7,8 @@ from trainers.base_trainer import BaseTrainer
 from trainers.build import TRAINER_REGISTRY
 from utils.metrics import evaluate, track_trust_scores, evaluate_personalization_benefits
 from utils.helper import save_dict_to_json, setup_adaptive_learning_rate
+import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,13 @@ class PersonalizedTrainer(BaseTrainer):
         self.freeze_ratio = adaptive_freezing_config.get("initial_freeze_ratio", 0.5)
         self.freeze_decay_rate = adaptive_freezing_config.get("decay_rate", 0.05)
         
+        # Training tracking
+        self.global_round = 0
+        self.best_acc = 0.0
+        self.best_personalized_acc = 0.0
+        self.best_model_state = None
+        self.best_personalized_state = None
+        
         # Client performance tracking
         self.client_performance = {}
         self.personalization_metrics = {}
@@ -53,13 +62,15 @@ class PersonalizedTrainer(BaseTrainer):
         """Training process with personalization support"""
         # Initialize metrics tracking
         metrics_history = defaultdict(list)
-        best_acc = 0.0
+        self.global_round = 0
         
         # Setup initial model
-        self.server.setup(self.model)
+        if self.server is not None:
+            self.server.setup(self.model)
         
         # Training loop
         for round_idx in range(self.args.trainer.global_rounds):
+            self.global_round = round_idx
             logger.info(f"=== Round {round_idx+1}/{self.args.trainer.global_rounds} ===")
             
             # Update adaptive freezing if enabled
@@ -73,106 +84,63 @@ class PersonalizedTrainer(BaseTrainer):
             logger.info(f"Selected {len(selected_clients)} clients for training")
             
             # Get current global model
-            global_model = self.server.get_global_model()
+            global_model = self.server.get_global_model() if self.server is not None else self.model
             global_model_dict = global_model.state_dict()
             
             # Client training
             client_models = {}
             client_weights = {}
-            client_stats = {}
             
             for client_idx in selected_clients:
                 client = self.clients[client_idx]
                 
-                # Determine learning rate (adaptive if enabled)
-                local_lr = self.args.trainer.local_lr
-                if self.adaptive_lr and hasattr(client, 'trust_score'):
-                    trust_score = getattr(client, 'trust_score', 1.0)
-                    local_lr = setup_adaptive_learning_rate(
-                        base_lr=0.001,
-                        max_lr=0.1,
-                        trust_score=trust_score,
-                        step=round_idx,
-                        step_size=10
-                    )
-                    logger.debug(f"Client {client_idx} adaptive LR: {local_lr:.6f} (trust: {trust_score:.2f})")
-                
                 # Setup client for training
-                client.setup(
-                    state_dict=global_model_dict,
-                    device=self.device,
-                    local_dataset=self.trainset[client_idx],
-                    global_epoch=round_idx,
-                    local_lr=local_lr,
-                    trainer=self
-                )
+                if hasattr(client, 'setup'):
+                    client.setup(
+                        state_dict=global_model_dict,
+                        device=self.device,
+                        local_dataset=self.trainset[client_idx],
+                        global_epoch=round_idx,
+                        local_lr=self.args.trainer.local_lr  # Use base learning rate
+                    )
                 
                 # Train client
                 client_model_dict, stats = client.local_train(round_idx)
                 
-                # Store results if client returned a model
+                # Store results
                 if client_model_dict is not None:
                     client_models[client_idx] = client_model_dict
                     client_weights[client_idx] = len(self.trainset[client_idx])
-                    client_stats[client_idx] = stats
-                    
-                    # Track client performance
-                    if stats is not None:
-                        if client_idx not in self.client_performance:
-                            self.client_performance[client_idx] = []
-                        self.client_performance[client_idx].append({
-                            'round': round_idx,
-                            'loss': stats.get('loss', 0.0),
-                            'trust_score': stats.get('trust_score', 1.0)
-                        })
             
-            # Update global model
-            if client_models:
-                updated_model_dict = self.server.update_global_model(client_models, client_weights, client_stats)
-                self.model.load_state_dict(updated_model_dict, strict=False)
+            # Server update
+            if self.server is not None and client_models:
+                updated_model_dict = self.server.update_global_model(client_models, client_weights)
+                self.model.load_state_dict(updated_model_dict)
                 logger.info(f"Global model updated with {len(client_models)} client models")
-            else:
-                logger.warning("No client models returned. Global model unchanged.")
             
-            # Evaluate periodically
-            if (round_idx + 1) % self.args.trainer.eval_every == 0 or round_idx == 0:
+            # Evaluate
+            if (round_idx + 1) % self.args.trainer.eval_every == 0:
                 metrics = self.evaluate(round_idx)
                 
                 # Track metrics
                 for k, v in metrics.items():
-                    if isinstance(v, (int, float)):
-                        metrics_history[k].append(v)
+                    metrics_history[k].append(v)
                 
-                # Save best model
-                current_acc = metrics.get('acc_personalized', metrics.get('acc', 0.0))
-                if current_acc > best_acc:
-                    best_acc = current_acc
+                # Update best accuracies
+                current_acc = metrics.get('acc', 0.0)
+                current_personalized_acc = metrics.get('acc_personalized', 0.0)
+                
+                if current_acc > self.best_acc:
+                    self.best_acc = current_acc
+                    self.best_model_state = copy.deepcopy(self.model.state_dict())
                     self.save_model(f"best_model_round_{round_idx+1}.pt")
-                    logger.info(f"New best model saved with accuracy: {best_acc:.2f}%")
                 
-                # Save metrics
-                save_dict_to_json(metrics, f"{self.args.log_dir}/metrics_round_{round_idx+1}.json")
-                
-                # Save overall metrics history
-                save_dict_to_json(dict(metrics_history), f"{self.args.log_dir}/metrics_history.json")
-                
-                # Save client performance
-                save_dict_to_json(self.client_performance, f"{self.args.log_dir}/client_performance.json")
-                
-                # Save personalization metrics
-                if 'personalization' in metrics:
-                    self.personalization_metrics[round_idx+1] = metrics['personalization']
-                    save_dict_to_json(self.personalization_metrics, f"{self.args.log_dir}/personalization_metrics.json")
-            
-            # Save checkpoint periodically
-            if (round_idx + 1) % self.args.save_freq == 0:
-                self.save_model(f"model_round_{round_idx+1}.pt")
+                if current_personalized_acc > self.best_personalized_acc:
+                    self.best_personalized_acc = current_personalized_acc
+                    self.best_personalized_state = copy.deepcopy(self.model.state_dict())
+                    self.save_model(f"best_personalized_model_round_{round_idx+1}.pt")
         
-        # Save final model
-        self.save_model("final_model.pt")
-        logger.info("Training completed!")
-        
-        return metrics_history
+        return self.model, metrics_history
     
     def evaluate(self, round_idx):
         """Evaluate both global and personalized models"""
@@ -214,11 +182,41 @@ class PersonalizedTrainer(BaseTrainer):
             return super().select_clients(round_idx)
     
     def save_model(self, filename):
-        """Save model to file"""
-        save_path = f"{self.args.checkpoint_path}/{filename}"
-        torch.save({
-            'model_state_dict': self.model.state_dict(),
-            'round': self.global_round,
-            'args': self.args
-        }, save_path)
-        logger.info(f"Model saved to {save_path}")
+        """Save model checkpoint with training metadata"""
+        try:
+            save_path = os.path.join(self.args.log_dir, filename)
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            
+            # Prepare checkpoint
+            checkpoint = {
+                'model_state': self.model.state_dict(),
+                'round': self.global_round,
+                'best_acc': self.best_acc,
+                'best_personalized_acc': self.best_personalized_acc,
+                'args': self.args,
+                'personalization_enabled': self.enable_personalization,
+                'timestamp': time.strftime("%Y%m%d-%H%M%S")
+            }
+            
+            # Add personalization metrics if available
+            if self.personalization_metrics:
+                checkpoint['personalization_metrics'] = self.personalization_metrics
+            
+            # Save checkpoint
+            torch.save(checkpoint, save_path)
+            logger.info(f"Model saved to {save_path}")
+            
+            # Save additional metadata
+            metadata = {
+                'round': self.global_round,
+                'accuracy': self.best_acc,
+                'personalized_accuracy': self.best_personalized_acc,
+                'timestamp': checkpoint['timestamp']
+            }
+            metadata_path = os.path.join(os.path.dirname(save_path), 'model_metadata.json')
+            save_dict_to_json(metadata, metadata_path)
+            
+        except Exception as e:
+            logger.error(f"Failed to save model: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())

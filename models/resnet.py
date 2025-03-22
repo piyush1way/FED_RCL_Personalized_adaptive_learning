@@ -744,18 +744,11 @@ class PersonalizedResNet18(ResNet18):
         logger.info(f"Initialized PersonalizedResNet18 with personalization_layers={self.personalization_layers}")
     
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-
-        x = self.avgpool(x)
-        features = torch.flatten(x, 1)
+        # Use parent class's feature extraction
+        results = super().forward(x)
+        
+        # Extract features
+        features = results['feature']
         
         # Get predictions from both heads
         global_logits = self.global_head(features)
@@ -813,3 +806,4 @@ class PersonalizedResNet18(ResNet18):
         if self.use_personalized_head:
             return list(self.personalized_head.parameters())
         return list(self.parameters())
+

@@ -162,43 +162,40 @@ def create_pth_dict(pth_path):
 
     return dict(sorted(pth_dict.items()))
 
-def save_dict_to_json(d, json_path):
-    """Save a dictionary to a JSON file.
+def convert_to_serializable(obj):
+    """Convert numpy types to Python native types for JSON serialization"""
+    if isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64,
+                       np.uint8, np.uint16, np.uint32, np.uint64)):
+        return int(obj)
+    elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, (np.bool_, np.bool8)):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_to_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_serializable(item) for item in obj]
+    return obj
+
+def save_dict_to_json(d: dict, json_path: str):
+    """Save dict to json file
     
     Args:
-        d: Dictionary to save
-        json_path: Path to the JSON file
+        d: dict to save
+        json_path: path to json file
     """
     # Create directory if it doesn't exist
-    directory = os.path.dirname(json_path)
-    if directory and not os.path.exists(directory):
-        os.makedirs(directory)
-        
-    # Convert any non-serializable objects (like numpy arrays or tensors)
-    serializable_dict = {}
-    for k, v in d.items():
-        if isinstance(v, np.ndarray):
-            serializable_dict[k] = v.tolist()
-        elif isinstance(v, torch.Tensor):
-            serializable_dict[k] = v.cpu().tolist()
-        elif isinstance(v, dict):
-            # Handle nested dictionaries
-            nested_dict = {}
-            for nk, nv in v.items():
-                if isinstance(nv, np.ndarray):
-                    nested_dict[nk] = nv.tolist()
-                elif isinstance(nv, torch.Tensor):
-                    nested_dict[nk] = nv.cpu().tolist()
-                else:
-                    nested_dict[nk] = nv
-            serializable_dict[k] = nested_dict
-        else:
-            serializable_dict[k] = v
+    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+    
+    # Convert dict to JSON serializable format
+    serializable_dict = convert_to_serializable(d)
     
     # Save to JSON file
     with open(json_path, 'w') as f:
         json.dump(serializable_dict, f, indent=4)
-        
+    
     logger.info(f"Dictionary saved to {json_path}")
 
 def load_dict_from_json(json_path):

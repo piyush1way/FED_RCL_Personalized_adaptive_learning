@@ -754,18 +754,20 @@ class PersonalizedResNet18(ResNet18):
         global_logits = self.global_head(features)
         personalized_logits = self.personalized_head(features)
         
-        if self.training:
-            return {
-                "global_logit": global_logits,
-                "personalized_logit": personalized_logits,
-                "features": features
-            }
-        else:
-            # During evaluation, return based on mode
-            if self.use_personalized_head:
-                return {"logit": personalized_logits, "features": features}
-            else:
-                return {"logit": global_logits, "features": features}
+        # Determine which logits to use as default
+        default_logits = personalized_logits if self.use_personalized_head else global_logits
+        
+        # Return consistent dictionary structure
+        return {
+            "logit": default_logits,  # Always include default logits
+            "global_logit": global_logits,
+            "personalized_logit": personalized_logits,
+            "features": features,
+            "feature": features,  # Keep both feature keys for compatibility
+            "feature_normalized": F.normalize(features, p=2, dim=1) if hasattr(self, 'l2_norm') and self.l2_norm else features,
+            "use_personalized": self.use_personalized_head,
+            "trust_score": self.trust_score
+        }
     
     def enable_personalized_mode(self):
         """Enable personalized mode"""
@@ -806,4 +808,5 @@ class PersonalizedResNet18(ResNet18):
         if self.use_personalized_head:
             return list(self.personalized_head.parameters())
         return list(self.parameters())
+
 

@@ -106,6 +106,7 @@ class RCLClient(Client):
     def setup(self, state_dict, device, local_dataset, global_epoch, local_lr, trainer, **kwargs):
         self.device = device
         self.rounds_trained += 1
+        self.trainer = trainer  # Store trainer reference
         
         # Save previous model state for trust score calculation
         if self.enable_trust_filtering and hasattr(self.model, 'state_dict'):
@@ -149,98 +150,83 @@ class RCLClient(Client):
             if self.adaptive_layer_freezing and hasattr(model_module, 'setup_adaptive_freezing'):
                 freeze_ratio = max(0.0, self.freeze_ratio - (self.rounds_trained / 50.0))
                 model_module.setup_adaptive_freezing(freeze_ratio=freeze_ratio)
-
-        self.trainer = trainer
-        self.global_epoch = global_epoch
-
-        # Create data loader
-        if local_dataset is None or len(local_dataset) == 0:
-            logger.warning(f"[C{self.client_index}] Empty dataset provided. Creating a dummy loader.")
-            self.loader = None
-        else:
-            train_sampler = RandomClasswiseSampler(local_dataset, num_instances=self.args.dataset.num_instances) \
-                if hasattr(self.args.dataset, 'num_instances') and self.args.dataset.num_instances > 0 else None
-                
-            self.loader = DataLoader(
-                local_dataset,
-                batch_size=self.args.batch_size,
-                sampler=train_sampler,
-                shuffle=train_sampler is None,
-                num_workers=0,
-                pin_memory=False,
-                drop_last=True
-            )
-
-        # Trust-based adaptive learning rate
+        
+        # Setup data loader
+        self.local_dataset = local_dataset
+        if hasattr(self.local_dataset, 'x'):
+            if len(self.local_dataset.x) < 2:  # Not enough data for training
+                self.trainloader = None
+                logger.warning(f"Client {self.client_index} has insufficient data ({len(self.local_dataset.x)} samples)")
+                return
+        
+        self.trainloader = DataLoader(
+            self.local_dataset,
+            batch_size=kwargs.get('local_bs', 32),
+            shuffle=True,
+            num_workers=kwargs.get('num_workers', 4),
+            pin_memory=kwargs.get('pin_memory', True),
+            drop_last=True
+        )
+        
+        # Save a sample batch for EWC if enabled
+        if self.ewc_enabled and hasattr(self, 'trainloader') and self.trainloader is not None:
+            first_batch = next(iter(self.trainloader), None)
+            if first_batch is not None:
+                images, labels = first_batch
+                if len(images) > 1:
+                    self.ewc_batch = (images.to(self.device), labels.to(self.device))
+        
+        # Calculate trust score for learning rate adjustment if enabled
+        trust_score = self.compute_trust_score() if self.enable_trust_filtering else 0.8
+        
+        # Setup optimizer with trust-based adaptive learning rate
         if self.enable_cyclical_lr:
-            # Calculate trust-adjusted learning rate
-            trust_score = self.compute_trust_score() if len(self.trust_score_history) > 0 else 0.8
-            
-            # Cyclical LR with trust adjustment
-            cycle_step = self.rounds_trained % (2 * self.step_size)
-            x = abs(cycle_step / self.step_size - 1)
-            
-            # Adjust max_lr based on trust score
-            adjusted_max_lr = self.max_lr * (0.5 + 0.5 * trust_score)
-            
-            adjusted_lr = self.base_lr + (adjusted_max_lr - self.base_lr) * max(0, (1 - x))
-            logger.info(f"[C{self.client_index}] Trust-based Cyclical LR: {adjusted_lr:.6f} (trust: {trust_score:.2f}, cycle step: {cycle_step})")
-            local_lr = adjusted_lr
-        else:
-            logger.info(f"[C{self.client_index}] Using base LR: {local_lr:.6f}")
-
-        # Configure optimizer with different learning rates for personalized and backbone parameters
-        if self.enable_personalization:
-            if hasattr(model_module, 'get_local_params'):
-                personalized_params = []
-                backbone_params = []
-                for name, param in self.model.named_parameters():
-                    if 'personalized_head' in name or 'projection_head' in name:
-                        personalized_params.append(param)
-                    else:
-                        backbone_params.append(param)
+            # Adapt learning rate based on trust score if available
+            if hasattr(self, 'trust_score_history') and len(self.trust_score_history) > 0:
+                # Use trust score to adjust learning rate
+                trust_avg = np.mean(self.trust_score_history[-3:]) if len(self.trust_score_history) >= 3 else trust_score
                 
-                if personalized_params:
-                    param_groups = [
-                        {'params': personalized_params, 'lr': local_lr},
-                        {'params': backbone_params, 'lr': local_lr * 0.1}
-                    ]
-                    self.optimizer = torch.optim.SGD(
-                        param_groups,
-                        momentum=self.args.optimizer.momentum,
-                        weight_decay=self.args.optimizer.wd
-                    )
-                else:
-                    self.optimizer = torch.optim.SGD(
-                        self.model.parameters(),
-                        lr=local_lr,
-                        momentum=self.args.optimizer.momentum,
-                        weight_decay=self.args.optimizer.wd
-                    )
+                # Base learning rate on trust score - higher trust = higher LR
+                trust_adjusted_lr = self.base_lr + (self.max_lr - self.base_lr) * trust_avg
+                
+                # Apply cyclical pattern based on rounds trained
+                cycle = np.sin(np.pi * (self.rounds_trained % self.step_size) / self.step_size)
+                cycle_factor = 0.5 * (1 + cycle)
+                
+                # Combine trust adjustment with cycle
+                current_lr = self.base_lr + (trust_adjusted_lr - self.base_lr) * cycle_factor
+                
+                logger.info(f"[C{self.client_index}] Trust-adjusted LR: {current_lr:.6f} (trust={trust_avg:.3f}, cycle={cycle_factor:.2f})")
             else:
-                self.optimizer = torch.optim.SGD(
-                    self.model.parameters(),
-                    lr=local_lr,
-                    momentum=self.args.optimizer.momentum,
-                    weight_decay=self.args.optimizer.wd
-                )
+                # Default cyclical LR if no trust score history
+                cycle = np.sin(np.pi * (self.rounds_trained % self.step_size) / self.step_size)
+                cycle_factor = 0.5 * (1 + cycle)
+                current_lr = self.base_lr + (self.max_lr - self.base_lr) * cycle_factor
+                logger.info(f"[C{self.client_index}] Cyclical LR: {current_lr:.6f} (cycle={cycle_factor:.2f})")
         else:
-            self.optimizer = torch.optim.SGD(
-                self.model.parameters(),
-                lr=local_lr,
-                momentum=self.args.optimizer.momentum,
-                weight_decay=self.args.optimizer.wd
-            )
+            # No cyclical LR, use constant rate
+            current_lr = local_lr
+            logger.info(f"[C{self.client_index}] Fixed LR: {current_lr:.6f}")
             
-        # Increase local epochs for early rounds to improve convergence
-        if self.rounds_trained < 5:
-            self.local_epochs = min(30, self.args.trainer.local_epochs * 3)
-        else:
-            self.local_epochs = self.args.trainer.local_epochs
-            
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer=self.optimizer,
-            lr_lambda=lambda epoch: self.args.trainer.local_lr_decay ** epoch
+        # Ensure learning rate is reasonable
+        current_lr = max(1e-5, min(current_lr, 0.1))
+        
+        # Special case for early rounds to prevent cold start
+        if self.rounds_trained <= 2:
+            current_lr = min(current_lr * 1.5, 0.1)  # Slightly higher LR at the start
+
+        self.local_epochs = kwargs.get('local_ep', 5)
+        self.optimizer = torch.optim.SGD(
+            self.model.parameters(),
+            lr=current_lr,
+            momentum=0.9,
+            weight_decay=kwargs.get('weight_decay', 1e-5)
+        )
+        
+        # Reset scheduler for each round of training
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, 
+            T_max=self.local_epochs
         )
 
     def _update_model(self, state_dict):
@@ -267,19 +253,40 @@ class RCLClient(Client):
         return self.fedprox_mu * proximal_term / 2
 
     def compute_distillation_loss(self, student_logits, teacher_logits, features=None, teacher_features=None):
-        """Compute knowledge distillation loss with feature alignment"""
+        """
+        Compute distillation loss between teacher and student models.
+        Improved to prevent overfitting to the teacher model.
+        """
+        # Logit-based distillation with temperature scaling
         temp = self.distillation_temp
         soft_targets = F.softmax(teacher_logits / temp, dim=1)
         log_probs = F.log_softmax(student_logits / temp, dim=1)
-        logit_distillation = -(soft_targets * log_probs).sum(dim=1).mean() * (temp ** 2)
         
-        feature_distillation = 0.0
+        # Apply temperature scaling and normalize
+        kd_loss = F.kl_div(log_probs, soft_targets, reduction='batchmean') * (temp * temp)
+        
+        # Feature distillation (optional)
+        feature_loss = 0.0
         if features is not None and teacher_features is not None:
-            features_norm = F.normalize(features, dim=1)
-            teacher_features_norm = F.normalize(teacher_features, dim=1)
-            feature_distillation = (1 - (features_norm * teacher_features_norm).sum(dim=1).mean())
+            # Normalize features
+            student_features = F.normalize(features, p=2, dim=1)
+            teacher_features = F.normalize(teacher_features, p=2, dim=1)
             
-        return logit_distillation + 0.5 * feature_distillation
+            # Apply L2 loss with a smaller weight for feature distillation
+            feature_loss = F.mse_loss(student_features, teacher_features) * 0.1
+        
+        # Combine losses with a safeguard to prevent overfitting to teacher
+        # Dynamically reduce distillation impact as training progresses
+        distillation_weight_factor = max(0.2, 1.0 - 0.05 * self.rounds_trained)
+        combined_loss = (kd_loss + feature_loss) * distillation_weight_factor
+        
+        # Add a safeguard against excessive distillation
+        if self.rounds_trained > 10 and hasattr(self, 'distillation_loss_avg') and self.distillation_loss_avg > 0:
+            if combined_loss > 2.0 * self.distillation_loss_avg:
+                combined_loss = self.distillation_loss_avg
+                logger.warning(f"[C{self.client_index}] Limiting excessive distillation loss")
+                
+        return combined_loss
 
     def compute_ewc_loss(self):
         """Compute EWC regularization loss with device consistency"""
@@ -299,7 +306,7 @@ class RCLClient(Client):
     def compute_trust_score(self):
         """Compute trust score based on update magnitude and consistency"""
         if self.previous_model_state is None:
-            return 1.0
+            return 0.8  # Initialize with a neutral score instead of 1.0
         
         current_state = self.model.state_dict()
         
@@ -317,18 +324,27 @@ class RCLClient(Client):
         if param_count > 0:
             update_norm = (update_norm / param_count) ** 0.5
         
+        # Ensure we have a more dynamic update history
         self.update_history.append(update_norm)
         if len(self.update_history) > 5:
             self.update_history.pop(0)
             
+        # Add small epsilon to prevent division by zero
         update_variance = np.var(self.update_history) if len(self.update_history) > 1 else 0.0
         
-        # Compute trust score components
-        magnitude_score = 1.0 / (1.0 + update_norm)
-        consistency_score = 1.0 / (1.0 + update_variance)
+        # Compute trust score components with improved scaling
+        magnitude_score = 1.0 / (1.0 + 10.0 * update_norm)  # Adjust sensitivity
+        consistency_score = 1.0 / (1.0 + 5.0 * update_variance)  # Adjust sensitivity
         
-        # Combine scores with weights
-        trust_score = 0.7 * magnitude_score + 0.3 * consistency_score
+        # Dynamic weighting based on training progress
+        mag_weight = max(0.5, min(0.8, 0.8 - 0.01 * self.rounds_trained))  # Reduce weight over time
+        cons_weight = 1.0 - mag_weight
+        
+        # Combine scores with dynamic weights
+        trust_score = mag_weight * magnitude_score + cons_weight * consistency_score
+        
+        # Add random noise to break any potential plateaus
+        trust_score += np.random.normal(0, 0.02)  # Small random noise
         
         # Save current state for next round
         self.previous_model_state = {k: v.detach().clone().to(self.device) for k, v in current_state.items()}
@@ -338,256 +354,286 @@ class RCLClient(Client):
         if len(self.trust_score_history) > 10:
             self.trust_score_history.pop(0)
         
-        return max(0.0, min(1.0, trust_score))
+        # Ensure the trust score is within [0.1, 1.0] to avoid getting stuck
+        return max(0.1, min(1.0, trust_score))
 
-        def compute_fisher_information(self):
-            """Compute Fisher Information Matrix for EWC regularization"""
-            if not self.ewc_enabled or self.loader is None:
-                return
+    def compute_fisher_information(self):
+        """Compute Fisher Information Matrix for EWC regularization"""
+        if not self.ewc_enabled or self.trainloader is None:
+            return
                 
-            fisher_information = {}
-            for name, param in self.model.named_parameters():
-                if param.requires_grad and 'personalized_head' not in name:
-                    fisher_information[name] = torch.zeros_like(param)
-                    
-            self.model.eval()
-            for images, labels in self.loader:
-                images = images.to(self.device)
-                labels = labels.to(self.device)
+        fisher_information = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and 'personalized_head' not in name:
+                fisher_information[name] = torch.zeros_like(param)
                 
-                self.model.zero_grad()
-                output = self.model(images)
-                if isinstance(output, dict):
-                    logits = output["logit"]
-                else:
-                    logits = output
-                    
-                log_probs = F.log_softmax(logits, dim=1)
-                samples = torch.multinomial(torch.exp(log_probs), 1).squeeze()
-                loss = F.nll_loss(log_probs, samples)
-                loss.backward()
-                
-                for name, param in self.model.named_parameters():
-                    if param.requires_grad and param.grad is not None and 'personalized_head' not in name:
-                        fisher_information[name] += param.grad.pow(2).detach()
-                        
-            for name in fisher_information:
-                fisher_information[name] /= len(self.loader) if len(self.loader) > 0 else 1.0
-                
-            self.fisher_information = fisher_information
-            self.optimal_parameters = {name: param.clone().detach() for name, param in self.model.named_parameters() 
-                                      if name in fisher_information}
-            self.model.train()
-    
-        def compute_multi_level_rcl_loss(self, output, labels):
-            """Compute RCL loss across multiple feature levels"""
-            if not self.multi_level_rcl or not isinstance(output, dict):
-                return 0.0
-                
-            total_loss = 0.0
+        self.model.eval()
+        for images, labels in self.trainloader:
+            images = images.to(self.device)
+            labels = labels.to(self.device)
             
-            # Get features from different layers
-            layer_features = []
-            for i in range(5):  # Assuming 5 layers (0-4)
-                layer_key = f"layer{i}"
-                if layer_key in output:
-                    layer_features.append(output[layer_key])
-                    
-            # If no layer features found, return 0
-            if not layer_features:
-                return 0.0
-                
-            # Apply RCL to each layer with weights
-            for i, features in enumerate(layer_features):
-                if i < len(self.layer_weights):
-                    weight = self.layer_weights[i]
-                    # Reshape features if needed
-                    if len(features.shape) > 2:
-                        # Global average pooling for conv features
-                        features = F.adaptive_avg_pool2d(features, 1).view(features.size(0), -1)
-                    
-                    # Apply L2 normalization
-                    features = F.normalize(features, p=2, dim=1)
-                    
-                    # Compute RCL loss for this layer
-                    layer_loss = self.relaxed_contrastive_loss(features, labels)
-                    total_loss += weight * layer_loss
-                    
-            return total_loss
-    
-        def local_train(self, global_epoch, **kwargs):
-            self.global_epoch = global_epoch
-        
-            scaler = GradScaler(enabled=self.device.type == "cuda")
-            start_time = time.time()
-            loss_meter = AverageMeter('Loss', ':.4f')
-            ce_loss_meter = AverageMeter('CE Loss', ':.4f')
-            rcl_loss_meter = AverageMeter('RCL Loss', ':.4f')
-            distillation_loss_meter = AverageMeter('Distill Loss', ':.4f')
-            fedprox_loss_meter = AverageMeter('FedProx Loss', ':.4f')
-            ewc_loss_meter = AverageMeter('EWC Loss', ':.4f')
-            multi_level_rcl_meter = AverageMeter('Multi-Level RCL', ':.4f')
-        
-            if self.loader is None or len(self.loader) == 0:
-                logger.warning(f"[C{self.client_index}] No data for training!")
-                return None, None
-        
-            for local_epoch in range(self.local_epochs):
-                epoch_loss = 0.0
-                samples_processed = 0
-                
-                for images, labels in self.loader:
-                    if len(images) < 2:
-                        continue
-                        
-                    images = images.to(self.device, non_blocking=True)
-                    labels = labels.to(self.device, non_blocking=True)
-        
-                    self.model.zero_grad()
-        
-                    with autocast(enabled=self.device.type == "cuda"):
-                        output = self.model(images, get_projection=True)
-                        
-                        if isinstance(output, dict):
-                            logits = output["logit"] if "logit" in output else output.get("personalized_logit", output)
-                            features = output.get("feature", None)
-                            projection = output.get("projection", None)
-                        else:
-                            logits = output
-                            features = None
-                            projection = None
-                        
-                        ce_loss = self.criterion(logits, labels)
-                        
-                        rcl_loss = 0.0
-                        if hasattr(self.args.client, 'rcl_loss') and getattr(self.args.client.rcl_loss, 'weight', 0) > 0:
-                            contrastive_features = projection if projection is not None else features
-                            
-                            if contrastive_features is not None and len(contrastive_features) >= 2:
-                                rcl_weight = getattr(self.args.client.rcl_loss, 'weight', 0.1)
-                                rcl_loss = self.relaxed_contrastive_loss(contrastive_features, labels) * rcl_weight
-                        
-                        # Multi-level contrastive learning
-                        multi_level_rcl_loss = 0.0
-                        if self.multi_level_rcl and isinstance(output, dict):
-                            multi_level_rcl_loss = self.compute_multi_level_rcl_loss(output, labels)
-                            multi_level_rcl_meter.update(multi_level_rcl_loss.item(), images.size(0))
-                        
-                        distillation_loss = 0.0
-                        if self.enable_distillation:
-                            with torch.no_grad():
-                                global_output = self.global_model(images)
-                                if isinstance(global_output, dict):
-                                    global_logits = global_output.get("global_logit", global_output.get("logit", None))
-                                    global_features = global_output.get("feature", None)
-                                else:
-                                    global_logits = global_output
-                                    global_features = None
-                                    
-                            if global_logits is not None:
-                                distillation_loss = self.compute_distillation_loss(
-                                    logits, global_logits, features, global_features
-                                ) * self.distillation_weight
-                        
-                        fedprox_loss = 0.0
-                        if self.enable_fedprox:
-                            fedprox_loss = self.compute_fedprox_term()
-                            
-                        ewc_loss = 0.0
-                        if self.ewc_enabled and self.fisher_information is not None:
-                            ewc_loss = self.compute_ewc_loss()
-                        
-                        loss = ce_loss + rcl_loss + multi_level_rcl_loss + distillation_loss + fedprox_loss + ewc_loss
-                        
-                        ce_loss_meter.update(ce_loss.item(), images.size(0))
-                        if rcl_loss > 0:
-                            rcl_loss_meter.update(rcl_loss.item(), images.size(0))
-                        if distillation_loss > 0:
-                            distillation_loss_meter.update(distillation_loss.item(), images.size(0))
-                        if fedprox_loss > 0:
-                            fedprox_loss_meter.update(fedprox_loss.item(), images.size(0))
-                        if ewc_loss > 0:
-                            ewc_loss_meter.update(ewc_loss.item(), images.size(0))
-                    
-                    if not torch.isfinite(loss):
-                        logger.warning(f"[C{self.client_index}] Loss is {loss}, skipping batch")
-                        continue
-                        
-                    if self.device.type == "cuda":
-                        scaler.scale(loss).backward()
-                        scaler.unscale_(self.optimizer)
-                    else:
-                        loss.backward()
-                    
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
-                    
-                    if self.device.type == "cuda":
-                        scaler.step(self.optimizer)
-                        scaler.update()
-                    else:
-                        self.optimizer.step()
-                        
-                    batch_size = images.size(0)
-                    loss_meter.update(loss.item(), batch_size)
-                    epoch_loss += loss.item() * batch_size
-                    samples_processed += batch_size
-                    
-                if samples_processed > 0:
-                    logger.info(f"[C{self.client_index}] Epoch {local_epoch+1}/{self.local_epochs}, Loss: {epoch_loss/samples_processed:.4f}")
-                else:
-                    logger.warning(f"[C{self.client_index}] No samples processed in epoch {local_epoch+1}")
-                
-                self.scheduler.step()
-                
-            end_time = time.time()
-            training_time = end_time - start_time
-            
-            self.ce_loss_avg = ce_loss_meter.avg
-            self.rcl_loss_avg = rcl_loss_meter.avg
-            self.distillation_loss_avg = distillation_loss_meter.avg
-            self.fedprox_loss_avg = fedprox_loss_meter.avg
-            self.ewc_loss_avg = ewc_loss_meter.avg
-            self.multi_level_rcl_avg = multi_level_rcl_meter.avg
-            
-            if self.ewc_enabled and self.rounds_trained > 1:
-                self.compute_fisher_information()
-            
-            trust_score = self.compute_trust_score() if self.enable_trust_filtering else 1.0
-            logger.info(f"[C{self.client_index}] Training Complete. Time: {training_time:.2f}s, Loss: {loss_meter.avg:.4f}, Trust Score: {trust_score:.3f}")
-            
-            if self.enable_personalization:
-                if isinstance(self.model, torch.nn.DataParallel):
-                    model_module = self.model.module
-                else:
-                    model_module = self.model
-                    
-                if hasattr(model_module, 'get_global_params'):
-                    global_params = model_module.get_global_params()
-                    return_dict = {k: v.cpu() for k, v in global_params.items()}
-                else:
-                    return_dict = {k: v.cpu() for k, v in self.model.state_dict().items() 
-                                  if 'personalized_head' not in k}
+            self.model.zero_grad()
+            output = self.model(images)
+            if isinstance(output, dict):
+                logits = output["logit"]
             else:
-                return_dict = {k: v.cpu() for k, v in self.model.state_dict().items()}
+                logits = output
                 
-            if self.enable_trust_filtering and trust_score < self.trust_threshold:
-                logger.warning(f"[C{self.client_index}] Skipped in Aggregation (Trust Score {trust_score:.3f} < {self.trust_threshold})")
-                return None, None
+            log_probs = F.log_softmax(logits, dim=1)
+            samples = torch.multinomial(torch.exp(log_probs), 1).squeeze()
+            loss = F.nll_loss(log_probs, samples)
+            loss.backward()
+            
+            for name, param in self.model.named_parameters():
+                if param.requires_grad and param.grad is not None and 'personalized_head' not in name:
+                    fisher_information[name] += param.grad.pow(2).detach()
+                    
+        for name in fisher_information:
+            fisher_information[name] /= len(self.trainloader) if len(self.trainloader) > 0 else 1.0
                 
-            self.model = self.model.cpu()
-            self.global_model = self.global_model.cpu()
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        self.fisher_information = fisher_information
+        self.optimal_parameters = {name: param.clone().detach() for name, param in self.model.named_parameters() 
+                                  if name in fisher_information}
+        self.model.train()
+    
+    def compute_multi_level_rcl_loss(self, output, labels):
+        """Compute RCL loss across multiple feature levels"""
+        if not self.multi_level_rcl or not isinstance(output, dict):
+            return 0.0
                 
-            return return_dict, {
-                "loss": float(loss_meter.avg), 
-                "trust_score": trust_score, 
-                "ce_loss": float(self.ce_loss_avg),
-                "rcl_loss": float(self.rcl_loss_avg),
-                "multi_level_rcl": float(self.multi_level_rcl_avg),
-                "distillation_loss": float(self.distillation_loss_avg),
-                "fedprox_loss": float(self.fedprox_loss_avg),
-                "ewc_loss": float(self.ewc_loss_avg)
-            }
+        total_loss = 0.0
+        
+        # Get features from different layers
+        layer_features = []
+        for i in range(5):  # Assuming 5 layers (0-4)
+            layer_key = f"layer{i}"
+            if layer_key in output:
+                layer_features.append(output[layer_key])
+                
+        # If no layer features found, return 0
+        if not layer_features:
+            return 0.0
+                
+        # Apply RCL to each layer with weights
+        for i, features in enumerate(layer_features):
+            if i < len(self.layer_weights):
+                weight = self.layer_weights[i]
+                # Reshape features if needed
+                if len(features.shape) > 2:
+                    # Global average pooling for conv features
+                    features = F.adaptive_avg_pool2d(features, 1).view(features.size(0), -1)
+                
+                # Apply L2 normalization
+                features = F.normalize(features, p=2, dim=1)
+                
+                # Compute RCL loss for this layer
+                layer_loss = self.relaxed_contrastive_loss(features, labels)
+                total_loss += weight * layer_loss
+                
+        return total_loss
+    
+    def detect_and_fix_catastrophic_forgetting(self, loss_value, current_epoch, early_stop_patience=3):
+        """
+        Detect and fix catastrophic forgetting during training.
+        Returns True if training should continue, False if early stopping is triggered.
+        """
+        # Track loss trends to detect sudden increases
+        if not hasattr(self, 'loss_history'):
+            self.loss_history = []
+            
+        self.loss_history.append(loss_value)
+        if len(self.loss_history) > 10:
+            self.loss_history.pop(0)
+        
+        # Only check after collecting enough history
+        if len(self.loss_history) < 3:
+            return True
+            
+        # Calculate moving average and variance
+        recent_losses = self.loss_history[-3:]
+        older_losses = self.loss_history[:-3] if len(self.loss_history) > 3 else []
+        
+        # If loss suddenly increases significantly, take action
+        if len(older_losses) > 0 and np.mean(recent_losses) > 1.5 * np.mean(older_losses):
+            logger.warning(f"[C{self.client_index}] Potential catastrophic forgetting detected! Loss spiked to {loss_value:.4f}")
+            
+            # Reduce learning rate
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] *= 0.5
+                logger.info(f"[C{self.client_index}] Reducing learning rate to {param_group['lr']:.6f}")
+            
+            # Strengthen knowledge distillation to recover
+            if self.enable_distillation:
+                self.distillation_weight *= 1.5
+                logger.info(f"[C{self.client_index}] Increasing distillation weight to {self.distillation_weight:.4f}")
+            
+            # Apply early stopping if necessary
+            if current_epoch >= early_stop_patience and np.mean(recent_losses) > 2.0 * np.mean(older_losses):
+                logger.warning(f"[C{self.client_index}] Early stopping due to loss instability")
+                return False
+                
+        return True
+
+    def local_train(self, round_idx):
+        """Train the model locally with improved balance between global and personalized objectives"""
+        self.model.train()
+        
+        # Initialize tracking variables
+        global_losses = []
+        personalized_losses = []
+        contrastive_losses = []
+        
+        # Get initial global model state for distillation
+        global_model_state = copy.deepcopy(self.model.state_dict())
+        
+        # Training loop
+        for epoch in range(self.args.trainer.local_epochs):
+            epoch_loss = 0
+            correct = 0
+            total = 0
+            
+            for batch_idx, (images, labels) in enumerate(self.trainloader):
+                images, labels = images.to(self.device), labels.to(self.device)
+                
+                self.optimizer.zero_grad()
+                
+                # Forward pass
+                outputs = self.model(images)
+                features = outputs['feature']
+                global_logits = outputs['global_logit']
+                personalized_logits = outputs['personalized_logit']
+                
+                # Calculate losses
+                # 1. Global classification loss
+                global_loss = self.criterion(global_logits, labels)
+                
+                # 2. Personalized classification loss
+                personalized_loss = self.criterion(personalized_logits, labels)
+                
+                # 3. Knowledge distillation loss
+                if self.enable_distillation:
+                    with torch.no_grad():
+                        global_model = copy.deepcopy(self.model)
+                        global_model.load_state_dict(global_model_state)
+                        global_model.eval()
+                        teacher_outputs = global_model(images)
+                        teacher_logits = teacher_outputs['global_logit']
+                    
+                    distill_temp = self.distillation_temp
+                    soft_targets = F.softmax(teacher_logits / distill_temp, dim=1)
+                    distill_loss = F.kl_div(
+                        F.log_softmax(personalized_logits / distill_temp, dim=1),
+                        soft_targets,
+                        reduction='batchmean'
+                    ) * (distill_temp ** 2)
+                else:
+                    distill_loss = torch.tensor(0.0).to(self.device)
+                
+                # 4. Contrastive loss for feature alignment
+                if hasattr(self.model, 'get_contrastive_features'):
+                    proj_features = self.model.get_contrastive_features(images)
+                    contrastive_loss = self.calculate_contrastive_loss(proj_features, labels)
+                else:
+                    contrastive_loss = torch.tensor(0.0).to(self.device)
+                
+                # Combine losses with dynamic weighting
+                trust_score = getattr(self.model, 'trust_score', 0.8)  # Default to 0.8 if not set
+                global_weight = max(0.3, 1.0 - trust_score)  # Ensure minimum global weight
+                personalized_weight = trust_score
+                
+                total_loss = (
+                    global_weight * global_loss +
+                    personalized_weight * personalized_loss +
+                    self.distillation_weight * distill_loss +  # Use client's distillation weight
+                    0.1 * contrastive_loss  # Small weight for contrastive loss
+                )
+                
+                # Backward pass and optimize
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)  # Add gradient clipping
+                self.optimizer.step()
+                
+                # Update metrics
+                epoch_loss += total_loss.item()
+                _, predicted = torch.max(personalized_logits, 1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
+                
+                # Track individual losses
+                global_losses.append(global_loss.item())
+                personalized_losses.append(personalized_loss.item())
+                contrastive_losses.append(contrastive_loss.item())
+            
+            # Log epoch metrics
+            accuracy = 100. * correct / total
+            logger.debug(f'Epoch {epoch}: Loss: {epoch_loss/len(self.trainloader):.3f}, '
+                        f'Acc: {accuracy:.2f}%, Trust: {trust_score:.3f}')
+            
+            # Update trust score based on performance
+            if hasattr(self.trainer, 'calculate_trust_score'):
+                global_acc = self.evaluate_global_accuracy()
+                personalized_acc = accuracy / 100.0  # Convert to decimal
+                new_trust = self.trainer.calculate_trust_score(global_acc, personalized_acc, round_idx)
+                self.model.trust_score = new_trust
+        
+        # Create state_dict dictionary to return - only include non-personalized parameters
+        if self.enable_personalization and hasattr(self.model, 'get_global_params'):
+            return_dict = self.model.get_global_params()
+        else:
+            return_dict = {k: v.cpu() for k, v in self.model.state_dict().items() 
+                          if 'personalized_head' not in k}
+        
+        # Create stats dictionary
+        stats_dict = {
+            'trust_score': getattr(self.model, 'trust_score', 0.8),
+            'global_loss': np.mean(global_losses),
+            'personalized_loss': np.mean(personalized_losses),
+            'contrastive_loss': np.mean(contrastive_losses)
+        }
+        
+        # Return both the model state and stats (as two separate values)
+        return return_dict, stats_dict
+
+    def evaluate_global_accuracy(self):
+        """Evaluate accuracy using only the global head"""
+        self.model.eval()
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for images, labels in self.trainloader:
+                images, labels = images.to(self.device), labels.to(self.device)
+                outputs = self.model(images)
+                global_logits = outputs['global_logit']
+                _, predicted = torch.max(global_logits, 1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
+        
+        return correct / total
+
+    def calculate_contrastive_loss(self, features, labels):
+        """Calculate supervised contrastive loss"""
+        temperature = self.model.temperature
+        batch_size = features.size(0)
+        
+        # Normalize features
+        features = F.normalize(features, p=2, dim=1)
+        
+        # Compute similarity matrix
+        similarity_matrix = torch.matmul(features, features.T) / temperature
+        
+        # Create mask for positive pairs
+        labels = labels.contiguous().view(-1, 1)
+        mask = torch.eq(labels, labels.T).float()
+        
+        # Remove diagonal elements
+        mask = mask - torch.eye(batch_size).to(mask.device)
+        
+        # Compute loss
+        exp_sim = torch.exp(similarity_matrix)
+        log_prob = similarity_matrix - torch.log(exp_sim.sum(dim=1, keepdim=True))
+        
+        mean_log_prob = (mask * log_prob).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+        
+        return -mean_log_prob.mean()
 

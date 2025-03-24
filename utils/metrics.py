@@ -103,13 +103,13 @@ def evaluate(args, model, testloader, device) -> dict:
             personalized_conf, predicted_personalized = torch.max(personalized_probs, 1)
             
             # Store confidence scores
-            confidence_global.extend(global_conf.cpu().tolist())
-            confidence_personalized.extend(personalized_conf.cpu().tolist())
+            confidence_global.extend(global_conf.cpu().numpy().tolist())
+            confidence_personalized.extend(personalized_conf.cpu().numpy().tolist())
             
             # Store predictions for analysis
-            all_labels.extend(labels.cpu().tolist())
-            all_global_preds.extend(predicted_global.cpu().tolist())
-            all_personalized_preds.extend(predicted_personalized.cpu().tolist())
+            all_labels.extend(labels.cpu().numpy().tolist())
+            all_global_preds.extend(predicted_global.cpu().numpy().tolist())
+            all_personalized_preds.extend(predicted_personalized.cpu().numpy().tolist())
             
             # Update counters
             total += labels.size(0)
@@ -130,16 +130,18 @@ def evaluate(args, model, testloader, device) -> dict:
     acc_personalized = 100 * correct_personalized / float(total) if total > 0 else 0
     
     # Calculate class-wise accuracy
-    class_acc_global = {cls: 100 * correct / class_total[cls] for cls, correct in class_correct_global.items()}
-    class_acc_personalized = {cls: 100 * correct / class_total[cls] for cls, correct in class_correct_personalized.items()}
+    class_acc_global = {int(cls): float(100 * correct / class_total[cls]) 
+                       for cls, correct in class_correct_global.items()}
+    class_acc_personalized = {int(cls): float(100 * correct / class_total[cls]) 
+                            for cls, correct in class_correct_personalized.items()}
     
     # Calculate balanced accuracy (average of class-wise accuracies)
-    balanced_acc_global = sum(class_acc_global.values()) / len(class_acc_global) if class_acc_global else 0
-    balanced_acc_personalized = sum(class_acc_personalized.values()) / len(class_acc_personalized) if class_acc_personalized else 0
+    balanced_acc_global = float(sum(class_acc_global.values()) / len(class_acc_global)) if class_acc_global else 0
+    balanced_acc_personalized = float(sum(class_acc_personalized.values()) / len(class_acc_personalized)) if class_acc_personalized else 0
     
     # Calculate average confidence
-    avg_confidence_global = sum(confidence_global) / len(confidence_global) if confidence_global else 0
-    avg_confidence_personalized = sum(confidence_personalized) / len(confidence_personalized) if confidence_personalized else 0
+    avg_confidence_global = float(sum(confidence_global) / len(confidence_global)) if confidence_global else 0
+    avg_confidence_personalized = float(sum(confidence_personalized) / len(confidence_personalized)) if confidence_personalized else 0
 
     logger.info(f'Global Model Accuracy: {acc_global:.2f}% | Personalized Model Accuracy: {acc_personalized:.2f}%')
     logger.info(f'Global Model Balanced Accuracy: {balanced_acc_global:.2f}% | Personalized Model Balanced Accuracy: {balanced_acc_personalized:.2f}%')
@@ -149,14 +151,14 @@ def evaluate(args, model, testloader, device) -> dict:
     torch.cuda.empty_cache()
     
     return {
-        "acc": acc_global,  # Keep original key for compatibility
-        "acc_personalized": acc_personalized,
-        "balanced_acc_global": balanced_acc_global,
-        "balanced_acc_personalized": balanced_acc_personalized,
+        "acc": float(acc_global),  # Keep original key for compatibility
+        "acc_personalized": float(acc_personalized),
+        "balanced_acc_global": float(balanced_acc_global),
+        "balanced_acc_personalized": float(balanced_acc_personalized),
         "class_acc_global": class_acc_global,
         "class_acc_personalized": class_acc_personalized,
-        "avg_confidence_global": avg_confidence_global,
-        "avg_confidence_personalized": avg_confidence_personalized,
+        "avg_confidence_global": float(avg_confidence_global),
+        "avg_confidence_personalized": float(avg_confidence_personalized),
         "predictions": {
             "labels": all_labels,
             "global_preds": all_global_preds,

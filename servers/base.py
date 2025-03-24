@@ -53,7 +53,13 @@ class Server:
         """Initialize server with a model"""
         self.model = model
         self.global_model = copy.deepcopy(model)
-        self.global_model_state_dict = copy.deepcopy(model.state_dict())
+        
+        # Ensure both models are on the same device
+        device = next(model.parameters()).device
+        self.global_model = self.global_model.to(device)
+        
+        # Copy state dict after ensuring device match
+        self.global_model_state_dict = copy.deepcopy(self.global_model.state_dict())
         
         # Initialize personalized head if enabled
         if self.enable_personalization and hasattr(model, 'enable_personalized_mode'):
@@ -93,6 +99,9 @@ class Server:
             
         self.round_num += 1
         
+        # Determine device to use
+        device = next(self.global_model.parameters()).device
+        
         # Apply trust-based filtering if enabled
         if self.enable_trust_filtering and client_stats:
             trusted_clients = {}
@@ -116,7 +125,7 @@ class Server:
                         # Soft filtering: use client with adjusted weight based on trust
                         trusted_clients[client_id] = client_models[client_id]
                         if client_weights:
-                            trusted_weights[client_id] = client_weights.get(client_id, 1.0) * trust_score
+                            trusted_weights[client_id] = client_weights.get(client_id, 1.0) * max(0.2, trust_score)
                         trusted_stats[client_id] = stats
                         logger.info(f"Client {client_id} weighted by trust score {trust_score:.4f}")
                     else:
@@ -132,10 +141,24 @@ class Server:
             
             # Ensure minimum number of clients for aggregation
             if len(trusted_clients) < self.min_trusted_clients:
-                logger.warning(f"Only {len(trusted_clients)} trusted clients (min: {self.min_trusted_clients}). Using all clients.")
-                trusted_clients = client_models
-                trusted_weights = client_weights
-                trusted_stats = client_stats
+                # Sort clients by trust score and take top N
+                sorted_clients = sorted(
+                    [(cid, self.trust_scores.get(cid, 0.0)) for cid in client_models.keys()],
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+                
+                # Use at least min_trusted_clients
+                for cid, score in sorted_clients[:self.min_trusted_clients]:
+                    if cid not in trusted_clients and cid in client_models:
+                        trusted_clients[cid] = client_models[cid]
+                        if client_weights:
+                            # Apply minimum weight for low-trust but needed clients
+                            trusted_weights[cid] = client_weights.get(cid, 1.0) * max(0.2, score)
+                        if cid in client_stats:
+                            trusted_stats[cid] = client_stats[cid]
+                
+                logger.warning(f"Only {len(trusted_clients)-self.min_trusted_clients} trusted clients (min: {self.min_trusted_clients}). Added additional clients.")
             
             client_models = trusted_clients
             if client_weights:
@@ -152,6 +175,12 @@ class Server:
             weight_sum = sum(client_weights.values())
             if weight_sum > 0:
                 client_weights = {k: v / weight_sum for k, v in client_weights.items()}
+            else:
+                # Equal weights if sum is zero
+                client_weights = {k: 1.0 / len(client_models) for k in client_models.keys()}
+        else:
+            # Default to equal weights
+            client_weights = {k: 1.0 / len(client_models) for k in client_models.keys()}
         
         # Weighted averaging of model parameters
         avg_state_dict = {}
@@ -163,15 +192,32 @@ class Server:
             if self.enable_personalization and 'personalized_head' in key:
                 continue
                 
-            avg_state_dict[key] = torch.zeros_like(reference_state_dict[key])
+            # Get tensor from reference and ensure it's on the correct device
+            tensor = reference_state_dict[key].to(device)
+            avg_state_dict[key] = torch.zeros_like(tensor)
         
-        # Weighted sum of model parameters
+        # Add up weighted parameters
         for client_id, state_dict in client_models.items():
-            weight = client_weights.get(client_id, 1.0 / len(client_models)) if client_weights else 1.0 / len(client_models)
+            weight = client_weights.get(client_id, 1.0 / len(client_models))
             
             for key in avg_state_dict.keys():
                 if key in state_dict:
-                    avg_state_dict[key] += weight * state_dict[key]
+                    # Move client parameter to the correct device and apply weight
+                    tensor = state_dict[key].to(device)
+                    avg_state_dict[key] += weight * tensor
+                else:
+                    logger.warning(f"Key {key} missing from client {client_id}")
+        
+        # Apply model averaging stabilization for BatchNorm layers
+        for key in avg_state_dict.keys():
+            # Special handling for batch norm running statistics
+            if 'running_mean' in key or 'running_var' in key or 'num_batches_tracked' in key:
+                # Use exponential moving average for running statistics
+                current_value = self.global_model_state_dict.get(key, None)
+                if current_value is not None:
+                    decay = min(0.9, 1.0 - 1.0 / (self.round_num + 1))
+                    current_value = current_value.to(device)
+                    avg_state_dict[key] = decay * current_value + (1 - decay) * avg_state_dict[key]
         
         # Update round statistics
         self.round_stats = {
@@ -259,15 +305,22 @@ class ServerM(Server):
     
     def set_momentum(self, model):
         """Initialize momentum buffers for the model"""
-        self.global_delta = {key: torch.zeros_like(val) for key, val in model.state_dict().items()}
-        self.global_momentum = {key: torch.zeros_like(val) for key, val in model.state_dict().items()}
+        device = next(model.parameters()).device
+        self.global_delta = {key: torch.zeros_like(val).to(device) for key, val in model.state_dict().items()}
+        self.global_momentum = {key: torch.zeros_like(val).to(device) for key, val in model.state_dict().items()}
 
     @torch.no_grad()
     def FedACG_lookahead(self, model):
         """Apply FedACG lookahead step to the model"""
         sending_model_dict = copy.deepcopy(model.state_dict())
+        device = next(model.parameters()).device
+        
         for key in self.global_momentum:
-            sending_model_dict[key] += self.momentum * self.global_momentum[key]
+            # Ensure both tensors are on the same device
+            momentum = self.global_momentum[key].to(device)
+            if key in sending_model_dict:
+                sending_model_dict[key] = sending_model_dict[key].to(device) + self.momentum * momentum
+                
         model.load_state_dict(sending_model_dict)
         return copy.deepcopy(model)
 
@@ -277,6 +330,9 @@ class ServerM(Server):
             client_metrics = {cid: {"trust_score": 1.0} for cid in client_ids}
             
         trust_scores = {cid: client_metrics.get(cid, {}).get("trust_score", 1.0) for cid in client_ids}
+        
+        # Determine device to use
+        device = next(iter(model_dict.values())).device
         
         if self.enable_trust_filtering:
             if self.soft_filtering:
@@ -319,9 +375,9 @@ class ServerM(Server):
                                param_key in local_weights[i]]
             
             if valid_clients:
-                # Compute weighted sum across valid clients
+                # Compute weighted sum across valid clients, ensuring all tensors are on the same device
                 weighted_sum = sum(
-                    local_weights[i][param_key] * trust_scores.get(client_ids[i], 1.0) / trust_sum
+                    local_weights[i][param_key].to(device) * trust_scores.get(client_ids[i], 1.0) / trust_sum
                     for i in valid_clients
                 )
                 avg_weights[param_key] = weighted_sum
@@ -332,7 +388,8 @@ class ServerM(Server):
                 # Standard momentum update
                 for param_key in avg_weights:
                     if param_key in self.global_momentum:
-                        avg_weights[param_key] += self.momentum * self.global_momentum[param_key]
+                        momentum = self.global_momentum[param_key].to(device)
+                        avg_weights[param_key] += self.momentum * momentum
 
             # Update momentum buffers
             for param_key in model_dict.keys():
@@ -346,14 +403,15 @@ class ServerM(Server):
                                 param_key in local_deltas[i]]
                 
                 if valid_clients:
+                    # Ensure all tensors are on the same device
                     self.global_delta[param_key] = sum(
-                        local_deltas[i][param_key] * trust_scores.get(client_ids[i], 1.0) / trust_sum
+                        local_deltas[i][param_key].to(device) * trust_scores.get(client_ids[i], 1.0) / trust_sum
                         for i in valid_clients
                     )
                     
                     # Apply momentum update to buffer
                     self.global_momentum[param_key] = (
-                        self.momentum * self.global_momentum[param_key] +
+                        self.momentum * self.global_momentum[param_key].to(device) +
                         (1 - self.dampening) * self.global_delta[param_key]
                     )
                     
@@ -415,22 +473,43 @@ class PersonalizedServer(ServerM):
         local_deltas = {}
         client_ids = list(client_models.keys())
         
+        # Determine which device to use (prefer CUDA if available)
+        device = next(self.global_model.parameters()).device
+        
+        # Ensure global model state dict is on the same device
+        global_state_dict = {}
+        for k, v in self.global_model_state_dict.items():
+            global_state_dict[k] = v.to(device)
+        
         # Extract non-personalized parameters from client models
         for i, client_id in enumerate(client_ids):
             local_weights[i] = {}
             local_deltas[i] = {}
             
-            # Filter out personalized head parameters
+            # Filter out personalized head parameters and ensure all tensors are on the same device
             for key, value in client_models[client_id].items():
                 if 'personalized_head' not in key:
-                    local_weights[i][key] = value
+                    # Ensure value is on the same device as the global model
+                    value_on_device = value.to(device)
+                    local_weights[i][key] = value_on_device
                     
                     # Calculate deltas from previous global model
-                    if key in self.global_model_state_dict:
-                        local_deltas[i][key] = value - self.global_model_state_dict[key]
+                    if key in global_state_dict:
+                        local_deltas[i][key] = value_on_device - global_state_dict[key]
+        
+        # Ensure model_dict is on the correct device
+        model_dict = {}
+        for k, v in self.global_model.state_dict().items():
+            model_dict[k] = v.to(device)
             
-        model_dict = self.global_model.state_dict()
         current_lr = getattr(self.args.trainer, 'local_lr', 0.01)
+        
+        # Ensure client_stats has the required format
+        if client_stats:
+            for client_id in client_stats:
+                # Add 'loss' field if missing, using global_loss or default 0.0
+                if 'loss' not in client_stats[client_id]:
+                    client_stats[client_id]['loss'] = client_stats[client_id].get('global_loss', 0.0)
         
         # Aggregate using the momentum-based aggregation method
         aggregated_params = self.aggregate(
@@ -442,7 +521,8 @@ class PersonalizedServer(ServerM):
             client_stats
         )
         
-        self.global_model.load_state_dict(aggregated_params, strict=False)
-        self.global_model_state_dict = aggregated_params
+        # Update global model
+        self.global_model.load_state_dict(aggregated_params)
+        self.global_model_state_dict = copy.deepcopy(aggregated_params)
         
         return aggregated_params

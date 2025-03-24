@@ -268,11 +268,16 @@ class RelaxedContrastiveLoss(nn.Module):
         if batch_size <= 1:
             return torch.tensor(0.0, device=features.device)
             
-        # Normalize feature vectors
-        features = F.normalize(features, dim=1)
+        # Normalize feature vectors for numerical stability
+        features = F.normalize(features, p=2, dim=1)
         
-        # Compute similarity matrix
+        # Compute similarity matrix with scaling
         sim_matrix = torch.matmul(features, features.t()) / self.temperature
+        
+        # Apply temperature scaling in a numerically stable way
+        # Subtract max for numerical stability before exponentiation
+        sim_max, _ = torch.max(sim_matrix, dim=1, keepdim=True)
+        sim_matrix_stable = sim_matrix - sim_max
         
         # Create mask for positive pairs (same class)
         labels_expand = labels.expand(batch_size, batch_size)
@@ -287,8 +292,8 @@ class RelaxedContrastiveLoss(nn.Module):
         if pos_mask.sum() == 0:
             return torch.tensor(0.0, device=features.device)
         
-        # Standard supervised contrastive loss
-        exp_sim = torch.exp(sim_matrix)
+        # Use the log-sum-exp trick for numerical stability
+        exp_sim = torch.exp(sim_matrix_stable)
         
         # For numerical stability, mask out self-similarity
         exp_sim = exp_sim * (1 - eye_mask)
@@ -296,9 +301,14 @@ class RelaxedContrastiveLoss(nn.Module):
         # Compute denominators (sum over all samples except self)
         denominators = exp_sim.sum(dim=1, keepdim=True)
         
-        # Compute standard SCL loss
-        eps = 1e-8  # Small epsilon to avoid log(0)
+        # Use logsumexp for numerical stability
+        log_denominators = torch.log(denominators + 1e-12) + sim_max
+        
+        # Compute supervised contrastive loss using log-space operations
+        eps = 1e-12  # Small epsilon to avoid numerical issues
         scl_loss = 0
+        valid_pairs = 0
+        
         for i in range(batch_size):
             pos_indices = torch.nonzero(pos_mask[i]).squeeze()
             if pos_indices.numel() > 0:  # If there are positive samples
@@ -307,41 +317,61 @@ class RelaxedContrastiveLoss(nn.Module):
                 
                 # Compute loss for each positive pair
                 for j in pos_indices:
-                    numerator = exp_sim[i, j]
-                    denominator = denominators[i]
-                    scl_loss -= torch.log(numerator / (denominator + eps))
+                    # Compute log(numerator/denominator) directly
+                    log_numerator = sim_matrix[i, j]
+                    scl_loss -= (log_numerator - log_denominators[i])
+                    valid_pairs += 1
         
         # Normalize by number of positive pairs
-        num_pos_pairs = pos_mask.sum()
-        if num_pos_pairs > 0:
-            scl_loss = scl_loss / num_pos_pairs
+        if valid_pairs > 0:
+            scl_loss = scl_loss / valid_pairs
         
         # Relaxation term: penalty for too-similar positive pairs
         # Find positive pairs with similarity > lambda
         high_sim_pos = (sim_matrix * self.temperature > self.lambda_threshold) & (pos_mask > 0)
         
         relaxation_loss = 0
+        valid_high_sim_pairs = 0
+        
         if high_sim_pos.sum() > 0:
-            # For each anchor i, compute log(sum_j exp(z_i·z_j/τ) + exp(1/τ)) where j are positive samples with similarity > lambda
             for i in range(batch_size):
                 high_sim_indices = torch.nonzero(high_sim_pos[i]).squeeze()
                 if high_sim_indices.numel() > 0:
                     if high_sim_indices.numel() == 1:
                         high_sim_indices = high_sim_indices.unsqueeze(0)
                     
-                    # Sum of exp(similarity) for high-similarity positive pairs
-                    high_sim_sum = exp_sim[i, high_sim_indices].sum() + torch.exp(torch.tensor(1.0/self.temperature, device=features.device))
-                    relaxation_loss += torch.log(high_sim_sum)
+                    # Use logsumexp for numerical stability
+                    high_sim_logits = sim_matrix_stable[i, high_sim_indices]
+                    
+                    # Add baseline term
+                    baseline_logit = 1.0/self.temperature - sim_max[i]
+                    high_sim_logits_with_baseline = torch.cat([high_sim_logits, baseline_logit.reshape(1)])
+                    
+                    # Compute log-sum-exp directly
+                    max_logit = torch.max(high_sim_logits_with_baseline)
+                    relaxation_loss += max_logit + torch.log(
+                        torch.sum(torch.exp(high_sim_logits_with_baseline - max_logit))
+                    )
+                    valid_high_sim_pairs += high_sim_indices.numel()
             
             # Normalize by number of high-similarity pairs
-            relaxation_loss = relaxation_loss / high_sim_pos.sum()
+            if valid_high_sim_pairs > 0:
+                relaxation_loss = relaxation_loss / valid_high_sim_pairs
         
-        # Total loss
-        total_loss = scl_loss + self.beta * relaxation_loss
+        # Dynamically adjust beta to prevent one term from dominating
+        # This helps stabilize training
+        effective_beta = self.beta
+        if self.rounds_trained > 10 if hasattr(self, 'rounds_trained') else False:
+            if relaxation_loss > 2.0 * scl_loss:
+                effective_beta = self.beta * 0.5
+            elif scl_loss > 2.0 * relaxation_loss:
+                effective_beta = self.beta * 1.5
         
-        # Handle numerical issues
-        if torch.isnan(total_loss) or torch.isinf(total_loss):
-            return torch.tensor(0.5, device=features.device)
+        # Combine losses with safeguards
+        total_loss = scl_loss + effective_beta * relaxation_loss
+        
+        # Clip the loss to prevent explosion
+        total_loss = torch.clamp(total_loss, 0.0, 10.0)
             
         return total_loss
 

@@ -69,6 +69,7 @@ class ResNet(nn.Module):
         self.in_planes = 64
         self.num_classes = num_classes
         self.use_bn_layer = use_bn_layer
+        self.expansion = block.expansion
 
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64) if use_bn_layer else nn.Identity()
@@ -201,7 +202,6 @@ class ResNet(nn.Module):
             projection_features = self.projection_head(features)
             projection_features = F.normalize(projection_features, p=2, dim=1)
         
-        # Get multi-level projections if requested
         if get_multi_level:
             multi_level_projections = {}
             for layer_name in ['layer1', 'layer2', 'layer3']:
@@ -321,45 +321,22 @@ class ResNet(nn.Module):
 @ENCODER_REGISTRY.register()
 class ResNet18(ResNet):
     def __init__(self, args: DictConfig, num_classes: int = 10, **kwargs):
-        super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, 
-                         l2_norm=args.model.l2_norm,
-                         use_bn_layer=args.model.use_bn_layer,
-                         personalization_layers=args.model.personalization_layers,
-                         **kwargs)
+        super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes,
+                        l2_norm=args.model.l2_norm,
+                        use_bn_layer=args.model.use_bn_layer,
+                        personalization_layers=args.model.personalization_layers,
+                        **kwargs)
+        self.use_personalized_head = False
 
 @ENCODER_REGISTRY.register()
-class ResNet34(ResNet):
+class PersonalizedResNet18(ResNet):
     def __init__(self, args: DictConfig, num_classes: int = 10, **kwargs):
-        super().__init__(BasicBlock, [3, 4, 6, 3], num_classes=num_classes, 
-                         l2_norm=args.model.l2_norm,
-                         use_bn_layer=args.model.use_bn_layer,
-                         personalization_layers=args.model.personalization_layers,
-                         **kwargs)
-
-@ENCODER_REGISTRY.register()
-class PersonalizedResNet18(ResNet18):
-    expansion = 1
-    def __init__(self, args: DictConfig, num_classes: int = 10, **kwargs):
-        super().__init__(args, num_classes=num_classes, **kwargs)
-        # Enable personalized mode by default
-        # self.expansion = 1 
+        super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes,
+                        l2_norm=args.model.l2_norm,
+                        use_bn_layer=args.model.use_bn_layer,
+                        personalization_layers=args.model.personalization_layers,
+                        **kwargs)
         self.use_personalized_head = True
-        
-        # Enhanced personalization options
-        personalization_config = getattr(args.model, "personalization", {})
-        self.use_distillation = getattr(personalization_config, "knowledge_distillation", True)
-        self.distillation_temp = getattr(personalization_config, "kd_temperature", 3.0)
-        
-        # Trust-based settings
-        self.trust_score = 1.0  # Initialize with full trust
-        
-        # Adaptive layer freezing
-        adaptive_config = getattr(args.model, "adaptive_freezing", {})
-        self.use_adaptive_freezing = getattr(adaptive_config, "enable", False)
-        self.initial_freeze_ratio = getattr(adaptive_config, "initial_freeze_ratio", 0.5)
-        self.freeze_decay_rate = getattr(adaptive_config, "decay_rate", 0.05)
-        
-        if self.use_adaptive_freezing:
-            self.setup_adaptive_freezing(self.initial_freeze_ratio)
-            
-        logger.info(f"Initialized PersonalizedResNet18 with personalization_layers={args.model.personalization_layers}")
+        self.enable_personalized_mode()
+
+

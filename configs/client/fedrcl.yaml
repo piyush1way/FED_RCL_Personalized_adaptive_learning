@@ -41,9 +41,9 @@ trust_filtering:
 # Personalization configuration
 personalization:
   enable: true
-  freeze_backbone: true
+  freeze_backbone: false
   adaptive_layer_freezing: true
-  trust_threshold: 0.5
+  freeze_ratio: 0.5
 
 # Adaptive learning rate configuration
 adaptive_lr:
@@ -51,3 +51,28 @@ adaptive_lr:
   beta: 0.1  # Factor for adaptive learning rate calculation
   min_lr: 0.001  # Minimum learning rate
   max_lr: 0.1  # Maximum learning rate
+
+# Cyclical learning rate
+cyclical_lr: true
+base_lr: 0.001
+max_lr: 0.1
+step_size: 10
+
+# Knowledge distillation
+distillation: true
+distillation_temp: 3.0
+distillation_weight: 0.7
+
+# Multi-level contrastive learning
+multi_level_rcl: true
+layer_weights: [0.2, 0.2, 0.2, 0.2, 0.2]
+
+# Relaxed contrastive loss parameters
+temperature: 0.05
+beta: 1.0
+lambda_threshold: 0.7
+
+# EWC regularization
+ewc_enabled: true
+ewc_lambda: 0.4
+ewc_importance: 5000

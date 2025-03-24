@@ -4,7 +4,7 @@
 from .build import build_encoder, ENCODER_REGISTRY
 
 # Expose specific models (optional, but useful for direct imports)
-from .resnet import ResNet18, PersonalizedResNet18
+from .resnet_new import ResNet18, PersonalizedResNet18
 from .VGG9 import VGG9
 from .basic import *
 from .resnet_base import *

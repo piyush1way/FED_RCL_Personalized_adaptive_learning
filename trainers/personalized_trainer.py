@@ -55,8 +55,40 @@ class PersonalizedTrainer(BaseTrainer):
         self.client_performance = {}
         self.personalization_metrics = {}
         
+        self.trust_ema = 0.5  # Initialize exponential moving average for trust
+        self.trust_history = []  # Keep track of trust scores
+        self.acc_history = {'global': [], 'personalized': []}  # Track accuracy history
+        self.trust_momentum = 0.9  # Momentum factor for trust score updates
+        self.min_trust = 0.1  # Minimum trust score
+        self.max_trust = 1.0  # Maximum trust score
+        
         logger.info(f"Initialized PersonalizedTrainer with personalization={self.enable_personalization}, "
                    f"adaptive_lr={self.adaptive_lr}, trust_filtering={self.trust_filtering}")
+    
+    def calculate_trust_score(self, global_acc, personalized_acc, round_number):
+        """Calculate dynamic trust score based on performance metrics and training progress"""
+        # Get base trust from accuracy ratio
+        acc_ratio = personalized_acc / (global_acc + 1e-8)  # Prevent division by zero
+        base_trust = min(acc_ratio, 2.0) / 2.0  # Normalize to [0, 1]
+        
+        # Add round-dependent factor to encourage exploration in early rounds
+        round_factor = min(round_number / 100, 1.0)  # Scales up to 1.0 over first 100 rounds
+        
+        # Add small random noise to break plateaus
+        noise = torch.randn(1).item() * 0.02  # Using randn instead of normal
+        
+        # Calculate new trust score with momentum
+        new_trust = self.trust_momentum * self.trust_ema + (1 - self.trust_momentum) * base_trust
+        new_trust = new_trust * round_factor + noise
+        
+        # Ensure trust score stays within bounds
+        new_trust = max(self.min_trust, min(self.max_trust, new_trust))
+        
+        # Update EMA
+        self.trust_ema = new_trust
+        self.trust_history.append(new_trust)
+        
+        return new_trust
     
     def train(self):
         """Training process with personalization support"""
@@ -90,6 +122,7 @@ class PersonalizedTrainer(BaseTrainer):
             # Client training
             client_models = {}
             client_weights = {}
+            client_stats = {}
             
             for client_idx in selected_clients:
                 client = self.clients[client_idx]
@@ -115,7 +148,7 @@ class PersonalizedTrainer(BaseTrainer):
                         local_dataset=self.trainset[client_idx],
                         global_epoch=round_idx,
                         local_lr=local_lr,
-                        trainer=self  # Add back the trainer parameter
+                        trainer=self
                     )
                 
                 # Train client
@@ -125,12 +158,28 @@ class PersonalizedTrainer(BaseTrainer):
                 if client_model_dict is not None:
                     client_models[client_idx] = client_model_dict
                     client_weights[client_idx] = len(self.trainset[client_idx])
+                    client_stats[client_idx] = stats
+                    
+                    # Track client performance
+                    if stats is not None:
+                        if client_idx not in self.client_performance:
+                            self.client_performance[client_idx] = []
+                        self.client_performance[client_idx].append({
+                            'round': round_idx,
+                            'loss': stats.get('global_loss', stats.get('loss', 0.0)),
+                            'trust_score': stats.get('trust_score', 1.0)
+                        })
             
             # Server update
             if self.server is not None and client_models:
-                updated_model_dict = self.server.update_global_model(client_models, client_weights)
+                updated_model_dict = self.server.update_global_model(client_models, client_weights, client_stats)
                 self.model.load_state_dict(updated_model_dict)
                 logger.info(f"Global model updated with {len(client_models)} client models")
+            
+            # Log trust scores if available
+            if hasattr(self.server, 'trust_scores') and self.server.trust_scores:
+                avg_trust = sum(self.server.trust_scores.values()) / len(self.server.trust_scores)
+                logger.info(f"Average trust score: {avg_trust:.4f}")
             
             # Evaluate
             if (round_idx + 1) % self.args.trainer.eval_every == 0:
@@ -153,6 +202,20 @@ class PersonalizedTrainer(BaseTrainer):
                     self.best_personalized_acc = current_personalized_acc
                     self.best_personalized_state = copy.deepcopy(self.model.state_dict())
                     self.save_model(f"best_personalized_model_round_{round_idx+1}.pt")
+                
+                # Save metrics
+                save_dict_to_json(metrics, f"{self.args.log_dir}/metrics_round_{round_idx+1}.json")
+                
+                # Save overall metrics history
+                save_dict_to_json(dict(metrics_history), f"{self.args.log_dir}/metrics_history.json")
+                
+                # Save client performance
+                save_dict_to_json(self.client_performance, f"{self.args.log_dir}/client_performance.json")
+                
+                # Save personalization metrics
+                if 'personalization' in metrics:
+                    self.personalization_metrics[round_idx+1] = metrics['personalization']
+                    save_dict_to_json(self.personalization_metrics, f"{self.args.log_dir}/personalization_metrics.json")
         
         return self.model, metrics_history
     
@@ -160,27 +223,48 @@ class PersonalizedTrainer(BaseTrainer):
         """Evaluate both global and personalized models"""
         logger.info(f"Evaluating models at round {round_idx+1}")
         
-        # Basic evaluation
-        metrics = super().evaluate(round_idx)
+        # Create a copy of the model for evaluation
+        eval_model = copy.deepcopy(self.model)
+        eval_model.eval()
+        eval_model.to(self.device)
+        
+        # Evaluate global model
+        if hasattr(eval_model, 'disable_personalized_mode'):
+            eval_model.disable_personalized_mode()
+        metrics = evaluate(self.args, eval_model, self.testloader, self.device)
         
         # Track trust scores if available
         if hasattr(self.server, 'trust_scores') and len(self.server.trust_scores) > 0:
             trust_stats = track_trust_scores(self)
             metrics.update({"trust_stats": trust_stats})
-            
-        # Evaluate personalization benefits
+        
+        # Evaluate personalization if enabled
         if self.enable_personalization:
+            # Enable personalized mode
+            if hasattr(eval_model, 'enable_personalized_mode'):
+                eval_model.enable_personalized_mode()
+            
+            # Evaluate personalization benefits
             personalization_metrics = evaluate_personalization_benefits(
-                self.args, self.model, self.testloader, self.device
+                self.args, eval_model, self.testloader, self.device
             )
             metrics.update({"personalization": personalization_metrics})
+            
+            # Update personalized accuracy
+            if 'acc_personalized' in personalization_metrics:
+                metrics['acc_personalized'] = personalization_metrics['acc_personalized']
             
             # Log key personalization metrics
             if 'bop' in personalization_metrics:
                 logger.info(f"Benefit of Personalization: {personalization_metrics['bop']:.4f}")
                 logger.info(f"Global Acc: {personalization_metrics['acc_global']:.4f}, "
-                           f"Personalized Acc: {personalization_metrics['acc_personalized']:.4f}")
-            
+                          f"Personalized Acc: {personalization_metrics['acc_personalized']:.4f}")
+        
+        # Clean up
+        eval_model.to('cpu')
+        del eval_model
+        torch.cuda.empty_cache()
+        
         return metrics
     
     def select_clients(self, round_idx):

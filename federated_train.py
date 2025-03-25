@@ -159,7 +159,11 @@ def main(args: DictConfig) -> None:
         try:
             # Create client with state dict rather than full model copy
             client = client_type(args, client_idx, None)  # Pass None instead of model copy
-            client.model = copy.deepcopy(model)  # Set model directly
+            
+            # Add a reference to the model without deepcopy (to be set later)
+            if not hasattr(client, 'model') or client.model is None:
+                logger.info(f"Client {client_idx} model will be initialized during setup")
+                
             client_instances[client_idx] = client
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
@@ -168,10 +172,15 @@ def main(args: DictConfig) -> None:
                 gc.collect()
                 
                 # Alternative approach: create client without model, will be set during training
-                client = client_type(args, client_idx, None)
-                client_instances[client_idx] = client
+                try:
+                    client = client_type(args, client_idx, None)
+                    client_instances[client_idx] = client
+                except Exception as nested_e:
+                    logger.error(f"Failed to create client {client_idx}: {str(nested_e)}")
             else:
-                raise e
+                logger.error(f"Error creating client {client_idx}: {str(e)}")
+    
+    logger.info(f"Created {len(client_instances)} clients successfully")
     
     # Get evaler and trainer types
     evaler_type = get_evaler_type(args)

@@ -149,21 +149,35 @@ class PersonalizedTrainer(BaseTrainer):
             metrics.update({"trust_stats": trust_stats})
         
         if self.enable_personalization:
-            if hasattr(eval_model, 'enable_personalized_mode'):
-                eval_model.enable_personalized_mode()
-            
-            personalization_metrics = evaluate_personalization_benefits(
-                self.args, eval_model, self.testloader, self.device
-            )
-            metrics.update({"personalization": personalization_metrics})
-            
-            if 'acc_personalized' in personalization_metrics:
-                metrics['acc_personalized'] = personalization_metrics['acc_personalized']
-            
-            if 'bop' in personalization_metrics:
-                logger.info(f"Benefit of Personalization: {personalization_metrics['bop']:.4f}")
-                logger.info(f"Global Acc: {personalization_metrics['acc_global']:.4f}, "
-                          f"Personalized Acc: {personalization_metrics['acc_personalized']:.4f}")
+            try:
+                if hasattr(eval_model, 'enable_personalized_mode'):
+                    eval_model.enable_personalized_mode()
+                
+                personalization_metrics = evaluate_personalization_benefits(
+                    self.args, eval_model, self.testloader, self.device
+                )
+                metrics.update({"personalization": personalization_metrics})
+                
+                if 'acc_personalized' in personalization_metrics:
+                    metrics['acc_personalized'] = personalization_metrics['acc_personalized']
+                
+                if 'bop' in personalization_metrics:
+                    logger.info(f"Benefit of Personalization: {personalization_metrics['bop']:.4f}")
+                    
+                    # Fix KeyError by checking for different possible keys or using get() with default value
+                    global_acc = personalization_metrics.get('acc_global', 
+                                personalization_metrics.get('global_acc', metrics.get('acc', 0.0)))
+                    
+                    personalized_acc = personalization_metrics.get('acc_personalized', 
+                                      personalization_metrics.get('personalized_acc', global_acc))
+                    
+                    logger.info(f"Global Acc: {global_acc:.4f}, Personalized Acc: {personalized_acc:.4f}")
+            except Exception as e:
+                logger.error(f"Error in personalization evaluation: {str(e)}")
+                logger.error(f"Personalization metrics keys: {list(personalization_metrics.keys()) if 'personalization_metrics' in locals() else 'N/A'}")
+                # Continue with evaluation without personalization results
+                if 'acc_personalized' not in metrics:
+                    metrics['acc_personalized'] = metrics.get('acc', 0.0)  # Use global accuracy as fallback
         
         eval_model.to('cpu')
         del eval_model

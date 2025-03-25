@@ -19,6 +19,9 @@ class PersonalizedTrainer(BaseTrainer):
     def __init__(self, args, model, trainset, testset, clients, server, evaler):
         super().__init__(args, model, trainset, testset, clients, server, evaler)
         
+        # Set device based on CUDA availability
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        
         # Ensure server is properly initialized
         if isinstance(server, dict):
             from servers.build import build_server
@@ -216,7 +219,7 @@ class PersonalizedTrainer(BaseTrainer):
     def train_init(self):
         """Initialize training by setting up models and optimizer"""
         # Set up model and optimizer
-        if self.args.device.type == "cuda":
+        if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = self.args.enable_benchmark
         
         # Initialize model with personalization support

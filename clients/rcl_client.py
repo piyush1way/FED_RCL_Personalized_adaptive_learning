@@ -185,7 +185,7 @@ class RCLClient(Client):
             trust_history = self.trust_score_history[-5:] if hasattr(self, 'trust_score_history') and self.trust_score_history else [trust_score]
             
             # Calculate moving average of trust scores for stability
-            trust_avg = sum(trust_history) / len(trust_history)
+            trust_avg = float(sum(trust_history)) / float(len(trust_history))
             
             # Cyclical component: sine wave with period of 2*step_size
             cycle_position = self.rounds_trained % (2 * self.step_size)
@@ -257,11 +257,26 @@ class RCLClient(Client):
                 self.global_model.load_state_dict(state_dict, strict=False)
 
     def compute_fedprox_term(self):
-        """Compute FedProx regularization term"""
+        """Compute FedProx regularization term with proper type handling"""
         proximal_term = 0.0
+        
+        if not self.enable_fedprox or not hasattr(self, 'global_model'):
+            return torch.tensor(0.0).to(self.device)
+        
+        # Calculate L2 distance between local and global model parameters
         for w, w_t in zip(self.model.parameters(), self.global_model.parameters()):
-            proximal_term += (w - w_t).norm(2)**2
-        return self.fedprox_mu * proximal_term / 2
+            # Skip parameters that don't require gradients
+            if not w.requires_grad:
+                continue
+            
+            # Ensure parameters are float type
+            w_float = w.float()
+            w_t_float = w_t.float()
+            
+            # Add to proximal term
+            proximal_term += (w_float - w_t_float).norm(2).pow(2)
+        
+        return self.fedprox_mu * 0.5 * proximal_term
 
     def compute_distillation_loss(self, student_logits, teacher_logits, features=None, teacher_features=None):
         """Compute knowledge distillation loss between student and teacher models"""
@@ -338,6 +353,10 @@ class RCLClient(Client):
                             
                             # Compute cosine similarity if tensors are not empty
                             if flat_current.shape[0] > 0 and flat_past.shape[0] > 0:
+                                # Convert tensors to float for cosine similarity
+                                flat_current = flat_current.float()
+                                flat_past = flat_past.float()
+                                
                                 cos_sim = F.cosine_similarity(flat_current.unsqueeze(0), flat_past.unsqueeze(0))
                                 # Convert from [-1, 1] to [0, 1] range
                                 sim_score += (cos_sim + 1) / 2
@@ -442,14 +461,14 @@ class RCLClient(Client):
                 global_output = self.global_model(data)
                 global_preds = torch.argmax(global_output["logit"], dim=1)
                 
-                # Calculate agreement ratio
+                # Calculate agreement ratio - ensure float calculation
                 agreement += (local_preds == global_preds).float().sum().item()
                 total_samples += data.size(0)
         
         self.model.train()
         
         if total_samples > 0:
-            return agreement / total_samples
+            return float(agreement) / float(total_samples)
         else:
             return 0.8  # Default if no samples
 
@@ -547,7 +566,7 @@ class RCLClient(Client):
         # High trust clients can focus more on higher layers (personalization)
         # Low trust clients need to focus more on lower layers (generalization)
         if hasattr(self, 'trust_score_history') and self.trust_score_history:
-            trust_avg = sum(self.trust_score_history[-3:]) / min(3, len(self.trust_score_history))
+            trust_avg = float(sum(self.trust_score_history[-3:])) / float(min(3, len(self.trust_score_history)))
             
             # Slightly shift weight from final to lower layers for low-trust clients
             trust_adjustment = max(0.0, 0.2 * (1.0 - trust_avg))
@@ -755,28 +774,23 @@ class RCLClient(Client):
         return correct / total
 
     def calculate_contrastive_loss(self, features, labels):
-        """Calculate supervised contrastive loss"""
-        temperature = self.model.temperature
-        batch_size = features.size(0)
+        """Calculate relaxed contrastive loss with proper type handling"""
+        if not isinstance(features, torch.Tensor) or not isinstance(labels, torch.Tensor):
+            return torch.tensor(0.0).to(self.device)
         
-        # Normalize features
-        features = F.normalize(features, p=2, dim=1)
+        # Ensure features are float type
+        if features.dtype != torch.float32 and features.dtype != torch.float64:
+            features = features.float()
         
-        # Compute similarity matrix
-        similarity_matrix = torch.matmul(features, features.T) / temperature
+        # Ensure labels are long type
+        if labels.dtype != torch.int64 and labels.dtype != torch.long:
+            labels = labels.long()
         
-        # Create mask for positive pairs
-        labels = labels.contiguous().view(-1, 1)
-        mask = torch.eq(labels, labels.T).float()
-        
-        # Remove diagonal elements
-        mask = mask - torch.eye(batch_size).to(mask.device)
-        
-        # Compute loss
-        exp_sim = torch.exp(similarity_matrix)
-        log_prob = similarity_matrix - torch.log(exp_sim.sum(dim=1, keepdim=True))
-        
-        mean_log_prob = (mask * log_prob).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
-        
-        return -mean_log_prob.mean()
+        # Apply relaxed contrastive loss
+        try:
+            rcl_loss = self.relaxed_contrastive_loss(features, labels)
+            return rcl_loss
+        except RuntimeError as e:
+            logger.warning(f"Error computing contrastive loss: {str(e)}. Using default loss.")
+            return torch.tensor(0.01).to(self.device)  # Small default loss to avoid NaN
 

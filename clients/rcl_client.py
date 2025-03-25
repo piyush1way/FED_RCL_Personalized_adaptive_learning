@@ -196,7 +196,7 @@ class RCLClient(Client):
                     self.ewc_batch = (images.to(self.device), labels.to(self.device))
         
         # Calculate trust score for learning rate adjustment
-        trust_score = self.compute_trust_score() if self.enable_trust_filtering else 0.8
+        trust_score = self.compute_trust_score(self.model) if self.enable_trust_filtering else 0.8
         
         # Enhanced trust-based cyclical learning rate
         if self.enable_cyclical_lr:

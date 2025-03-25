@@ -25,6 +25,7 @@ class RCLClient(Client):
         self.args = args
         self.client_index = client_index
         self.loader = None
+        self.use_amp = getattr(args, 'use_amp', False)
 
         # Trust-based client filtering configuration
         trust_filtering_config = getattr(args.client, "trust_filtering", {})
@@ -62,10 +63,11 @@ class RCLClient(Client):
 
         # Model setup
         self.model = model
-        self.global_model = copy.deepcopy(model)
+        self.global_model = copy.deepcopy(model) if model is not None else None
         self.device = torch.device("cpu")
 
         # Multi-level contrastive learning setup
+        self.enable_contrastive = getattr(args.client, "enable_contrastive", True)
         self.rcl_criterions = {'scl': None, 'penalty': None}
         args_rcl = getattr(args.client, "rcl_loss", None)
         if args_rcl:
@@ -107,6 +109,22 @@ class RCLClient(Client):
         self.device = device
         self.rounds_trained += 1
         self.trainer = trainer  # Store trainer reference
+        
+        # Initialize models if None
+        if self.model is None and hasattr(trainer, 'model'):
+            logger.info(f"Client {self.client_index}: Creating model from trainer")
+            self.model = copy.deepcopy(trainer.model)
+            
+        if self.global_model is None and self.model is not None:
+            logger.info(f"Client {self.client_index}: Creating global model from local model")
+            self.global_model = copy.deepcopy(self.model)
+        elif self.global_model is None and hasattr(trainer, 'global_model'):
+            logger.info(f"Client {self.client_index}: Creating global model from trainer")
+            self.global_model = copy.deepcopy(trainer.global_model)
+            
+        # Ensure models exist before continuing
+        if self.model is None:
+            raise ValueError(f"Client {self.client_index}: Unable to initialize model")
         
         # Save previous model state for trust score calculation
         if self.enable_trust_filtering and hasattr(self.model, 'state_dict'):
@@ -251,6 +269,16 @@ class RCLClient(Client):
     def _update_global_model(self, state_dict):
         """Update global model copy with server state dict"""
         if state_dict is not None:
+            # Create global_model if it doesn't exist
+            if self.global_model is None:
+                if self.model is not None:
+                    self.global_model = copy.deepcopy(self.model)
+                else:
+                    # If both model and global_model are None, can't update
+                    logger.warning(f"Client {self.client_index}: Cannot update global model - both model and global_model are None")
+                    return
+                    
+            # Update the global model
             if isinstance(self.global_model, torch.nn.DataParallel):
                 self.global_model.module.load_state_dict(state_dict, strict=False)
             else:

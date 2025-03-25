@@ -264,6 +264,18 @@ class RelaxedContrastiveLoss(nn.Module):
         self.lambda_threshold = lambda_threshold
         
     def forward(self, features, labels):
+        # Handle type conversion first to avoid dtype issues
+        if not isinstance(features, torch.Tensor) or not isinstance(labels, torch.Tensor):
+            return torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Ensure features are float type for numerical operations
+        if features.dtype != torch.float32 and features.dtype != torch.float64:
+            features = features.float()
+        
+        # Ensure labels are long type for indexing
+        if labels.dtype != torch.int64 and labels.dtype != torch.long:
+            labels = labels.long()
+        
         batch_size = features.size(0)
         if batch_size <= 1:
             return torch.tensor(0.0, device=features.device)
@@ -343,8 +355,8 @@ class RelaxedContrastiveLoss(nn.Module):
                     # Use logsumexp for numerical stability
                     high_sim_logits = sim_matrix_stable[i, high_sim_indices]
                     
-                    # Add baseline term
-                    baseline_logit = 1.0/self.temperature - sim_max[i]
+                    # Add baseline term - ensure it's a tensor
+                    baseline_logit = torch.tensor(1.0/self.temperature, device=features.device) - sim_max[i]
                     high_sim_logits_with_baseline = torch.cat([high_sim_logits, baseline_logit.reshape(1)])
                     
                     # Compute log-sum-exp directly

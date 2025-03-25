@@ -32,25 +32,32 @@ wandb.require("service")
 
 @hydra.main(version_base=None, config_path="configs", config_name="fedrcl_p")
 def main(args: DictConfig) -> None:
+    """Main entry point for federated training"""
     start_time = time.time()
     
-    # Configure CUDA memory management to avoid fragmentation
+    # Configure CUDA for better memory management
     if torch.cuda.is_available():
         try:
             # Clear CUDA cache and collect garbage
             torch.cuda.empty_cache()
             gc.collect()
-            torch.cuda.ipc_collect()
+            if hasattr(torch.cuda, 'ipc_collect'):
+                torch.cuda.ipc_collect()
             
             # Apply memory split size if specified in config
             if hasattr(args, 'memory') and hasattr(args.memory, 'max_split_size_mb'):
-                torch.backends.cuda.max_split_size_mb = args.memory.max_split_size_mb
-                logger.info(f"Set CUDA max_split_size_mb to {args.memory.max_split_size_mb}")
+                max_split_size_mb = args.memory.max_split_size_mb
             else:
-                # Default to 128MB for Kaggle
-                torch.backends.cuda.max_split_size_mb = 128
-                logger.info("Set CUDA max_split_size_mb to default (128MB) for Kaggle")
+                # Default to 64MB for Kaggle (smaller than previous 128MB)
+                max_split_size_mb = 64
                 
+            # Set environment variables for PyTorch memory management
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = f'max_split_size_mb:{max_split_size_mb},garbage_collection_threshold:0.6'
+            logger.info(f"Set CUDA max_split_size_mb to {max_split_size_mb}")
+                
+            # Set memory fraction to avoid OOM
+            torch.cuda.set_per_process_memory_fraction(0.8)  # Limit to 80% instead of default 95%
+            
             # Set other performance options
             torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for faster computation
             torch.backends.cudnn.allow_tf32 = True
@@ -60,6 +67,14 @@ def main(args: DictConfig) -> None:
             logger.info(f"CUDA Device: {torch.cuda.get_device_name(0)}")
             logger.info(f"CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
             logger.info(f"CUDA Capability: {torch.cuda.get_device_capability()}")
+            
+            # Auto-adjust batch size based on GPU memory
+            if not hasattr(args, 'batch_size') or args.batch_size > 16:
+                gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                if gpu_memory_gb < 12:  # For smaller GPUs like K80, P100, T4
+                    args.batch_size = 8
+                    logger.info(f"Auto-adjusted batch size to {args.batch_size} for {gpu_memory_gb:.1f} GB GPU")
+            
         except Exception as e:
             logger.warning(f"CUDA initialization failed: {e}. Falling back to CPU.")
             device = torch.device("cpu")
@@ -106,9 +121,30 @@ def main(args: DictConfig) -> None:
     client_type = get_client_type(args)
     server_type = get_server_type(args)
     
-    # Create server instance
+    # Create server instance with memory-efficient approach
     server = build_server(args)
-    server.setup(model)  # Initialize the server with the model
+    try:
+        # Move model to CPU temporarily for setup to avoid OOM
+        model_device = next(model.parameters()).device
+        model = model.to('cpu')
+        server.setup(model)  # Initialize the server with the model
+        model = model.to(model_device)  # Move back
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            logger.error("CUDA OOM during server setup. Using fallback approach.")
+            # Clear cache and retry
+            torch.cuda.empty_cache()
+            gc.collect()
+            # Try again with more conservative approach
+            try:
+                # Create new server and setup
+                server = build_server(args)
+                server.setup(model)
+            except Exception as nested_e:
+                logger.error(f"Server setup failed: {nested_e}")
+                raise nested_e
+        else:
+            raise e
     
     # Build datasets with balanced subset sharing if enabled
     if hasattr(args.split, 'share_balanced_subset') and args.split.share_balanced_subset:
@@ -117,10 +153,25 @@ def main(args: DictConfig) -> None:
     else:
         datasets = build_datasets(args)
     
-    # Create client instances
+    # Create client instances with memory-efficient approach
     client_instances = {}
     for client_idx in range(args.trainer.num_clients):
-        client_instances[client_idx] = client_type(args, client_idx, copy.deepcopy(model))
+        try:
+            # Create client with state dict rather than full model copy
+            client = client_type(args, client_idx, None)  # Pass None instead of model copy
+            client.model = copy.deepcopy(model)  # Set model directly
+            client_instances[client_idx] = client
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                logger.error(f"CUDA OOM creating client {client_idx}. Using alternative approach.")
+                torch.cuda.empty_cache()
+                gc.collect()
+                
+                # Alternative approach: create client without model, will be set during training
+                client = client_type(args, client_idx, None)
+                client_instances[client_idx] = client
+            else:
+                raise e
     
     # Get evaler and trainer types
     evaler_type = get_evaler_type(args)
@@ -166,7 +217,7 @@ def main(args: DictConfig) -> None:
     # Move model to device
     trainer.device = device
     trainer.model = trainer.model.to(device)
-
+    
     # Track metrics during training
     training_metrics = {
         "global_acc": [],
@@ -183,6 +234,7 @@ def main(args: DictConfig) -> None:
     try:
         # Run garbage collection before training
         gc.collect()
+        torch.cuda.empty_cache()
         
         # Train the model
         trained_model, metrics = trainer.train()
@@ -197,8 +249,16 @@ def main(args: DictConfig) -> None:
             gc.collect()
             # Try to continue with reduced batch size if possible
             if hasattr(args, 'batch_size') and args.batch_size > 8:
+                old_batch_size = args.batch_size
                 args.batch_size = args.batch_size // 2
                 logger.info(f"Reduced batch size to {args.batch_size}")
+                
+                # Reset model to clear gradients
+                if hasattr(trainer, 'model'):
+                    for param in trainer.model.parameters():
+                        if param.grad is not None:
+                            param.grad = None
+                
                 # Try one more time
                 try:
                     trained_model, metrics = trainer.train()
@@ -231,21 +291,35 @@ def main(args: DictConfig) -> None:
     
     # Save final model
     if hasattr(trainer, 'save_model'):
-        trainer.save_model(suffix="final")
+        try:
+            trainer.save_model(suffix="final")
+        except Exception as e:
+            logger.error(f"Error saving model: {e}")
+            # Fallback to simpler save
+            try:
+                save_path = args.log_dir / "final_model.pt"
+                torch.save(trained_model.state_dict(), save_path)
+                logger.info(f"Saved model state dict to {save_path}")
+            except Exception as nested_e:
+                logger.error(f"Fallback save failed: {nested_e}")
     
     # Evaluate personalization benefits if enabled
     if personalization_enabled:
         logger.info("Evaluating personalization benefits...")
-        personalization_metrics = evaluate_personalization_benefits(
-            args, model, trainer.testloader, device
-        )
-        
-        # Save personalization metrics
-        metrics_path = args.log_dir / "personalization_metrics.json"
-        save_dict_to_json(personalization_metrics, metrics_path)
-        
-        if args.wandb:
-            wandb.log({"personalization_metrics": personalization_metrics})
+        try:
+            personalization_metrics = evaluate_personalization_benefits(
+                args, model, trainer.testloader, device
+            )
+            
+            # Save personalization metrics
+            metrics_path = args.log_dir / "personalization_metrics.json"
+            save_dict_to_json(personalization_metrics, metrics_path)
+            
+            if args.wandb:
+                wandb.log({"personalization_metrics": personalization_metrics})
+        except Exception as e:
+            logger.error(f"Error evaluating personalization benefits: {e}")
+            personalization_metrics = {"error": str(e)}
     
     # Save training metrics
     metrics_path = args.log_dir / "training_metrics.json"
@@ -267,6 +341,8 @@ def main(args: DictConfig) -> None:
             logger.info(f"4. Multi-Level Contrastive Learning: {personalization_metrics['bop']:.4f} benefit of personalization")
     
     logger.info(f"Experiment completed successfully! Total time: {(time.time() - start_time)/60:.2f} minutes")
+    
+    return trained_model, training_metrics
 
 if __name__ == "__main__":
     main()

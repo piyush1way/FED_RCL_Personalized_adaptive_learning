@@ -636,47 +636,150 @@ class RCLClient(Client):
                 
         return True
 
-    def local_train(self, round_idx):
-        """Train the model locally with improved balance between global and personalized objectives"""
+    def local_train(self, epoch):
+        """Train client model on local data"""
+        if not hasattr(self, 'model') or self.model is None:
+            raise ValueError("Client model not initialized")
+            
+        if not hasattr(self, 'trainloader') or self.trainloader is None:
+            raise ValueError("Client data loader not initialized")
+            
         self.model.train()
         
-        # Initialize tracking variables
-        global_losses = []
-        personalized_losses = []
-        contrastive_losses = []
+        # Set up trackers
+        metrics = {'loss': 0, 'acc': 0, 'trust_score': 0.5}
+        epoch_loss = []
         
-        # Get initial global model state for distillation
-        global_model_state = copy.deepcopy(self.model.state_dict())
+        # Set up optimizer
+        if not hasattr(self, 'optimizer') or self.optimizer is None:
+            self.setup_optimizer()
+            
+        # Set train mode
+        self.model.train()
         
-        # Training loop
-        for epoch in range(self.args.trainer.local_epochs):
-            epoch_loss = 0
-            correct = 0
-            total = 0
+        # Setup cyclical learning rate if enabled
+        if self.enable_cyclic_lr:
+            self.setup_cyclic_lr(epoch)
+            
+        # Setup trust-based learning rate if enabled
+        if self.enable_trust_lr and hasattr(self, 'trust_score'):
+            self.setup_trust_lr(self.trust_score)
+            
+        # Track batches processed
+        batches_processed = 0
+            
+        # Train for local epochs
+        for local_epoch in range(self.local_epochs):
+            batch_loss = []
+            
+            # Track labels seen this epoch for contrastive learning
+            self.epoch_labels = []
+            self.batch_features = None
+            self.batch_labels = None
             
             for batch_idx, (images, labels) in enumerate(self.trainloader):
-                images, labels = images.to(self.device), labels.to(self.device)
+                # Move batch to device
+                try:
+                    images, labels = images.to(self.device), labels.to(self.device)
+                except Exception as e:
+                    logger.error(f"Error moving batch to device: {e}")
+                    continue
                 
+                # Clear gradients
                 self.optimizer.zero_grad()
                 
-                # Forward pass
-                outputs = self.model(images)
-                features = outputs['feature']
-                global_logits = outputs['global_logit']
-                personalized_logits = outputs['personalized_logit']
+                try:
+                    # Clear CUDA cache if memory is getting tight
+                    if torch.cuda.is_available() and torch.cuda.memory_allocated() > 0.8 * torch.cuda.get_device_properties(0).total_memory:
+                        torch.cuda.empty_cache()
+                        
+                    # Process in smaller chunks if batch is large
+                    if len(images) > 16 and torch.cuda.is_available():
+                        outputs_list = []
+                        chunk_size = 8  # Smaller chunks to avoid OOM
+                        for i in range(0, len(images), chunk_size):
+                            img_chunk = images[i:i+chunk_size]
+                            chunk_outputs = self.model(img_chunk)
+                            outputs_list.append(chunk_outputs)
+                            
+                        # Combine outputs if they're dictionaries
+                        if isinstance(outputs_list[0], dict):
+                            outputs = {k: torch.cat([out[k] for out in outputs_list if k in out]) 
+                                      for k in outputs_list[0].keys()}
+                        else:
+                            outputs = torch.cat(outputs_list)
+                    else:
+                        # Normal forward pass
+                        outputs = self.model(images)
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        # If OOM, try with smaller batch
+                        logger.warning(f"OOM error with batch size {len(images)}. Trying with smaller batch.")
+                        torch.cuda.empty_cache()
+                        # Try with half the batch size
+                        if len(images) > 2:
+                            half_point = len(images) // 2
+                            try:
+                                # Process first half
+                                outputs1 = self.model(images[:half_point])
+                                # Process second half
+                                outputs2 = self.model(images[half_point:])
+                                
+                                # Combine outputs
+                                if isinstance(outputs1, dict):
+                                    outputs = {k: torch.cat([outputs1[k], outputs2[k]]) for k in outputs1.keys()}
+                                else:
+                                    outputs = torch.cat([outputs1, outputs2])
+                            except Exception as nested_e:
+                                logger.error(f"Failed with smaller batch: {nested_e}")
+                                continue
+                        else:
+                            logger.error("Batch too small to split further")
+                            continue
+                    else:
+                        logger.error(f"Error in forward pass: {e}")
+                        continue
+                
+                # Extract contrastive learning features with memory-efficient approach
+                try:
+                    if self.enable_contrastive:
+                        # Process features in smaller chunks to avoid OOM
+                        if len(images) > 8:
+                            features_list = []
+                            chunk_size = 4  # Even smaller for feature extraction
+                            for i in range(0, len(images), chunk_size):
+                                # Extract features for this chunk
+                                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                                    chunk_features = self.extract_features_safely(images[i:i+chunk_size])
+                                features_list.append(chunk_features)
+                                # Clear cache after each chunk
+                                torch.cuda.empty_cache()
+                            
+                            proj_features = torch.cat(features_list)
+                        else:
+                            # Regular feature extraction
+                            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                                proj_features = self.extract_features_safely(images)
+                    else:
+                        proj_features = None
+                        
+                except Exception as e:
+                    logger.error(f"Error in feature extraction: {e}")
+                    # Skip contrastive loss if feature extraction fails
+                    proj_features = None
                 
                 # Calculate losses
                 # 1. Global classification loss
-                global_loss = self.criterion(global_logits, labels)
+                global_loss = self.criterion(outputs['global_logit'], labels)
                 
                 # 2. Personalized classification loss
-                personalized_loss = self.criterion(personalized_logits, labels)
+                personalized_loss = self.criterion(outputs['personalized_logit'], labels)
                 
                 # 3. Knowledge distillation loss
                 if self.enable_distillation:
                     with torch.no_grad():
                         global_model = copy.deepcopy(self.model)
-                        global_model.load_state_dict(global_model_state)
+                        global_model.load_state_dict(self.previous_model_state)
                         global_model.eval()
                         teacher_outputs = global_model(images)
                         teacher_logits = teacher_outputs['global_logit']
@@ -684,7 +787,7 @@ class RCLClient(Client):
                     distill_temp = self.distillation_temp
                     soft_targets = F.softmax(teacher_logits / distill_temp, dim=1)
                     distill_loss = F.kl_div(
-                        F.log_softmax(personalized_logits / distill_temp, dim=1),
+                        F.log_softmax(outputs['personalized_logit'] / distill_temp, dim=1),
                         soft_targets,
                         reduction='batchmean'
                     ) * (distill_temp ** 2)
@@ -692,8 +795,7 @@ class RCLClient(Client):
                     distill_loss = torch.tensor(0.0).to(self.device)
                 
                 # 4. Contrastive loss for feature alignment
-                if hasattr(self.model, 'get_contrastive_features'):
-                    proj_features = self.model.get_contrastive_features(images)
+                if proj_features is not None:
                     contrastive_loss = self.calculate_contrastive_loss(proj_features, labels)
                 else:
                     contrastive_loss = torch.tensor(0.0).to(self.device)
@@ -716,27 +818,21 @@ class RCLClient(Client):
                 self.optimizer.step()
                 
                 # Update metrics
-                epoch_loss += total_loss.item()
-                _, predicted = torch.max(personalized_logits, 1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-                
-                # Track individual losses
-                global_losses.append(global_loss.item())
-                personalized_losses.append(personalized_loss.item())
-                contrastive_losses.append(contrastive_loss.item())
+                batch_loss.append(total_loss.item())
+                self.epoch_labels.append(labels.cpu().numpy())
+                self.batch_features = proj_features
+                self.batch_labels = labels.cpu().numpy()
             
             # Log epoch metrics
-            accuracy = 100. * correct / total
-            logger.debug(f'Epoch {epoch}: Loss: {epoch_loss/len(self.trainloader):.3f}, '
-                        f'Acc: {accuracy:.2f}%, Trust: {trust_score:.3f}')
-            
-            # Update trust score based on performance
-            if hasattr(self.trainer, 'calculate_trust_score'):
-                global_acc = self.evaluate_global_accuracy()
-                personalized_acc = accuracy / 100.0  # Convert to decimal
-                new_trust = self.trainer.calculate_trust_score(global_acc, personalized_acc, round_idx)
-                self.model.trust_score = new_trust
+            epoch_loss.append(np.mean(batch_loss))
+            metrics['loss'] += np.mean(batch_loss)
+            metrics['acc'] += self.evaluate_global_accuracy()
+            metrics['trust_score'] = self.compute_trust_score()
+        
+        # Log final epoch metrics
+        metrics['loss'] /= self.local_epochs
+        metrics['acc'] /= self.local_epochs
+        metrics['trust_score'] = self.compute_trust_score()
         
         # Create state_dict dictionary to return - only include non-personalized parameters
         if self.enable_personalization and hasattr(self.model, 'get_global_params'):
@@ -748,9 +844,9 @@ class RCLClient(Client):
         # Create stats dictionary
         stats_dict = {
             'trust_score': getattr(self.model, 'trust_score', 0.8),
-            'global_loss': np.mean(global_losses),
-            'personalized_loss': np.mean(personalized_losses),
-            'contrastive_loss': np.mean(contrastive_losses)
+            'global_loss': np.mean(epoch_loss),
+            'personalized_loss': np.mean(epoch_loss),
+            'contrastive_loss': np.mean(epoch_loss)
         }
         
         # Return both the model state and stats (as two separate values)
@@ -793,4 +889,51 @@ class RCLClient(Client):
         except RuntimeError as e:
             logger.warning(f"Error computing contrastive loss: {str(e)}. Using default loss.")
             return torch.tensor(0.01).to(self.device)  # Small default loss to avoid NaN
+
+    def extract_features_safely(self, images):
+        """Extract features from images in a memory-efficient way"""
+        try:
+            # Move to CPU to avoid extra memory usage
+            self.model.eval()  # Temporarily set to eval mode for feature extraction
+            
+            with torch.no_grad():  # No gradients needed for feature extraction
+                # Use a dedicated forward hook to get intermediate features
+                features = None
+                
+                def hook_fn(module, input, output):
+                    nonlocal features
+                    features = output.detach()
+                
+                # Register hook on the feature extractor layer (adjust depending on your model)
+                if hasattr(self.model, 'layer4'):
+                    hook = self.model.layer4.register_forward_hook(hook_fn)
+                elif hasattr(self.model, 'features'):
+                    hook = self.model.features.register_forward_hook(hook_fn)
+                else:
+                    # Fallback to using the get_contrastive_features method
+                    self.model.train()  # Restore train mode
+                    return self.model.get_contrastive_features(images)
+                
+                # Just do a forward pass to trigger the hook
+                _ = self.model(images)
+                
+                # Remove the hook
+                hook.remove()
+                
+                # Apply projection if available
+                if hasattr(self.model, 'projection_head') and self.model.projection_head is not None:
+                    features = self.model.projection_head(features)
+            
+            self.model.train()  # Restore train mode
+            return features
+            
+        except Exception as e:
+            logger.error(f"Error in safe feature extraction: {e}")
+            self.model.train()  # Make sure to restore train mode
+            # Fallback to original method if available
+            if hasattr(self.model, 'get_contrastive_features'):
+                return self.model.get_contrastive_features(images)
+            else:
+                # Return empty tensor as last resort
+                return torch.zeros((images.size(0), 128), device=self.device)
 

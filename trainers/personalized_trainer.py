@@ -133,35 +133,46 @@ class PersonalizedTrainer(BaseTrainer):
         
         return self.model, metrics
     
-    def evaluate(self, round_idx):
-        """Evaluate both global and personalized models"""
-        logger.info(f"Evaluating models at round {round_idx+1}")
+    def evaluate(self, round_idx=None, eval_model=None):
+        """Evaluate model on test data"""
+        if eval_model is None:
+            eval_model = self.model.to(self.device)
+            
+        # Create a criterion for loss calculation
+        criterion = torch.nn.CrossEntropyLoss()
         
-        eval_model = copy.deepcopy(self.model)
-        eval_model.eval()
-        eval_model.to(self.device)
-        
+        # Evaluate global model by default
         if hasattr(eval_model, 'disable_personalized_mode'):
             eval_model.disable_personalized_mode()
-        metrics = evaluate(self.args, eval_model, self.testloader, self.device)
         
-        if hasattr(self.server, 'trust_scores') and len(self.server.trust_scores) > 0:
-            trust_stats = track_trust_scores(self)
-            metrics.update({"trust_stats": trust_stats})
+        # Evaluate model and get metrics
+        metrics = evaluate(self.args, eval_model, self.testloader, self.device, criterion)
         
+        # Store best accuracy so far
+        current_acc = metrics.get('acc', 0.0)
+        if current_acc > self.best_acc:
+            self.best_acc = current_acc
+            logger.info(f"New best accuracy: {self.best_acc:.4f}")
+            if round_idx is not None:
+                self.save_model(suffix=f"best_model_round_{round_idx}")
+        
+        # Track metrics
+        self.round_accs.append(current_acc)
+        
+        # Evaluate personalization benefits if enabled
         if self.enable_personalization:
             try:
                 if hasattr(eval_model, 'enable_personalized_mode'):
                     eval_model.enable_personalized_mode()
                 
                 personalization_metrics = evaluate_personalization_benefits(
-                    self.args, eval_model, self.testloader, self.device
+                    self.args, eval_model, self.testloader, self.device, criterion=criterion
                 )
                 metrics.update({"personalization": personalization_metrics})
-                
+                    
                 if 'acc_personalized' in personalization_metrics:
                     metrics['acc_personalized'] = personalization_metrics['acc_personalized']
-                
+                    
                 if 'bop' in personalization_metrics:
                     logger.info(f"Benefit of Personalization: {personalization_metrics['bop']:.4f}")
                     
@@ -173,6 +184,17 @@ class PersonalizedTrainer(BaseTrainer):
                                       personalization_metrics.get('personalized_acc', global_acc))
                     
                     logger.info(f"Global Acc: {global_acc:.4f}, Personalized Acc: {personalized_acc:.4f}")
+                    
+                    # Store best personalized accuracy
+                    if personalized_acc > self.best_personalized_acc:
+                        self.best_personalized_acc = personalized_acc
+                        logger.info(f"New best personalized accuracy: {self.best_personalized_acc:.4f}")
+                        if round_idx is not None:
+                            self.save_model(suffix=f"best_personalized_model_round_{round_idx}")
+                            
+                    # Track personalized metrics
+                    self.round_personalized_accs.append(personalized_acc)
+                    self.personalization_metrics = personalization_metrics
             except Exception as e:
                 logger.error(f"Error in personalization evaluation: {str(e)}")
                 logger.error(f"Personalization metrics keys: {list(personalization_metrics.keys()) if 'personalization_metrics' in locals() else 'N/A'}")
@@ -447,7 +469,8 @@ class PersonalizedTrainer(BaseTrainer):
                 updated_model, client_metrics = self.clients[client_idx].local_train(self.current_round)
                 
                 training_time = time.time() - start_time
-                client_metrics['training_time'] = training_time
+                if client_metrics is not None:
+                    client_metrics['training_time'] = training_time
                 
                 if updated_model is not None:
                     updated_models[client_idx] = updated_model
@@ -465,6 +488,10 @@ class PersonalizedTrainer(BaseTrainer):
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     
+        # Check if any models were updated
+        if not updated_models:
+            logger.warning("No updated models received from clients")
+            
         return updated_models, client_stats
 
     def _update_global_model(self, selected_clients, updated_models, client_stats):

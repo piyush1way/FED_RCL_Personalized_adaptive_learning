@@ -1,5 +1,3 @@
-
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -113,7 +111,16 @@ class ResNet(nn.Module):
             layers.append(nn.Linear(self.feature_dim, self.num_classes))
             self.personalized_head = nn.Sequential(*layers)
         
-        self._initialize_head(self.personalized_head)
+        # Initialize with slightly different weights than global head for better specialization
+        if isinstance(self.personalized_head, nn.Linear):
+            nn.init.normal_(self.personalized_head.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.personalized_head.bias)
+        elif isinstance(self.personalized_head, nn.Sequential):
+            for m in self.personalized_head.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
     def _create_projection_head(self):
         return nn.Sequential(
@@ -150,17 +157,6 @@ class ResNet(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def _initialize_head(self, head):
-        if isinstance(head, nn.Linear):
-            nn.init.normal_(head.weight, mean=0.0, std=0.01)
-            nn.init.zeros_(head.bias)
-        elif isinstance(head, nn.Sequential):
-            for m in head.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.normal_(m.weight, mean=0.0, std=0.01)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
-
     def forward(self, x: torch.Tensor, return_feature: bool = False, get_projection: bool = False, 
                 get_multi_level: bool = False) -> Dict[str, torch.Tensor]:
         results = {}
@@ -184,14 +180,21 @@ class ResNet(nn.Module):
             projection_features = F.normalize(projection_features, p=2, dim=1)
         
         if get_multi_level:
-            results['multi_level_projections'] = {
-                layer_name: F.normalize(self.multi_level_projections[layer_name](results[layer_name]), p=2, dim=1)
-                for layer_name in ['layer1', 'layer2', 'layer3']
-            }
+            multi_level_projections = {}
+            for layer_name in ['layer1', 'layer2', 'layer3']:
+                if layer_name in results:
+                    proj = self.multi_level_projections[layer_name](results[layer_name])
+                    multi_level_projections[layer_name] = F.normalize(proj, p=2, dim=1)
+            results['multi_level_projections'] = multi_level_projections
         
-        # Apply personalized features with normalized features for more stable learning
+        # Global logits from original features
         global_logit = self.fc(features)
+        
+        # Personalized logits from normalized features for more stable learning
+        # This helps prevent overfitting and convergence issues
         personalized_logit = self.personalized_head(features_normalized)
+        
+        # Use personalized head if enabled, otherwise use global head
         default_logit = personalized_logit if self.use_personalized_head else global_logit
         
         results.update({
@@ -213,39 +216,73 @@ class ResNet(nn.Module):
         return results
 
     def freeze_backbone(self):
+        """Freeze backbone layers for personalization"""
         for name, param in self.named_parameters():
-            if not any(x in name for x in ['fc', 'personalized_head', 'projection_head', 'temperature']):
+            if 'fc' not in name and 'personalized_head' not in name and 'projection_head' not in name and 'temperature' not in name:
                 param.requires_grad = False
+            else:
+                param.requires_grad = True
         logger.info('Froze backbone parameters (except fc, personalized_head, projection_head, and temperature)')
 
     def unfreeze_backbone(self):
+        """Unfreeze all parameters for full training"""
         for param in self.parameters():
             param.requires_grad = True
         logger.info('Unfroze all parameters')
     
     def enable_personalized_mode(self):
+        """Enable personalized mode to use the personalized head"""
         self.use_personalized_head = True
+        logger.info('Enabled personalized mode')
         
     def disable_personalized_mode(self):
+        """Disable personalized mode to use the global head"""
         self.use_personalized_head = False
+        logger.info('Disabled personalized mode')
         
     def get_global_params(self):
-        return {name: param.data.clone() for name, param in self.named_parameters() if 'personalized_head' not in name}
+        """Get only the global model parameters (excluding personalized head)"""
+        return {k: v.cpu() for k, v in self.state_dict().items() if 'personalized_head' not in k}
     
     def get_local_params(self):
         return {name: param.data.clone() for name, param in self.named_parameters() if 'personalized_head' in name}
     
     def setup_adaptive_freezing(self, freeze_ratio=0.5):
-        all_layers = ['conv1', 'bn1', 'layer1', 'layer2', 'layer3', 'layer4']
-        num_to_freeze = int(len(all_layers) * freeze_ratio)
-        self.frozen_layers = all_layers[:num_to_freeze]
-        self.freeze_layers(self.frozen_layers)
-        logger.info(f"Adaptively freezing layers: {self.frozen_layers}")
+        """Selectively freeze layers based on the freeze ratio"""
+        if freeze_ratio <= 0:
+            self.unfreeze_backbone()
+            return
         
-    def freeze_layers(self, layer_names):
+        if freeze_ratio >= 1.0:
+            self.freeze_backbone()
+            return
+        
+        # Define layers in order of freezing priority
+        freezable_layers = [
+            'conv1', 'bn1', 
+            'layer1.0', 'layer1.1',
+            'layer2.0', 'layer2.1',
+            'layer3.0', 'layer3.1', 
+            'layer4.0'
+        ]
+        
+        # Calculate how many layers to freeze
+        num_to_freeze = int(len(freezable_layers) * freeze_ratio)
+        to_freeze = freezable_layers[:num_to_freeze]
+        
+        # Unfreeze all parameters first
+        self.unfreeze_backbone()
+        
+        # Then freeze selected parameters
+        frozen_layers = []
         for name, param in self.named_parameters():
-            param.requires_grad = not any(layer in name for layer in layer_names)
-    
+            if any(layer in name for layer in to_freeze):
+                param.requires_grad = False
+                if name.split('.')[0] not in frozen_layers:
+                    frozen_layers.append(name.split('.')[0])
+        
+        logger.info(f"Adaptively freezing layers: {frozen_layers}")
+        
     def get_contrastive_features(self, x):
         out = self.layer4(self.layer3(self.layer2(self.layer1(F.relu(self.bn1(self.conv1(x)))))))
         features = F.adaptive_avg_pool2d(out, 1).view(out.size(0), -1)

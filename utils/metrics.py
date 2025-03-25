@@ -6,14 +6,14 @@ import json
 import logging
 import matplotlib.pyplot as plt
 from collections import defaultdict
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, balanced_accuracy_score
 from scipy import stats
 
 logger = logging.getLogger(__name__)
 
 __all__ = ['evaluate', 'track_trust_scores', 'evaluate_personalized_clients', 'evaluate_personalization_benefits']
 
-def evaluate(args, model, testloader, device) -> dict:
+def evaluate(args, model, testloader, device, criterion=None) -> dict:
     """
     Evaluate both global and personalized models on the test set.
     
@@ -22,6 +22,7 @@ def evaluate(args, model, testloader, device) -> dict:
         model: The model to evaluate
         testloader: DataLoader for test data
         device: Device to run evaluation on
+        criterion: Loss function for calculating loss
         
     Returns:
         dict: Evaluation metrics including accuracy and class-wise performance
@@ -50,6 +51,8 @@ def evaluate(args, model, testloader, device) -> dict:
     all_labels = []
     all_global_preds = []
     all_personalized_preds = []
+
+    test_loss = 0
 
     with torch.no_grad():
         for images, labels in testloader:
@@ -125,6 +128,11 @@ def evaluate(args, model, testloader, device) -> dict:
                 class_correct_global[label_val] += ((predicted_global == labels) & label_idx).sum().item()
                 class_correct_personalized[label_val] += ((predicted_personalized == labels) & label_idx).sum().item()
 
+            # Calculate loss if criterion is provided
+            if criterion is not None:
+                loss = criterion(global_logits, labels)
+                test_loss += loss.item()
+
     # Calculate overall accuracy
     acc_global = 100 * correct_global / float(total) if total > 0 else 0
     acc_personalized = 100 * correct_personalized / float(total) if total > 0 else 0
@@ -143,8 +151,11 @@ def evaluate(args, model, testloader, device) -> dict:
     avg_confidence_global = float(sum(confidence_global) / len(confidence_global)) if confidence_global else 0
     avg_confidence_personalized = float(sum(confidence_personalized) / len(confidence_personalized)) if confidence_personalized else 0
 
-    logger.info(f'Global Model Accuracy: {acc_global:.2f}% | Personalized Model Accuracy: {acc_personalized:.2f}%')
-    logger.info(f'Global Model Balanced Accuracy: {balanced_acc_global:.2f}% | Personalized Model Balanced Accuracy: {balanced_acc_personalized:.2f}%')
+    # Calculate loss
+    avg_loss = test_loss / len(testloader) if criterion is not None else 0
+
+    logger.info(f'Global Model Accuracy: {acc_global:.2f}%{" | Loss: " + str(avg_loss):.4f if criterion is not None else ""}')
+    logger.info(f'Global Model Balanced Accuracy: {balanced_acc_global:.2f}%')
 
     # Clean up
     eval_model.to('cpu')
@@ -163,7 +174,8 @@ def evaluate(args, model, testloader, device) -> dict:
             "labels": all_labels,
             "global_preds": all_global_preds,
             "personalized_preds": all_personalized_preds
-        }
+        },
+        "loss": avg_loss if criterion is not None else 0
     }
 
 
@@ -320,7 +332,7 @@ def track_trust_scores(trainer, num_clients=None):
     return stats
 
 
-def evaluate_personalization_benefits(args, model, testloader, device, max_samples=1000):
+def evaluate_personalization_benefits(args, model, testloader, device, max_samples=1000, criterion=None):
     """Evaluate benefits of personalization compared to global model"""
     if not hasattr(model, 'personalized_head') and not hasattr(model, 'use_personalized_head'):
         return {"bop": 0.0, "class_bop": {}}
@@ -353,6 +365,10 @@ def evaluate_personalization_benefits(args, model, testloader, device, max_sampl
     correct_global = 0
     correct_personalized = 0
     total = 0
+    
+    # For loss calculation
+    global_loss = 0
+    personalized_loss = 0
     
     # Track per-class performance
     class_correct_global = defaultdict(int)
@@ -398,6 +414,11 @@ def evaluate_personalization_benefits(args, model, testloader, device, max_sampl
                 correct_global += global_correct.sum().item()
                 correct_personalized += personalized_correct.sum().item()
                 
+                # Calculate loss if criterion is provided
+                if criterion is not None:
+                    global_loss += criterion(global_logits, batch_labels).item()
+                    personalized_loss += criterion(personalized_logits, batch_labels).item()
+                
                 # Track per-class accuracy
                 for i, label in enumerate(batch_labels):
                     label_item = label.item()
@@ -415,6 +436,10 @@ def evaluate_personalization_benefits(args, model, testloader, device, max_sampl
     personalized_acc = 100 * correct_personalized / total if total > 0 else 0
     benefit_of_personalization = personalized_acc - global_acc
     
+    # Calculate loss
+    avg_global_loss = global_loss / (len(testloader) if len(testloader) > 0 else 1)
+    avg_personalized_loss = personalized_loss / (len(testloader) if len(testloader) > 0 else 1)
+    
     # Calculate per-class benefits
     class_bop = {}
     min_class_bop = 0
@@ -426,7 +451,10 @@ def evaluate_personalization_benefits(args, model, testloader, device, max_sampl
             class_bop[class_idx] = personalized_class_acc - global_class_acc
             min_class_bop = min(min_class_bop, class_bop[class_idx])
     
+    # Print accuracy, loss and benefit of personalization
     logger.info(f"Global Model Accuracy: {global_acc:.4f}%, Personalized Model Accuracy: {personalized_acc:.4f}%")
+    if criterion is not None:
+        logger.info(f"Global Loss: {avg_global_loss:.4f}, Personalized Loss: {avg_personalized_loss:.4f}")
     logger.info(f"Min Class BoP: {min_class_bop:.4f} (worst performing class)")
     
     # Clean up to free memory
@@ -440,5 +468,7 @@ def evaluate_personalization_benefits(args, model, testloader, device, max_sampl
         "personalized_acc": personalized_acc,
         "acc_personalized": personalized_acc,  # Add alias for backward compatibility
         "class_bop": class_bop,
-        "min_class_bop": min_class_bop
+        "min_class_bop": min_class_bop,
+        "global_loss": avg_global_loss if criterion is not None else 0,
+        "personalized_loss": avg_personalized_loss if criterion is not None else 0
     }

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from models import build_encoder
 from servers.build import SERVER_REGISTRY
 from utils.logging_utils import AverageMeter
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
@@ -50,16 +51,33 @@ class Server:
         self.global_model_state_dict = None
 
     def setup(self, model):
-        """Initialize server with a model"""
-        self.model = model
-        self.global_model = copy.deepcopy(model)
+        """Initialize server with model and hyperparameters"""
+        # Move model to CPU for safe deepcopy operation
+        model_device = next(model.parameters()).device
+        cpu_model = model.to('cpu')
         
-        # Ensure both models are on the same device
-        device = next(model.parameters()).device
-        self.global_model = self.global_model.to(device)
+        # Use safer copy method to avoid OOM
+        try:
+            self.global_model = copy.deepcopy(cpu_model)
+        except Exception as e:
+            logger.error(f"Error during model copy: {str(e)}")
+            # Fallback method - create new model and load state dict
+            if hasattr(cpu_model, '__class__'):
+                model_class = cpu_model.__class__
+                self.global_model = model_class(**getattr(cpu_model, 'init_args', {}))
+                self.global_model.load_state_dict(cpu_model.state_dict())
+            else:
+                raise e
         
-        # Copy state dict after ensuring device match
-        self.global_model_state_dict = copy.deepcopy(self.global_model.state_dict())
+        # Move models back to original device
+        model.to(model_device)
+        self.global_model.to(model_device)
+        
+        # Initialize metrics and tracking
+        self.client_trust_scores = {}
+        self.client_histories = defaultdict(list)
+        self.client_contributions = defaultdict(float)
+        self.central_momentum_buffer = {}
         
         # Initialize personalized head if enabled
         if self.enable_personalization and hasattr(model, 'enable_personalized_mode'):
@@ -90,223 +108,122 @@ class Server:
             # Random selection
             return np.random.choice(clients, num_clients, replace=False).tolist()
 
-    def aggregate(self, client_models, client_weights=None, client_stats=None):
-        """Aggregate client models using trust-based weighted averaging"""
-        # Handle empty client models case
-        if not client_models:
-            logger.warning("No client models to aggregate")
+    def aggregate(self, local_weights, client_ids, trust_scores=None, device='cpu'):
+        """
+        Aggregate local client models with trust-based weighting
+        Args:
+            local_weights: list of client model state dictionaries
+            client_ids: list of client IDs corresponding to the weights
+            trust_scores: dict mapping client IDs to their trust scores
+            device: device to perform aggregation on (default: cpu to save GPU memory)
+        Returns:
+            aggregated model parameters
+        """
+        if not local_weights:
+            logger.warning("No client weights to aggregate")
             return self.global_model.state_dict()
-            
-        self.round_num += 1
+        
+        if trust_scores is None:
+            trust_scores = {client_id: 1.0 for client_id in client_ids}
+        
+        # Calculate trust score sum for normalization
+        trust_sum = sum(trust_scores.get(client_id, 1.0) for client_id in client_ids)
+        if trust_sum == 0:
+            logger.warning("Sum of trust scores is 0, using uniform weighting")
+            trust_scores = {client_id: 1.0 for client_id in client_ids}
+            trust_sum = len(client_ids)
+        
+        # Get keys from the first client's model
+        keys = list(local_weights[0].keys())
+        
+        # Create a CPU copy of the global model state dict as template
+        global_state = {k: v.clone().detach().to('cpu') for k, v in self.global_model.state_dict().items()}
+        
+        # Perform aggregation on CPU to avoid OOM
+        for param_key in keys:
+            try:
+                # First move all tensors to CPU and perform weighted sum
+                weighted_sum = sum(
+                    local_weights[i][param_key].to('cpu') * trust_scores.get(client_ids[i], 1.0) / trust_sum
+                    for i in range(len(local_weights))
+                )
+                global_state[param_key] = weighted_sum
+            except Exception as e:
+                logger.error(f"Error aggregating parameter {param_key}: {str(e)}")
+                # Keep global model's parameter if aggregation fails
+                global_state[param_key] = self.global_model.state_dict()[param_key].clone().detach().to('cpu')
+        
+        # Apply global momentum if enabled
+        if hasattr(self, 'global_momentum') and self.global_momentum > 0:
+            self._apply_global_momentum(global_state, device='cpu')
+        
+        return global_state
+
+    def update_global_model(self, client_models, client_weights=None, client_stats=None):
+        """Update global model with aggregated client models"""
+        self.round_num = getattr(self, 'round_num', 0) + 1
+        
+        # Convert client models dictionary to lists for the new aggregate method
+        client_ids = list(client_models.keys())
+        local_weights = [client_models[client_id] for client_id in client_ids]
+        
+        # Prepare trust scores if client_stats is available
+        trust_scores = {}
+        if client_stats:
+            for client_id, stats in client_stats.items():
+                if client_id in client_models:
+                    trust_scores[client_id] = float(stats.get('trust_score', 0.5))
         
         # Determine device to use
         device = next(self.global_model.parameters()).device
         
         # Apply trust-based filtering if enabled
         if self.enable_trust_filtering and client_stats:
-            trusted_clients = {}
-            trusted_weights = {}
-            trusted_stats = {}
-            
-            # Calculate average trust score for reference
-            all_trust_scores = [float(stats.get('trust_score', 0.5)) for client_id, stats in client_stats.items() 
-                               if client_id in client_models]
-            avg_trust_score = sum(all_trust_scores) / len(all_trust_scores) if all_trust_scores else 0.5
-            
-            for client_id, stats in client_stats.items():
-                if client_id in client_models:
-                    trust_score = float(stats.get('trust_score', 0.5))
-                    self.trust_scores[client_id] = trust_score
-                    
-                    # Track client trust history
-                    if client_id not in self.client_history:
-                        self.client_history[client_id] = []
-                    self.client_history[client_id].append(trust_score)
-                    if len(self.client_history[client_id]) > 10:
-                        self.client_history[client_id].pop(0)
-                    
-                    # Dynamic trust threshold based on average score
-                    dynamic_threshold = max(0.3, min(0.7, avg_trust_score * 0.8))
-                    
-                    # Apply soft or hard filtering based on configuration
-                    if self.soft_filtering:
-                        # Soft filtering: use client with adjusted weight based on trust
-                        trusted_clients[client_id] = client_models[client_id]
-                        
-                        if client_weights:
-                            base_weight = float(client_weights.get(client_id, 1.0))
-                            # Sigmoid function to make weights more representative of trust differences
-                            # This creates more separation between high and low trust clients
-                            trust_factor = 1.0 / (1.0 + np.exp(-10 * (trust_score - dynamic_threshold)))
-                            adjusted_weight = base_weight * max(0.2, trust_factor)
-                            trusted_weights[client_id] = adjusted_weight
-                            
-                            # Log significant weight adjustments
-                            if trust_factor < 0.5:
-                                logger.info(f"Client {client_id} weight reduced to {trust_factor:.2f} (trust={trust_score:.3f}, threshold={dynamic_threshold:.3f})")
-                        
-                        trusted_stats[client_id] = stats
-                    else:
-                        # Hard filtering: only include clients above threshold
-                        if trust_score >= self.trust_threshold:
-                            trusted_clients[client_id] = client_models[client_id]
-                            if client_weights:
-                                trusted_weights[client_id] = float(client_weights.get(client_id, 1.0))
-                            trusted_stats[client_id] = stats
-                            logger.info(f"Client {client_id} trusted with score {trust_score:.4f}")
-                        else:
-                            logger.info(f"Client {client_id} filtered out with score {trust_score:.4f}")
-            
             # Log trust distribution statistics
-            if all_trust_scores:
-                logger.info(f"Trust scores - Avg: {avg_trust_score:.3f}, Min: {min(all_trust_scores):.3f}, Max: {max(all_trust_scores):.3f}")
+            if trust_scores:
+                avg_trust_score = sum(trust_scores.values()) / len(trust_scores) if trust_scores else 0.5
+                min_trust = min(trust_scores.values()) if trust_scores else 0.0
+                max_trust = max(trust_scores.values()) if trust_scores else 0.0
+                logger.info(f"Trust scores - Avg: {avg_trust_score:.3f}, Min: {min_trust:.3f}, Max: {max_trust:.3f}")
             
-            # Ensure minimum number of clients for aggregation
-            if len(trusted_clients) < self.min_trusted_clients:
-                # Sort clients by trust score and take top N
-                sorted_clients = sorted(
-                    [(cid, self.trust_scores.get(cid, 0.0)) for cid in client_models.keys()],
-                    key=lambda x: x[1],
-                    reverse=True
-                )
-                
-                # Use at least min_trusted_clients
-                for cid, score in sorted_clients[:self.min_trusted_clients]:
-                    if cid not in trusted_clients and cid in client_models:
-                        trusted_clients[cid] = client_models[cid]
-                        if client_weights:
-                            # Apply minimum weight for low-trust but needed clients
-                            trusted_weights[cid] = client_weights.get(cid, 1.0) * max(0.2, score)
-                        if cid in client_stats:
-                            trusted_stats[cid] = client_stats[cid]
-                
-                logger.warning(f"Only {len(trusted_clients)-self.min_trusted_clients} trusted clients (min: {self.min_trusted_clients}). Added additional clients.")
-            
-            # Log participation statistics
-            participation_rate = len(trusted_clients) / len(client_models) if client_models else 0
-            logger.info(f"Client participation: {len(trusted_clients)}/{len(client_models)} ({participation_rate:.2%})")
-            
-            client_models = trusted_clients
-            if client_weights:
-                client_weights = trusted_weights
-            client_stats = trusted_stats
+            # Track client trust history
+            for client_id, score in trust_scores.items():
+                if not hasattr(self, 'client_history'):
+                    self.client_history = {}
+                if client_id not in self.client_history:
+                    self.client_history[client_id] = []
+                self.client_history[client_id].append(score)
+                if len(self.client_history[client_id]) > 10:
+                    self.client_history[client_id].pop(0)
         
-        # Return current model if no models to aggregate
-        if not client_models:
-            logger.warning("No trusted clients after filtering. Using current global model.")
-            return self.global_model.state_dict()
+        # Perform aggregation on CPU to avoid OOM errors
+        aggregated_params = self.aggregate(
+            local_weights=local_weights,
+            client_ids=client_ids,
+            trust_scores=trust_scores,
+            device='cpu'  # Force CPU aggregation to save GPU memory
+        )
         
-        # Normalize client weights
-        if client_weights:
-            weight_sum = sum(client_weights.values())
-            if weight_sum > 0:
-                client_weights = {k: v / weight_sum for k, v in client_weights.items()}
-            else:
-                # Equal weights if sum is zero
-                client_weights = {k: 1.0 / len(client_models) for k in client_models.keys()}
-        else:
-            # Default to equal weights
-            client_weights = {k: 1.0 / len(client_models) for k in client_models.keys()}
-        
-        # Weighted averaging of model parameters
-        avg_state_dict = {}
-        reference_state_dict = next(iter(client_models.values()))
-        
-        # Initialize average state dict with zeros
-        for key in reference_state_dict.keys():
-            # Skip personalized head parameters if personalization is enabled
-            if self.enable_personalization and 'personalized_head' in key:
-                continue
-                
-            # Get tensor from reference and ensure it's on the correct device
-            tensor = reference_state_dict[key].to(device)
-            # Ensure tensor is float for aggregation
-            if tensor.dtype == torch.int64 or tensor.dtype == torch.long:
-                tensor = tensor.float()
-            avg_state_dict[key] = torch.zeros_like(tensor)
-        
-        # Add up weighted parameters
-        for client_id, state_dict in client_models.items():
-            weight = float(client_weights.get(client_id, 1.0 / len(client_models)))
-            
-            for key in avg_state_dict.keys():
-                if key in state_dict:
-                    # Move client parameter to the correct device and apply weight
-                    tensor = state_dict[key].to(device)
-                    # Ensure tensor is float for aggregation
-                    if tensor.dtype == torch.int64 or tensor.dtype == torch.long:
-                        tensor = tensor.float()
-                    avg_state_dict[key] += weight * tensor
-                else:
-                    logger.warning(f"Key {key} missing from client {client_id}")
-        
-        # Apply model averaging stabilization for BatchNorm layers
-        for key in avg_state_dict.keys():
-            # Special handling for batch norm running statistics
-            if 'running_mean' in key or 'running_var' in key or 'num_batches_tracked' in key:
-                # Use exponential moving average for running statistics
-                current_value = self.global_model_state_dict.get(key, None)
-                if current_value is not None:
-                    decay = min(0.9, 1.0 - 1.0 / (self.round_num + 1))
-                    current_value = current_value.to(device)
-                    avg_state_dict[key] = decay * current_value + (1 - decay) * avg_state_dict[key]
+        # Move aggregated params to the correct device and update global model
+        try:
+            for key in aggregated_params:
+                aggregated_params[key] = aggregated_params[key].to(device)
+            self.global_model.load_state_dict(aggregated_params, strict=False)
+        except Exception as e:
+            logger.error(f"Error loading aggregated parameters: {str(e)}")
+            # Fallback: keep current global model if there's an error
         
         # Update round statistics
         self.round_stats = {
             'num_clients': len(client_models),
-            'trust_scores': {k: v for k, v in self.trust_scores.items() if k in client_models},
+            'trust_scores': trust_scores,
             'client_stats': client_stats,
-            'client_history': self.client_history,
+            'client_history': getattr(self, 'client_history', {}),
             'round': self.round_num
         }
         
-        # Update global model state dict
-        self.global_model_state_dict = avg_state_dict
-        self.global_model.load_state_dict(avg_state_dict, strict=False)
-        
-        return avg_state_dict
+        return aggregated_params
 
-    def update_global_model(self, client_models, client_weights=None, client_stats=None):
-        """Update the global model using aggregated client models"""
-        if not client_models:
-            logger.warning("No client models received. Global model unchanged.")
-            return self.global_model.state_dict()
-            
-        local_weights = {}
-        local_deltas = {}
-        client_ids = list(client_models.keys())
-        
-        for i, client_id in enumerate(client_ids):
-            local_weights[i] = client_models[client_id]
-            local_deltas[i] = {}
-            
-        model_dict = self.global_model.state_dict()
-        
-        # Get current learning rate for clients
-        current_lr = getattr(self.args.trainer, 'local_lr', 0.01)
-        
-        # If adaptive learning rate is enabled, calculate new rates based on trust scores
-        if self.enable_adaptive_lr and client_stats:
-            trust_avg = np.mean([stats.get('trust_score', 1.0) for stats in client_stats.values()])
-            adjusted_lr = self.base_lr + (self.max_lr - self.base_lr) * trust_avg
-            logger.info(f"Adjusted global learning rate to {adjusted_lr:.6f} based on average trust {trust_avg:.4f}")
-            # Store for next round
-            self.args.trainer.local_lr = adjusted_lr
-        
-        # Perform aggregation
-        aggregated_params = self.aggregate(client_models, client_weights, client_stats)
-        
-        # Apply aggregated parameters to global model
-        global_state_dict = self.global_model.state_dict()
-        for key in global_state_dict.keys():
-            if key in aggregated_params:
-                global_state_dict[key] = aggregated_params[key]
-        
-        self.global_model.load_state_dict(global_state_dict, strict=False)
-        self.global_model_state_dict = global_state_dict
-        
-        return global_state_dict
-        
     def get_global_model(self):
         """Return the current global model"""
         return self.global_model

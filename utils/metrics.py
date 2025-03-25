@@ -436,7 +436,9 @@ def evaluate_personalization_benefits(args, model, testloader, device, max_sampl
     return {
         "bop": benefit_of_personalization,
         "global_acc": global_acc,
+        "acc_global": global_acc,  # Add alias for backward compatibility
         "personalized_acc": personalized_acc,
+        "acc_personalized": personalized_acc,  # Add alias for backward compatibility
         "class_bop": class_bop,
         "min_class_bop": min_class_bop
     }

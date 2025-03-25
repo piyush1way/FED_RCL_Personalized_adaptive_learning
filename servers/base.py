@@ -109,13 +109,13 @@ class Server:
             trusted_stats = {}
             
             # Calculate average trust score for reference
-            all_trust_scores = [stats.get('trust_score', 0.5) for client_id, stats in client_stats.items() 
+            all_trust_scores = [float(stats.get('trust_score', 0.5)) for client_id, stats in client_stats.items() 
                                if client_id in client_models]
             avg_trust_score = sum(all_trust_scores) / len(all_trust_scores) if all_trust_scores else 0.5
             
             for client_id, stats in client_stats.items():
                 if client_id in client_models:
-                    trust_score = stats.get('trust_score', 0.5)
+                    trust_score = float(stats.get('trust_score', 0.5))
                     self.trust_scores[client_id] = trust_score
                     
                     # Track client trust history
@@ -134,7 +134,7 @@ class Server:
                         trusted_clients[client_id] = client_models[client_id]
                         
                         if client_weights:
-                            base_weight = client_weights.get(client_id, 1.0)
+                            base_weight = float(client_weights.get(client_id, 1.0))
                             # Sigmoid function to make weights more representative of trust differences
                             # This creates more separation between high and low trust clients
                             trust_factor = 1.0 / (1.0 + np.exp(-10 * (trust_score - dynamic_threshold)))
@@ -151,7 +151,7 @@ class Server:
                         if trust_score >= self.trust_threshold:
                             trusted_clients[client_id] = client_models[client_id]
                             if client_weights:
-                                trusted_weights[client_id] = client_weights.get(client_id, 1.0)
+                                trusted_weights[client_id] = float(client_weights.get(client_id, 1.0))
                             trusted_stats[client_id] = stats
                             logger.info(f"Client {client_id} trusted with score {trust_score:.4f}")
                         else:
@@ -220,16 +220,22 @@ class Server:
                 
             # Get tensor from reference and ensure it's on the correct device
             tensor = reference_state_dict[key].to(device)
+            # Ensure tensor is float for aggregation
+            if tensor.dtype == torch.int64 or tensor.dtype == torch.long:
+                tensor = tensor.float()
             avg_state_dict[key] = torch.zeros_like(tensor)
         
         # Add up weighted parameters
         for client_id, state_dict in client_models.items():
-            weight = client_weights.get(client_id, 1.0 / len(client_models))
+            weight = float(client_weights.get(client_id, 1.0 / len(client_models)))
             
             for key in avg_state_dict.keys():
                 if key in state_dict:
                     # Move client parameter to the correct device and apply weight
                     tensor = state_dict[key].to(device)
+                    # Ensure tensor is float for aggregation
+                    if tensor.dtype == torch.int64 or tensor.dtype == torch.long:
+                        tensor = tensor.float()
                     avg_state_dict[key] += weight * tensor
                 else:
                     logger.warning(f"Key {key} missing from client {client_id}")

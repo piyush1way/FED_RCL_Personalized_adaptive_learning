@@ -8,6 +8,7 @@ from models import build_encoder
 from servers.build import SERVER_REGISTRY
 from utils.logging_utils import AverageMeter
 from collections import defaultdict
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +179,7 @@ class Server:
         device = next(self.global_model.parameters()).device
         
         # Apply trust-based filtering if enabled
-        if self.enable_trust_filtering and client_stats:
+        if getattr(self, 'enable_trust_filtering', False) and client_stats:
             # Log trust distribution statistics
             if trust_scores:
                 avg_trust_score = sum(trust_scores.values()) / len(trust_scores) if trust_scores else 0.5
@@ -197,32 +198,43 @@ class Server:
                     self.client_history[client_id].pop(0)
         
         # Perform aggregation on CPU to avoid OOM errors
-        aggregated_params = self.aggregate(
-            local_weights=local_weights,
-            client_ids=client_ids,
-            trust_scores=trust_scores,
-            device='cpu'  # Force CPU aggregation to save GPU memory
-        )
-        
-        # Move aggregated params to the correct device and update global model
         try:
+            aggregated_params = self.aggregate(
+                local_weights=local_weights,
+                client_ids=client_ids,
+                trust_scores=trust_scores,
+                device='cpu'  # Force CPU aggregation to save GPU memory
+            )
+            
+            # Initialize self.global_model_state_dict if it's None
+            if not hasattr(self, 'global_model_state_dict') or self.global_model_state_dict is None:
+                self.global_model_state_dict = self.global_model.state_dict()
+            
+            # Move aggregated params to the correct device and update global model
             for key in aggregated_params:
                 aggregated_params[key] = aggregated_params[key].to(device)
-            self.global_model.load_state_dict(aggregated_params, strict=False)
+                if key in self.global_model_state_dict:
+                    self.global_model_state_dict[key] = aggregated_params[key]
+            
+            # Apply updated parameters to global model
+            self.global_model.load_state_dict(self.global_model_state_dict, strict=False)
+            
+            # Update round statistics
+            self.round_stats = {
+                'num_clients': len(client_models),
+                'trust_scores': trust_scores,
+                'client_stats': client_stats,
+                'client_history': getattr(self, 'client_history', {}),
+                'round': self.round_num
+            }
+            
+            return self.global_model_state_dict
+            
         except Exception as e:
-            logger.error(f"Error loading aggregated parameters: {str(e)}")
-            # Fallback: keep current global model if there's an error
-        
-        # Update round statistics
-        self.round_stats = {
-            'num_clients': len(client_models),
-            'trust_scores': trust_scores,
-            'client_stats': client_stats,
-            'client_history': getattr(self, 'client_history', {}),
-            'round': self.round_num
-        }
-        
-        return aggregated_params
+            logger.error(f"Error during global model update: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Return current global model state as fallback
+            return self.global_model.state_dict()
 
     def get_global_model(self):
         """Return the current global model"""

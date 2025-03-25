@@ -74,6 +74,9 @@ class Server:
         model.to(model_device)
         self.global_model.to(model_device)
         
+        # Initialize global_model_state_dict
+        self.global_model_state_dict = copy.deepcopy(self.global_model.state_dict())
+        
         # Initialize metrics and tracking
         self.client_trust_scores = {}
         self.client_histories = defaultdict(list)
@@ -164,6 +167,15 @@ class Server:
         """Update global model with aggregated client models"""
         self.round_num = getattr(self, 'round_num', 0) + 1
         
+        # Check if client_models is empty or None
+        if not client_models:
+            logger.warning("No client models received for aggregation")
+            # Ensure we have a valid global_model_state_dict
+            if not hasattr(self, 'global_model_state_dict') or self.global_model_state_dict is None:
+                logger.warning("Initializing global_model_state_dict from global_model")
+                self.global_model_state_dict = copy.deepcopy(self.global_model.state_dict())
+            return self.global_model_state_dict
+        
         # Convert client models dictionary to lists for the new aggregate method
         client_ids = list(client_models.keys())
         local_weights = [client_models[client_id] for client_id in client_ids]
@@ -208,7 +220,8 @@ class Server:
             
             # Initialize self.global_model_state_dict if it's None
             if not hasattr(self, 'global_model_state_dict') or self.global_model_state_dict is None:
-                self.global_model_state_dict = self.global_model.state_dict()
+                logger.warning("global_model_state_dict was None, initializing from global_model")
+                self.global_model_state_dict = copy.deepcopy(self.global_model.state_dict())
             
             # Move aggregated params to the correct device and update global model
             for key in aggregated_params:
@@ -233,8 +246,12 @@ class Server:
         except Exception as e:
             logger.error(f"Error during global model update: {str(e)}")
             logger.error(traceback.format_exc())
+            # Initialize global_model_state_dict if it's None
+            if not hasattr(self, 'global_model_state_dict') or self.global_model_state_dict is None:
+                logger.warning("Error recovery: initializing global_model_state_dict")
+                self.global_model_state_dict = copy.deepcopy(self.global_model.state_dict())
             # Return current global model state as fallback
-            return self.global_model.state_dict()
+            return self.global_model_state_dict
 
     def get_global_model(self):
         """Return the current global model"""

@@ -152,6 +152,10 @@ def main(args: DictConfig) -> None:
         evaler=evaler
     )
 
+    # Move model to device
+    trainer.device = device
+    trainer.model = trainer.model.to(device)
+
     # Track metrics during training
     training_metrics = {
         "global_acc": [],

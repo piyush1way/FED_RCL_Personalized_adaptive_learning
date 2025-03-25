@@ -10,6 +10,8 @@ from utils.helper import save_dict_to_json, setup_adaptive_learning_rate
 import os
 import time
 from torch.utils.data import DataLoader
+import traceback
+import gc
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +123,6 @@ class PersonalizedTrainer(BaseTrainer):
         
         except Exception as e:
             logger.error(f"Training error: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             raise e
         
@@ -242,7 +243,6 @@ class PersonalizedTrainer(BaseTrainer):
             
         except Exception as e:
             logger.error(f"Failed to save model: {str(e)}")
-            import traceback
             logger.error(traceback.format_exc())
 
     def train_init(self):
@@ -289,7 +289,6 @@ class PersonalizedTrainer(BaseTrainer):
                     # Clear cache and retry with more aggressive memory management
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                        import gc
                         gc.collect()
                     
                     # Create global model directly with minimal memory usage
@@ -413,19 +412,29 @@ class PersonalizedTrainer(BaseTrainer):
                 logger.warning(f"Skipping client {client_idx} due to insufficient data")
                 continue
             
+            # Ensure client model exists
+            if not hasattr(self.clients[client_idx], 'model') or self.clients[client_idx].model is None:
+                logger.info(f"Initializing model for client {client_idx}")
+                self.clients[client_idx].model = copy.deepcopy(self.model)
+                
             # Setup client for training
-            self.clients[client_idx].setup(
-                state_dict=self.global_model.state_dict(),
-                device=self.device,
-                local_dataset=self.trainloaders[client_idx].dataset,
-                global_epoch=self.current_round,
-                local_lr=self.local_lr,
-                local_ep=self.local_epochs,
-                local_bs=self.batch_size,
-                trainer=self,
-                num_workers=self.args.num_workers,
-                pin_memory=self.args.pin_memory
-            )
+            try:
+                self.clients[client_idx].setup(
+                    state_dict=self.global_model.state_dict(),
+                    device=self.device,
+                    local_dataset=self.trainloaders[client_idx].dataset,
+                    global_epoch=self.current_round,
+                    local_lr=self.local_lr,
+                    local_ep=self.local_epochs,
+                    local_bs=self.batch_size,
+                    trainer=self,
+                    num_workers=self.args.num_workers,
+                    pin_memory=self.args.pin_memory
+                )
+            except Exception as e:
+                logger.error(f"Error setting up client {client_idx}: {str(e)}")
+                logger.error(traceback.format_exc())
+                continue
             
             # Check if client is ready for training
             if not hasattr(self.clients[client_idx], 'trainloader') or self.clients[client_idx].trainloader is None:
@@ -433,25 +442,29 @@ class PersonalizedTrainer(BaseTrainer):
                 continue
             
             # Train the client
-            start_time = time.time()
             try:
-                # Train client and get updated model and statistics
+                start_time = time.time()
                 updated_model, client_metrics = self.clients[client_idx].local_train(self.current_round)
                 
-                # Store updated model and statistics
-                updated_models[client_idx] = updated_model
-                client_stats[client_idx] = client_metrics
+                training_time = time.time() - start_time
+                client_metrics['training_time'] = training_time
                 
-                # Track time
-                client_metrics['training_time'] = time.time() - start_time
-                logger.debug(f"Client {client_idx} trained in {client_metrics['training_time']:.2f}s")
-                
+                if updated_model is not None:
+                    updated_models[client_idx] = updated_model
+                if client_metrics is not None:
+                    client_stats[client_idx] = client_metrics
+                    
+                logger.info(f"Client {client_idx} training completed in {training_time:.2f}s. "
+                          f"Trust score: {client_metrics.get('trust_score', 'N/A')}")
+                    
             except Exception as e:
                 logger.error(f"Error training client {client_idx}: {str(e)}")
-                import traceback
                 logger.error(traceback.format_exc())
-                continue
-        
+                
+                # Try to recover by cleaning up
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
         return updated_models, client_stats
 
     def _update_global_model(self, selected_clients, updated_models, client_stats):
@@ -613,5 +626,4 @@ class PersonalizedTrainer(BaseTrainer):
             
         except Exception as e:
             logger.error(f"Failed to save metrics: {str(e)}")
-            import traceback
             logger.error(traceback.format_exc())

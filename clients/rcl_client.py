@@ -966,3 +966,212 @@ class RCLClient(Client):
         # Return updated model and metrics
         return self.model.state_dict(), epoch_metrics
 
+    def _train_epoch(self, optimizer, epoch):
+        """Train for one epoch
+        
+        Args:
+            optimizer: optimizer to use for training
+            epoch: current epoch number
+            
+        Returns:
+            dict: metrics for the epoch
+        """
+        batch_time = AverageMeter('Time', ':6.3f')
+        data_time = AverageMeter('Data', ':6.3f')
+        losses = AverageMeter('Loss', ':.4f')
+        ce_losses = AverageMeter('CE Loss', ':.4f')
+        rcl_losses = AverageMeter('RCL Loss', ':.4f')
+        distill_losses = AverageMeter('Distill Loss', ':.4f')
+        proximal_losses = AverageMeter('Proximal Loss', ':.4f')
+        top1 = AverageMeter('Acc@1', ':6.2f')
+        
+        # Training mode
+        self.model.train()
+        
+        # Initialize metrics
+        end = time.time()
+        metrics = {}
+        
+        # Ensure trainloader exists
+        if not hasattr(self, 'trainloader') or self.trainloader is None:
+            logger.warning(f"Client {self.client_id}: No trainloader available for training")
+            return {
+                'loss': 0.0,
+                'ce_loss': 0.0,
+                'rcl_loss': 0.0,
+                'acc': 0.0
+            }
+        
+        # Training loop
+        for batch_idx, (images, labels) in enumerate(self.trainloader):
+            # Measure data loading time
+            data_time.update(time.time() - end)
+            
+            # Move to device
+            images, labels = images.to(self.device), labels.to(self.device)
+            
+            # Zero gradients
+            optimizer.zero_grad()
+            
+            # Forward pass with amp support
+            if self.use_amp:
+                with autocast():
+                    outputs = self.model(images)
+                    
+                    # Extract logits from outputs
+                    if isinstance(outputs, dict):
+                        logits = outputs.get('logit', outputs.get('global_logit', None))
+                        if logits is None:
+                            for key in ['output', 'pred', 'prediction', 'logits']:
+                                if key in outputs:
+                                    logits = outputs[key]
+                                    break
+                    else:
+                        logits = outputs
+                    
+                    # Classification loss
+                    ce_loss = self.criterion(logits, labels)
+                    
+                    # Relaxed contrastive loss if enabled
+                    if self.enable_contrastive and 'feature_normalized' in outputs:
+                        rcl_loss = self.compute_multi_level_rcl_loss(outputs, labels)
+                    else:
+                        rcl_loss = torch.tensor(0.0).to(self.device)
+                    
+                    # Distillation loss if enabled
+                    if self.enable_distillation and hasattr(self, 'global_model'):
+                        with torch.no_grad():
+                            global_outputs = self.global_model(images)
+                            
+                        if isinstance(global_outputs, dict):
+                            global_logits = global_outputs.get('logit', global_outputs.get('global_logit', None))
+                        else:
+                            global_logits = global_outputs
+                            
+                        # Ensure global logits exist
+                        if global_logits is not None:
+                            distill_loss = self.compute_distillation_loss(logits, global_logits)
+                        else:
+                            distill_loss = torch.tensor(0.0).to(self.device)
+                    else:
+                        distill_loss = torch.tensor(0.0).to(self.device)
+                    
+                    # FedProx loss for regularization
+                    proximal_loss = self.compute_fedprox_term() if self.enable_fedprox else torch.tensor(0.0).to(self.device)
+                    
+                    # EWC loss for continual learning
+                    ewc_loss = self.compute_ewc_loss() if self.ewc_enabled else torch.tensor(0.0).to(self.device)
+                    
+                    # Combine losses with appropriate weights
+                    rcl_weight = 1.0 if self.enable_contrastive else 0.0
+                    distill_weight = self.distillation_weight if self.enable_distillation else 0.0
+                    
+                    # Total loss
+                    loss = ce_loss + rcl_weight * rcl_loss + distill_weight * distill_loss + proximal_loss + ewc_loss
+            else:
+                # Standard forward pass without amp
+                outputs = self.model(images)
+                
+                # Extract logits from outputs
+                if isinstance(outputs, dict):
+                    logits = outputs.get('logit', outputs.get('global_logit', None))
+                    if logits is None:
+                        for key in ['output', 'pred', 'prediction', 'logits']:
+                            if key in outputs:
+                                logits = outputs[key]
+                                break
+                else:
+                    logits = outputs
+                
+                # Classification loss
+                ce_loss = self.criterion(logits, labels)
+                
+                # Relaxed contrastive loss if enabled
+                if self.enable_contrastive and 'feature_normalized' in outputs:
+                    rcl_loss = self.compute_multi_level_rcl_loss(outputs, labels)
+                else:
+                    rcl_loss = torch.tensor(0.0).to(self.device)
+                
+                # Distillation loss if enabled
+                if self.enable_distillation and hasattr(self, 'global_model'):
+                    with torch.no_grad():
+                        global_outputs = self.global_model(images)
+                        
+                    if isinstance(global_outputs, dict):
+                        global_logits = global_outputs.get('logit', global_outputs.get('global_logit', None))
+                    else:
+                        global_logits = global_outputs
+                        
+                    # Ensure global logits exist
+                    if global_logits is not None:
+                        distill_loss = self.compute_distillation_loss(logits, global_logits)
+                    else:
+                        distill_loss = torch.tensor(0.0).to(self.device)
+                else:
+                    distill_loss = torch.tensor(0.0).to(self.device)
+                
+                # FedProx loss for regularization
+                proximal_loss = self.compute_fedprox_term() if self.enable_fedprox else torch.tensor(0.0).to(self.device)
+                
+                # EWC loss for continual learning
+                ewc_loss = self.compute_ewc_loss() if self.ewc_enabled else torch.tensor(0.0).to(self.device)
+                
+                # Combine losses with appropriate weights
+                rcl_weight = 1.0 if self.enable_contrastive else 0.0
+                distill_weight = self.distillation_weight if self.enable_distillation else 0.0
+                
+                # Total loss
+                loss = ce_loss + rcl_weight * rcl_loss + distill_weight * distill_loss + proximal_loss + ewc_loss
+            
+            # Check for NaN loss
+            if torch.isnan(loss):
+                logger.warning(f"Client {self.client_id}: NaN loss detected, skipping batch")
+                continue
+            
+            # Backward pass and optimize with amp support
+            if self.use_amp:
+                scaler = GradScaler()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+            
+            # Calculate accuracy
+            _, predicted = logits.max(1)
+            correct = predicted.eq(labels).sum().item()
+            acc = 100. * correct / labels.size(0)
+            
+            # Update metrics
+            losses.update(loss.item(), images.size(0))
+            ce_losses.update(ce_loss.item(), images.size(0))
+            rcl_losses.update(rcl_loss.item() if not torch.isnan(rcl_loss) else 0.0, images.size(0))
+            distill_losses.update(distill_loss.item(), images.size(0))
+            proximal_losses.update(proximal_loss.item(), images.size(0))
+            top1.update(acc, images.size(0))
+            
+            # Measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+            
+            # Apply EMA to loss history for stability tracking
+            self.ce_loss_avg = ce_loss.item() if not hasattr(self, 'ce_loss_avg') else 0.9 * self.ce_loss_avg + 0.1 * ce_loss.item()
+            self.rcl_loss_avg = rcl_loss.item() if not hasattr(self, 'rcl_loss_avg') else 0.9 * self.rcl_loss_avg + 0.1 * rcl_loss.item()
+            
+            # Optional learning rate scheduler step
+            if hasattr(self, 'scheduler'):
+                self.scheduler.step()
+        
+        # Return metrics dictionary
+        metrics = {
+            'loss': losses.avg,
+            'ce_loss': ce_losses.avg,
+            'rcl_loss': rcl_losses.avg,
+            'distill_loss': distill_losses.avg,
+            'proximal_loss': proximal_losses.avg,
+            'acc': top1.avg / 100.0,  # Convert back to [0,1] range
+        }
+        
+        return metrics
+

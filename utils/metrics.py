@@ -35,7 +35,11 @@ def evaluate(args, model, test_loader, device, criterion=None):
     start_time = time.time()
     
     # Set max samples to evaluate to avoid long eval time
-    max_samples = getattr(args.trainer.eval, 'max_samples', 10000)
+    try:
+        max_samples = getattr(args.trainer.eval, 'max_samples', 10000)
+    except (AttributeError, KeyError):
+        # Fallback if args.trainer.eval doesn't exist
+        max_samples = 10000
     
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(test_loader):

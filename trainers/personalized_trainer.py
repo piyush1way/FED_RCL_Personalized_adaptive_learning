@@ -250,6 +250,16 @@ class PersonalizedTrainer(BaseTrainer):
         # Set up model and optimizer
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = getattr(self.args, 'enable_benchmark', True)
+            
+            # Configure memory management
+            max_split_size_mb = getattr(self.args, 'max_split_size_mb', 128)
+            torch.cuda.set_per_process_memory_fraction(0.85)  # Limit memory usage to 85%
+            
+            # Set environment variables for PyTorch memory management
+            import os
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = f'max_split_size_mb:{max_split_size_mb}'
+            
+            logger.info(f"CUDA setup: max_split_size_mb={max_split_size_mb}")
         
         # Initialize model with personalization support
         if hasattr(self.model, 'enable_personalized_mode') and self.enable_personalization:
@@ -258,10 +268,39 @@ class PersonalizedTrainer(BaseTrainer):
         
         # Initialize server with the model
         if self.server and hasattr(self.server, 'setup'):
-            self.server.setup(self.model)
-            self.global_model = self.server.get_global_model() if hasattr(self.server, 'get_global_model') else copy.deepcopy(self.model)
+            # Move model to CPU first to reduce memory during setup
+            model_device = next(self.model.parameters()).device
+            self.model = self.model.to('cpu')
+            
+            try:
+                self.server.setup(self.model)
+                # Restore model to original device
+                self.model = self.model.to(model_device)
+                
+                # Get global model from server if available
+                if hasattr(self.server, 'get_global_model'):
+                    self.global_model = self.server.get_global_model()
+                else:
+                    # Create global model with minimal memory usage
+                    self.global_model = self.create_model_copy(self.model)
+            except RuntimeError as e:
+                if "CUDA out of memory" in str(e):
+                    logger.error("CUDA OOM during server setup. Using alternative initialization.")
+                    # Clear cache and retry with more aggressive memory management
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        import gc
+                        gc.collect()
+                    
+                    # Create global model directly with minimal memory usage
+                    self.global_model = self.create_model_copy(self.model)
+                    
+                    # Restore model to original device
+                    self.model = self.model.to(model_device)
+                else:
+                    raise e
         else:
-            self.global_model = copy.deepcopy(self.model)
+            self.global_model = self.create_model_copy(self.model)
         
         # Move models to the right device
         self.model = self.model.to(self.device)
@@ -314,6 +353,54 @@ class PersonalizedTrainer(BaseTrainer):
         self.trust_scores = {}
         self.client_performances = {client_idx: {"global_acc": [], "personalized_acc": []} 
                                   for client_idx in range(self.num_clients)}
+
+    def create_model_copy(self, model):
+        """Create a copy of model with minimal memory usage"""
+        try:
+            # First try to create a new instance of the same class
+            if hasattr(model, '__class__'):
+                model_class = model.__class__
+                if hasattr(model, 'init_params') and model.init_params:
+                    # If model has stored initialization parameters
+                    new_model = model_class(**model.init_params)
+                    new_model.load_state_dict(model.state_dict())
+                    return new_model
+            
+            # Fallback to deepcopy but with careful memory management
+            model_device = next(model.parameters()).device
+            model = model.to('cpu')  # Move to CPU first
+            
+            # Clear CUDA cache before copy
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            new_model = copy.deepcopy(model)
+            
+            # Restore original model device
+            model.to(model_device)
+            
+            return new_model
+        
+        except Exception as e:
+            logger.error(f"Error in model copy: {str(e)}")
+            # Last resort: create new model and copy state dict
+            if hasattr(model, '_get_name'):
+                logger.info(f"Attempting alternative copy for {model._get_name()}")
+            
+            # Create new state dict to copy values one by one
+            new_state_dict = {}
+            for key, param in model.state_dict().items():
+                new_state_dict[key] = param.clone().detach().cpu()
+            
+            # Create a new instance (this assumes model has a constructor that takes no args)
+            try:
+                new_model = model.__class__()
+                new_model.load_state_dict(new_state_dict)
+                return new_model
+            except:
+                logger.error("Failed to create model copy")
+                # Return original model as last resort
+                return model
 
     def _train_clients(self, selected_clients):
         """Train selected clients and return updated models and metrics"""

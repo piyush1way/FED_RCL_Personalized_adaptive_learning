@@ -617,254 +617,6 @@ class RCLClient(Client):
                 
         return True
 
-    def local_train(self, epoch):
-        """Perform local training for a specified number of epochs"""
-        # Call the updated implementation for better consistency and trust calculation
-        return self.local_train(epoch)
-        
-        """
-        # Original implementation below - keeping for reference but not executing
-        """
-
-    def evaluate_global_accuracy(self):
-        """Evaluate accuracy using only the global head"""
-        self.model.eval()
-        correct = 0
-        total = 0
-        
-        with torch.no_grad():
-            for images, labels in self.trainloader:
-                images, labels = images.to(self.device), labels.to(self.device)
-                outputs = self.model(images)
-                global_logits = outputs['global_logit']
-                _, predicted = torch.max(global_logits, 1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-        
-        return correct / total
-
-    def calculate_contrastive_loss(self, features, labels):
-        """Calculate relaxed contrastive loss with proper type handling"""
-        if not isinstance(features, torch.Tensor) or not isinstance(labels, torch.Tensor):
-            return torch.tensor(0.0).to(self.device)
-        
-        # Ensure features are float type
-        if features.dtype != torch.float32 and features.dtype != torch.float64:
-            features = features.float()
-        
-        # Ensure labels are long type
-        if labels.dtype != torch.int64 and labels.dtype != torch.long:
-            labels = labels.long()
-        
-        # Apply relaxed contrastive loss
-        try:
-            rcl_loss = self.relaxed_contrastive_loss(features, labels)
-            return rcl_loss
-        except RuntimeError as e:
-            logger.warning(f"Error computing contrastive loss: {str(e)}. Using default loss.")
-            return torch.tensor(0.01).to(self.device)  # Small default loss to avoid NaN
-
-    def extract_features_safely(self, images):
-        """Extract features from images in a memory-efficient way"""
-        try:
-            # Move to CPU to avoid extra memory usage
-            self.model.eval()  # Temporarily set to eval mode for feature extraction
-            
-            with torch.no_grad():  # No gradients needed for feature extraction
-                # Direct feature extraction through forward pass
-                outputs = self.model(images)
-                if isinstance(outputs, dict) and "feature" in outputs:
-                    features = outputs["feature"]
-                    
-                    # Apply projection if available
-                    if hasattr(self.model, 'projection_head') and self.model.projection_head is not None:
-                        features = self.model.projection_head(features)
-                else:
-                    # Fallback to get_contrastive_features if it exists
-                    self.model.train()  # Restore train mode
-                    return self.model.get_contrastive_features(images)
-            
-            self.model.train()  # Restore train mode
-            return features
-            
-        except Exception as e:
-            logger.error(f"Error in safe feature extraction: {str(e)}")
-            self.model.train()  # Make sure to restore train mode
-            # Fallback to original method if available
-            if hasattr(self.model, 'get_contrastive_features'):
-                return self.model.get_contrastive_features(images)
-            else:
-                # Return empty tensor as last resort
-                return torch.zeros((images.size(0), 128), device=self.device)
-
-    def setup_cyclical_lr(self, epoch):
-        """Setup cyclical learning rate for the current epoch"""
-        if not hasattr(self, 'optimizer'):
-            logger.warning(f"Client {self.client_index}: Cannot setup cyclical LR without optimizer")
-            return
-            
-        try:
-            # Get trust score history for smoother adaptation
-            trust_history = self.trust_score_history[-5:] if hasattr(self, 'trust_score_history') and self.trust_score_history else [0.8]
-            
-            # Calculate moving average of trust scores for stability
-            trust_avg = float(sum(trust_history)) / float(len(trust_history))
-            
-            # Cyclical component: sine wave with period of 2*step_size
-            cycle_position = self.rounds_trained % (2 * self.step_size)
-            cycle_ratio = cycle_position / self.step_size
-            
-            if cycle_position < self.step_size:
-                # Increasing phase
-                cycle_factor = 0.5 * (1 + np.sin(np.pi * (cycle_ratio - 0.5)))
-            else:
-                # Decreasing phase
-                cycle_factor = 0.5 * (1 + np.sin(np.pi * (cycle_ratio + 0.5)))
-            
-            # Adaptive learning rate range based on trust
-            # Higher trust → wider LR range (more exploration)
-            # Lower trust → narrower LR range (more conservative)
-            trust_adjusted_max_lr = self.base_lr + (self.max_lr - self.base_lr) * trust_avg
-            
-            # Apply cycle to the trust-adjusted range
-            current_lr = self.base_lr + (trust_adjusted_max_lr - self.base_lr) * cycle_factor
-            
-            # Add warmup phase for first few rounds
-            if self.rounds_trained <= 3:
-                warmup_factor = min(1.0, self.rounds_trained / 3)
-                current_lr = self.base_lr + (current_lr - self.base_lr) * warmup_factor
-            
-            # Set learning rate in optimizer
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = current_lr
-                
-            logger.info(f"[C{self.client_index}] Trust-based Cyclical LR: {current_lr:.6f} (trust={trust_avg:.3f}, cycle={cycle_factor:.2f})")
-        except Exception as e:
-            logger.error(f"Error setting up cyclical LR: {str(e)}")
-            # Fallback to base learning rate
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = self.base_lr
-            
-    def setup_trust_lr(self, trust_score):
-        """Setup trust-based learning rate"""
-        if not hasattr(self, 'optimizer'):
-            logger.warning(f"Client {self.client_index}: Cannot setup trust LR without optimizer")
-            return
-            
-        try:
-            # Scale learning rate based on trust score
-            # Higher trust means higher learning rate (more aggressive updates)
-            # Lower trust means lower learning rate (more conservative updates)
-            trust_factor = max(0.5, min(1.5, trust_score * 2))
-            current_lr = self.base_lr * trust_factor
-            
-            # Set learning rate in optimizer
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = current_lr
-                
-            logger.info(f"[C{self.client_index}] Trust-based LR: {current_lr:.6f} (trust={trust_score:.3f})")
-        except Exception as e:
-            logger.error(f"Error setting up trust LR: {str(e)}")
-            # Fallback to base learning rate
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = self.base_lr
-
-    def setup_optimizer(self):
-        """Initialize the optimizer if it doesn't exist"""
-        if hasattr(self, 'model') and self.model is not None:
-            # Default optimizer parameters
-            lr = getattr(self, 'base_lr', 0.01)
-            weight_decay = 1e-5
-            momentum = 0.9
-            
-            try:
-                self.optimizer = torch.optim.SGD(
-                    self.model.parameters(),
-                    lr=lr,
-                    momentum=momentum,
-                    weight_decay=weight_decay
-                )
-                logger.info(f"Client {self.client_index}: Initialized optimizer with lr={lr}")
-            except Exception as e:
-                logger.error(f"Error initializing optimizer: {str(e)}")
-                # Try simpler optimizer as fallback
-                try:
-                    self.optimizer = torch.optim.SGD(
-                        self.model.parameters(),
-                        lr=lr
-                    )
-                except Exception as nested_e:
-                    logger.error(f"Failed to initialize fallback optimizer: {str(nested_e)}")
-        else:
-            logger.error(f"Client {self.client_index}: Cannot setup optimizer without model")
-
-    def update_trust_score(self, metrics):
-        """Update trust score based on training metrics"""
-        if hasattr(self, 'enable_trust_filtering') and self.enable_trust_filtering:
-            # Get trust score based on training metrics
-            trust_score = self.compute_trust_score(self.model, metrics)
-            
-            # Stabilize trust score with exponential moving average
-            if not hasattr(self, 'trust_score') or self.trust_score is None:
-                self.trust_score = trust_score
-            else:
-                # Smooth trust score changes
-                momentum = 0.7  # Higher value = slower changes
-                self.trust_score = momentum * self.trust_score + (1 - momentum) * trust_score
-            
-            # Ensure trust score is within valid range
-            self.trust_score = min(max(self.trust_score, 0.1), 1.0)
-            
-            # Update model attribute if available
-            if hasattr(self.model, 'trust_score'):
-                self.model.trust_score = self.trust_score
-            
-            # Track history
-            if not hasattr(self, 'trust_score_history'):
-                self.trust_score_history = []
-            self.trust_score_history.append(self.trust_score)
-            if len(self.trust_score_history) > 10:
-                self.trust_score_history.pop(0)
-                
-            return self.trust_score
-        else:
-            # Default trust score if filtering not enabled
-            return 0.8
-            
-    def _compute_model_similarity(self):
-        """Compute similarity between client model and global model"""
-        if not hasattr(self, 'global_model') or self.global_model is None:
-            return 0.8  # Default similarity if no global model
-            
-        similarity_score = 0.0
-        count = 0
-        
-        # Get model dictionaries
-        client_state = self.model.state_dict()
-        global_state = self.global_model.state_dict()
-        
-        # Calculate cosine similarity for each parameter
-        for key in client_state:
-            if key in global_state and not ('personalized_head' in key):
-                # Skip personalization parameters
-                try:
-                    client_param = client_state[key].flatten().float()
-                    global_param = global_state[key].flatten().float()
-                    
-                    if client_param.numel() > 0 and global_param.numel() > 0:
-                        cos_sim = F.cosine_similarity(
-                            client_param.unsqueeze(0), 
-                            global_param.unsqueeze(0)
-                        )
-                        # Convert from [-1, 1] to [0, 1]
-                        similarity_score += (cos_sim.item() + 1) / 2
-                        count += 1
-                except Exception as e:
-                    logger.warning(f"Error computing parameter similarity: {e}")
-        
-        # Return average similarity
-        return similarity_score / count if count > 0 else 0.8
-                
     def local_train(self, global_epoch):
         """Perform local training for a client with additional measurement of client metrics"""
         self.global_epoch = global_epoch
@@ -877,6 +629,18 @@ class RCLClient(Client):
         ce_losses = AverageMeter('CE Loss', ':.4f')
         rcl_losses = AverageMeter('RCL Loss', ':.4f')
         accs = AverageMeter('Acc', ':.4f')
+        
+        # Check model for NaN parameters and reset if necessary
+        has_nan = False
+        for name, param in self.model.named_parameters():
+            if torch.isnan(param).any():
+                has_nan = True
+                logger.warning(f"Client {self.client_id}: Found NaN in model parameters before training")
+                break
+                
+        if has_nan and self.previous_model_state is not None:
+            logger.warning(f"Client {self.client_id}: Resetting NaN parameters using previous state")
+            self.model.load_state_dict(self.previous_model_state)
         
         # Set up optimizer with trust-based learning rate if enabled
         if hasattr(self, 'enable_adaptive_lr') and self.enable_adaptive_lr and hasattr(self, 'trust_score'):
@@ -1127,16 +891,33 @@ class RCLClient(Client):
             if torch.isnan(loss):
                 logger.warning(f"Client {self.client_id}: NaN loss detected, skipping batch")
                 continue
+                
+            # Also check if loss is too high (could indicate numerical instability)
+            if loss.item() > 1000:
+                logger.warning(f"Client {self.client_id}: Extremely high loss detected ({loss.item():.1f}), skipping batch")
+                continue
             
             # Backward pass and optimize with amp support
             if self.use_amp:
                 scaler = GradScaler()
                 scaler.scale(loss).backward()
+                
+                # Apply gradient clipping before optimizer step
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+                
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                
+                # Apply gradient clipping before optimizer step
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+                
                 optimizer.step()
+            
+            # Optional learning rate scheduler step - MOVED AFTER optimizer.step()
+            if hasattr(self, 'scheduler'):
+                self.scheduler.step()
             
             # Calculate accuracy
             _, predicted = logits.max(1)
@@ -1158,10 +939,6 @@ class RCLClient(Client):
             # Apply EMA to loss history for stability tracking
             self.ce_loss_avg = ce_loss.item() if not hasattr(self, 'ce_loss_avg') else 0.9 * self.ce_loss_avg + 0.1 * ce_loss.item()
             self.rcl_loss_avg = rcl_loss.item() if not hasattr(self, 'rcl_loss_avg') else 0.9 * self.rcl_loss_avg + 0.1 * rcl_loss.item()
-            
-            # Optional learning rate scheduler step
-            if hasattr(self, 'scheduler'):
-                self.scheduler.step()
         
         # Return metrics dictionary
         metrics = {
@@ -1174,4 +951,236 @@ class RCLClient(Client):
         }
         
         return metrics
+
+    def update_trust_score(self, metrics):
+        """Update trust score based on training metrics"""
+        if hasattr(self, 'enable_trust_filtering') and self.enable_trust_filtering:
+            # Get trust score based on training metrics
+            trust_score = self.compute_trust_score(self.model, metrics)
+            
+            # Stabilize trust score with exponential moving average
+            if not hasattr(self, 'trust_score') or self.trust_score is None:
+                self.trust_score = trust_score
+            else:
+                # Smooth trust score changes
+                momentum = 0.7  # Higher value = slower changes
+                self.trust_score = momentum * self.trust_score + (1 - momentum) * trust_score
+            
+            # Ensure trust score is within valid range
+            self.trust_score = min(max(self.trust_score, 0.1), 1.0)
+            
+            # Update model attribute if available
+            if hasattr(self.model, 'trust_score'):
+                self.model.trust_score = self.trust_score
+            
+            # Track history
+            if not hasattr(self, 'trust_score_history'):
+                self.trust_score_history = []
+            self.trust_score_history.append(self.trust_score)
+            if len(self.trust_score_history) > 10:
+                self.trust_score_history.pop(0)
+                
+            return self.trust_score
+        else:
+            # Default trust score if filtering not enabled
+            return 0.8
+            
+    def _compute_model_similarity(self):
+        """Compute similarity between client model and global model"""
+        if not hasattr(self, 'global_model') or self.global_model is None:
+            return 0.8  # Default similarity if no global model
+            
+        similarity_score = 0.0
+        count = 0
+        
+        # Get model dictionaries
+        client_state = self.model.state_dict()
+        global_state = self.global_model.state_dict()
+        
+        # Calculate cosine similarity for each parameter
+        for key in client_state:
+            if key in global_state and not ('personalized_head' in key):
+                # Skip personalization parameters
+                try:
+                    client_param = client_state[key].flatten().float()
+                    global_param = global_state[key].flatten().float()
+                    
+                    if client_param.numel() > 0 and global_param.numel() > 0:
+                        cos_sim = F.cosine_similarity(
+                            client_param.unsqueeze(0), 
+                            global_param.unsqueeze(0)
+                        )
+                        # Convert from [-1, 1] to [0, 1]
+                        similarity_score += (cos_sim.item() + 1) / 2
+                        count += 1
+                except Exception as e:
+                    logger.warning(f"Error computing parameter similarity: {e}")
+        
+        # Return average similarity
+        return similarity_score / count if count > 0 else 0.8
+                
+    def calculate_contrastive_loss(self, features, labels):
+        """Calculate relaxed contrastive loss with proper type handling"""
+        if not isinstance(features, torch.Tensor) or not isinstance(labels, torch.Tensor):
+            return torch.tensor(0.0).to(self.device)
+        
+        # Ensure features are float type
+        if features.dtype != torch.float32 and features.dtype != torch.float64:
+            features = features.float()
+        
+        # Ensure labels are long type
+        if labels.dtype != torch.int64 and labels.dtype != torch.long:
+            labels = labels.long()
+        
+        # Normalize features for numerical stability if not already normalized
+        if features.norm(dim=1).mean() > 1.1:  # Check if features appear to be unnormalized
+            features = F.normalize(features, p=2, dim=1)
+        
+        # Apply relaxed contrastive loss
+        try:
+            rcl_loss = self.relaxed_contrastive_loss(features, labels)
+            
+            # Check for NaN or extremely large loss
+            if torch.isnan(rcl_loss) or rcl_loss > 100:
+                logger.warning(f"Client {self.client_id}: Unstable contrastive loss detected, using fallback")
+                return torch.tensor(0.01).to(self.device)
+                
+            return rcl_loss
+        except RuntimeError as e:
+            logger.warning(f"Error computing contrastive loss: {str(e)}. Using default loss.")
+            return torch.tensor(0.01).to(self.device)  # Small default loss to avoid NaN
+
+    def extract_features_safely(self, images):
+        """Extract features from images in a memory-efficient way"""
+        try:
+            # Move to CPU to avoid extra memory usage
+            self.model.eval()  # Temporarily set to eval mode for feature extraction
+            
+            with torch.no_grad():  # No gradients needed for feature extraction
+                # Direct feature extraction through forward pass
+                outputs = self.model(images)
+                if isinstance(outputs, dict) and "feature" in outputs:
+                    features = outputs["feature"]
+                    
+                    # Apply projection if available
+                    if hasattr(self.model, 'projection_head') and self.model.projection_head is not None:
+                        features = self.model.projection_head(features)
+                else:
+                    # Fallback to get_contrastive_features if it exists
+                    self.model.train()  # Restore train mode
+                    return self.model.get_contrastive_features(images)
+            
+            self.model.train()  # Restore train mode
+            return features
+            
+        except Exception as e:
+            logger.error(f"Error in safe feature extraction: {str(e)}")
+            self.model.train()  # Make sure to restore train mode
+            # Fallback to original method if available
+            if hasattr(self.model, 'get_contrastive_features'):
+                return self.model.get_contrastive_features(images)
+            else:
+                # Return empty tensor as last resort
+                return torch.zeros((images.size(0), 128), device=self.device)
+
+    def setup_cyclical_lr(self, epoch):
+        """Setup cyclical learning rate for the current epoch"""
+        if not hasattr(self, 'optimizer'):
+            logger.warning(f"Client {self.client_index}: Cannot setup cyclical LR without optimizer")
+            return
+            
+        try:
+            # Get trust score history for smoother adaptation
+            trust_history = self.trust_score_history[-5:] if hasattr(self, 'trust_score_history') and self.trust_score_history else [0.8]
+            
+            # Calculate moving average of trust scores for stability
+            trust_avg = float(sum(trust_history)) / float(len(trust_history))
+            
+            # Cyclical component: sine wave with period of 2*step_size
+            cycle_position = self.rounds_trained % (2 * self.step_size)
+            cycle_ratio = cycle_position / self.step_size
+            
+            if cycle_position < self.step_size:
+                # Increasing phase
+                cycle_factor = 0.5 * (1 + np.sin(np.pi * (cycle_ratio - 0.5)))
+            else:
+                # Decreasing phase
+                cycle_factor = 0.5 * (1 + np.sin(np.pi * (cycle_ratio + 0.5)))
+            
+            # Adaptive learning rate range based on trust
+            # Higher trust → wider LR range (more exploration)
+            # Lower trust → narrower LR range (more conservative)
+            trust_adjusted_max_lr = self.base_lr + (self.max_lr - self.base_lr) * trust_avg
+            
+            # Apply cycle to the trust-adjusted range
+            current_lr = self.base_lr + (trust_adjusted_max_lr - self.base_lr) * cycle_factor
+            
+            # Add warmup phase for first few rounds
+            if self.rounds_trained <= 3:
+                warmup_factor = min(1.0, self.rounds_trained / 3)
+                current_lr = self.base_lr + (current_lr - self.base_lr) * warmup_factor
+            
+            # Set learning rate in optimizer
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = current_lr
+                
+            logger.info(f"[C{self.client_index}] Trust-based Cyclical LR: {current_lr:.6f} (trust={trust_avg:.3f}, cycle={cycle_factor:.2f})")
+        except Exception as e:
+            logger.error(f"Error setting up cyclical LR: {str(e)}")
+            # Fallback to base learning rate
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.base_lr
+            
+    def setup_trust_lr(self, trust_score):
+        """Setup trust-based learning rate"""
+        if not hasattr(self, 'optimizer'):
+            logger.warning(f"Client {self.client_index}: Cannot setup trust LR without optimizer")
+            return
+            
+        try:
+            # Scale learning rate based on trust score
+            # Higher trust means higher learning rate (more aggressive updates)
+            # Lower trust means lower learning rate (more conservative updates)
+            trust_factor = max(0.5, min(1.5, trust_score * 2))
+            current_lr = self.base_lr * trust_factor
+            
+            # Set learning rate in optimizer
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = current_lr
+                
+            logger.info(f"[C{self.client_index}] Trust-based LR: {current_lr:.6f} (trust={trust_score:.3f})")
+        except Exception as e:
+            logger.error(f"Error setting up trust LR: {str(e)}")
+            # Fallback to base learning rate
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.base_lr
+
+    def setup_optimizer(self):
+        """Initialize the optimizer if it doesn't exist"""
+        if hasattr(self, 'model') and self.model is not None:
+            # Default optimizer parameters
+            lr = getattr(self, 'base_lr', 0.01)
+            weight_decay = 1e-5
+            momentum = 0.9
+            
+            try:
+                self.optimizer = torch.optim.SGD(
+                    self.model.parameters(),
+                    lr=lr,
+                    momentum=momentum,
+                    weight_decay=weight_decay
+                )
+                logger.info(f"Client {self.client_index}: Initialized optimizer with lr={lr}")
+            except Exception as e:
+                logger.error(f"Error initializing optimizer: {str(e)}")
+                # Try simpler optimizer as fallback
+                try:
+                    self.optimizer = torch.optim.SGD(
+                        self.model.parameters(),
+                        lr=lr
+                    )
+                except Exception as nested_e:
+                    logger.error(f"Failed to initialize fallback optimizer: {str(nested_e)}")
+        else:
+            logger.error(f"Client {self.client_index}: Cannot setup optimizer without model")
 

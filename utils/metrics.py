@@ -318,7 +318,11 @@ def evaluate_personalization_benefits(args, model, test_loader, device, criterio
     total = 0
     
     # Limit samples to avoid OOM
-    max_samples = getattr(args.trainer.eval, 'max_samples', 500)
+    try:
+        max_samples = getattr(args.trainer.eval, 'max_samples', 500)
+    except (AttributeError, KeyError):
+        # Fallback if args.trainer.eval doesn't exist
+        max_samples = 500
     
     # Evaluate global model first
     model.disable_personalized_mode()

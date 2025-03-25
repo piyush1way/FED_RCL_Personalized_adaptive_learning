@@ -7,6 +7,7 @@ import os
 import json
 import numpy as np
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -266,27 +267,40 @@ def compute_trust_score(current_model, previous_model, update_history=None):
     
     return max(0.0, min(1.0, trust_score))
 
-def setup_adaptive_learning_rate(base_lr, max_lr, trust_score, step, step_size):
-    """Set up adaptive learning rate based on trust score and cyclical schedule.
+def setup_adaptive_learning_rate(min_lr, max_lr, current_round, total_rounds, trust_weight=1.0, client_id=0):
+    """
+    Set up adaptive learning rate based on current round and trust weight.
+    Uses cyclical learning rate pattern with trust-based scaling.
     
     Args:
-        base_lr: Base learning rate
+        min_lr: Minimum learning rate
         max_lr: Maximum learning rate
-        trust_score: Client trust score
-        step: Current step in the cycle
-        step_size: Number of steps in half a cycle
+        current_round: Current training round
+        total_rounds: Total number of training rounds
+        trust_weight: Trust score to scale learning rate (higher trust = higher LR)
+        client_id: Client ID to ensure variation across clients
         
     Returns:
-        Adjusted learning rate
+        Calculated learning rate
     """
-    # Cyclical LR calculation
-    cycle_step = step % (2 * step_size)
-    x = abs(cycle_step / step_size - 1)
+    # Normalize current position in training
+    position = (current_round % (total_rounds // 5)) / (total_rounds // 5)
     
-    # Adjust max_lr based on trust score
-    adjusted_max_lr = max_lr * (0.5 + 0.5 * trust_score)
+    # Add client-specific variation
+    client_factor = 0.8 + (client_id % 10) * 0.04  # Varies from 0.8 to 1.16
+    position = (position + client_id * 0.01) % 1.0  # Shifts the cycle position
     
-    # Calculate final learning rate
-    adjusted_lr = base_lr + (adjusted_max_lr - base_lr) * max(0, (1 - x))
+    # Convert position to angle
+    angle = position * 2 * math.pi
     
-    return adjusted_lr
+    # Create cosine wave scaled between 0 and 1
+    cosine_value = (math.cos(angle) + 1) / 2
+    
+    # Calculate base learning rate (cosine annealing)
+    base_lr = min_lr + (max_lr - min_lr) * cosine_value
+    
+    # Scale by trust weight (higher trust = higher learning rate)
+    # Add client-specific scaling
+    trust_adjusted_lr = base_lr * (0.5 + 0.5 * trust_weight) * client_factor
+    
+    return trust_adjusted_lr

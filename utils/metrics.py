@@ -8,175 +8,138 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 from sklearn.metrics import confusion_matrix, balanced_accuracy_score
 from scipy import stats
+import time
+import torch.nn.functional as F
+from utils.meter import AverageMeter
 
 logger = logging.getLogger(__name__)
 
 __all__ = ['evaluate', 'track_trust_scores', 'evaluate_personalized_clients', 'evaluate_personalization_benefits']
 
-def evaluate(args, model, testloader, device, criterion=None) -> dict:
-    """
-    Evaluate both global and personalized models on the test set.
-    
-    Args:
-        args: Configuration arguments
-        model: The model to evaluate
-        testloader: DataLoader for test data
-        device: Device to run evaluation on
-        criterion: Loss function for calculating loss
-        
-    Returns:
-        dict: Evaluation metrics including accuracy and class-wise performance
-    """
-    eval_device = device if not args.multiprocessing else torch.device(f"cuda:{args.main_gpu}")
-    eval_model = copy.deepcopy(model)
-    eval_model.eval()
-    eval_model.to(eval_device)
-
-    # Initialize counters
-    correct_global, correct_personalized, total = 0, 0, 0
-    
-    # Check if model supports personalization
-    has_personalization = hasattr(eval_model, 'personalized_head') or hasattr(eval_model, 'use_personalized_head')
-    
-    # Track class-wise accuracy for both models
-    class_correct_global = defaultdict(int)
-    class_correct_personalized = defaultdict(int)
-    class_total = defaultdict(int)
-    
-    # Track confidence scores
-    confidence_global = []
-    confidence_personalized = []
-    
-    # Track per-sample predictions for analysis
-    all_labels = []
-    all_global_preds = []
-    all_personalized_preds = []
-
+def evaluate(args, model, test_loader, device, criterion=None):
+    """Evaluate the model on the test dataset"""
+    model.eval()
     test_loss = 0
-
+    correct = 0
+    total = 0
+    
+    # For computing balanced accuracy
+    true_positives = {}
+    class_counts = {}
+    
+    # For tracking confidence
+    confidences = []
+    
+    # Track test running time
+    batch_time = AverageMeter('Batch Time', ':6.3f')
+    start_time = time.time()
+    
+    # Set max samples to evaluate to avoid long eval time
+    max_samples = getattr(args.trainer.eval, 'max_samples', 10000)
+    
     with torch.no_grad():
-        for images, labels in testloader:
-            images, labels = images.to(eval_device), labels.to(eval_device)
+        for batch_idx, (inputs, targets) in enumerate(test_loader):
+            # Limit number of samples for faster evaluation
+            if total >= max_samples:
+                break
+                
+            inputs, targets = inputs.to(device), targets.to(device)
             
             # Forward pass
-            outputs = eval_model(images)
+            outputs = model(inputs)
             
-            # Handle different output formats
+            # Handle both dictionary and direct tensor outputs
             if isinstance(outputs, dict):
-                if "global_logit" in outputs and "personalized_logit" in outputs:
-                    # Model returns both global and personalized logits
-                    global_logits = outputs["global_logit"]
-                    personalized_logits = outputs["personalized_logit"]
-                elif "logit" in outputs and has_personalization:
-                    # Model returns only one set of logits based on current mode
-                    # Store current personalization mode
-                    current_mode = getattr(eval_model, 'use_personalized_head', False)
-                    
-                    # Get global logits
-                    if hasattr(eval_model, 'use_personalized_head'):
-                        eval_model.use_personalized_head = False
-                    global_logits = eval_model(images)
-                    if isinstance(global_logits, dict):
-                        global_logits = global_logits["logit"]
-                    
-                    # Get personalized logits
-                    if hasattr(eval_model, 'use_personalized_head'):
-                        eval_model.use_personalized_head = True
-                    personalized_logits = eval_model(images)
-                    if isinstance(personalized_logits, dict):
-                        personalized_logits = personalized_logits["logit"]
-                    
-                    # Restore original mode
-                    if hasattr(eval_model, 'use_personalized_head'):
-                        eval_model.use_personalized_head = current_mode
-                else:
-                    # Only global model available
-                    global_logits = outputs["logit"] if "logit" in outputs else outputs.get("output", list(outputs.values())[0])
-                    personalized_logits = global_logits  # No personalization
-            else:
-                # Model returns tensor directly
-                global_logits = outputs
-                personalized_logits = outputs  # No personalization
-            
-            # Calculate predictions
-            global_probs = torch.softmax(global_logits, dim=1)
-            personalized_probs = torch.softmax(personalized_logits, dim=1)
-            
-            global_conf, predicted_global = torch.max(global_probs, 1)
-            personalized_conf, predicted_personalized = torch.max(personalized_probs, 1)
-            
-            # Store confidence scores
-            confidence_global.extend(global_conf.cpu().numpy().tolist())
-            confidence_personalized.extend(personalized_conf.cpu().numpy().tolist())
-            
-            # Store predictions for analysis
-            all_labels.extend(labels.cpu().numpy().tolist())
-            all_global_preds.extend(predicted_global.cpu().numpy().tolist())
-            all_personalized_preds.extend(predicted_personalized.cpu().numpy().tolist())
-            
-            # Update counters
-            total += labels.size(0)
-            correct_global += (predicted_global == labels).sum().item()
-            correct_personalized += (predicted_personalized == labels).sum().item()
-            
-            # Update class-wise accuracy
-            for label in torch.unique(labels):
-                label_idx = (labels == label)
-                label_val = label.item()
-                
-                class_total[label_val] += label_idx.sum().item()
-                class_correct_global[label_val] += ((predicted_global == labels) & label_idx).sum().item()
-                class_correct_personalized[label_val] += ((predicted_personalized == labels) & label_idx).sum().item()
-
-            # Calculate loss if criterion is provided
+                outputs = outputs.get('logit', outputs.get('global_logit', None))
+                if outputs is None:
+                    for key in ['output', 'pred', 'prediction', 'logits']:
+                        if key in outputs:
+                            outputs = outputs[key]
+                            break
+                    if outputs is None:
+                        # Last attempt: just use the first value that's a tensor
+                        for key, value in outputs.items():
+                            if isinstance(value, torch.Tensor) and value.dim() > 1:
+                                outputs = value
+                                break
+                        
+            # Calculate loss if criterion provided
             if criterion is not None:
-                loss = criterion(global_logits, labels)
+                loss = criterion(outputs, targets)
                 test_loss += loss.item()
-
-    # Calculate overall accuracy
-    acc_global = 100 * correct_global / float(total) if total > 0 else 0
-    acc_personalized = 100 * correct_personalized / float(total) if total > 0 else 0
+            
+            # Calculate accuracy
+            _, predicted = outputs.max(1)
+            correct += predicted.eq(targets).sum().item()
+            total += targets.size(0)
+            
+            # Update balanced accuracy metrics
+            for cls in torch.unique(targets):
+                cls_idx = cls.item()
+                if cls_idx not in true_positives:
+                    true_positives[cls_idx] = 0
+                    class_counts[cls_idx] = 0
+                
+                cls_mask = (targets == cls_idx)
+                true_positives[cls_idx] += predicted[cls_mask].eq(targets[cls_mask]).sum().item()
+                class_counts[cls_idx] += cls_mask.sum().item()
+            
+            # Collect confidence scores
+            with torch.no_grad():
+                probabilities = F.softmax(outputs, dim=1)
+                top_probs, _ = torch.max(probabilities, dim=1)
+                confidences.extend(top_probs.cpu().tolist())
+            
+            # Update timer
+            batch_time.update(time.time() - start_time)
+            start_time = time.time()
     
-    # Calculate class-wise accuracy
-    class_acc_global = {int(cls): float(100 * correct / class_total[cls]) 
-                       for cls, correct in class_correct_global.items()}
-    class_acc_personalized = {int(cls): float(100 * correct / class_total[cls]) 
-                            for cls, correct in class_correct_personalized.items()}
+    # Calculate final metrics
+    acc_global = 100.0 * correct / total if total > 0 else 0.0
     
-    # Calculate balanced accuracy (average of class-wise accuracies)
-    balanced_acc_global = float(sum(class_acc_global.values()) / len(class_acc_global)) if class_acc_global else 0
-    balanced_acc_personalized = float(sum(class_acc_personalized.values()) / len(class_acc_personalized)) if class_acc_personalized else 0
+    # Compute balanced accuracy (average of per-class accuracies)
+    balanced_acc = 0.0
+    valid_classes = 0
+    per_class_acc = {}
     
-    # Calculate average confidence
-    avg_confidence_global = float(sum(confidence_global) / len(confidence_global)) if confidence_global else 0
-    avg_confidence_personalized = float(sum(confidence_personalized) / len(confidence_personalized)) if confidence_personalized else 0
-
-    # Calculate loss
-    avg_loss = test_loss / len(testloader) if criterion is not None else 0
-
-    logger.info(f'Global Model Accuracy: {acc_global:.2f}%{" | Loss: " + str(avg_loss):.4f if criterion is not None else ""}')
-    logger.info(f'Global Model Balanced Accuracy: {balanced_acc_global:.2f}%')
-
-    # Clean up
-    eval_model.to('cpu')
-    torch.cuda.empty_cache()
+    for cls in true_positives.keys():
+        if class_counts[cls] > 0:
+            cls_acc = 100.0 * true_positives[cls] / class_counts[cls]
+            per_class_acc[cls] = cls_acc
+            balanced_acc += cls_acc
+            valid_classes += 1
     
-    return {
-        "acc": float(acc_global),  # Keep original key for compatibility
-        "acc_personalized": float(acc_personalized),
-        "balanced_acc_global": float(balanced_acc_global),
-        "balanced_acc_personalized": float(balanced_acc_personalized),
-        "class_acc_global": class_acc_global,
-        "class_acc_personalized": class_acc_personalized,
-        "avg_confidence_global": float(avg_confidence_global),
-        "avg_confidence_personalized": float(avg_confidence_personalized),
-        "predictions": {
-            "labels": all_labels,
-            "global_preds": all_global_preds,
-            "personalized_preds": all_personalized_preds
-        },
-        "loss": avg_loss if criterion is not None else 0
+    # Calculate average
+    balanced_acc = balanced_acc / valid_classes if valid_classes > 0 else 0.0
+    
+    # Calculate average loss if criterion was provided
+    avg_loss = test_loss / len(test_loader) if criterion is not None else None
+    
+    # Calculate confidence metrics
+    avg_confidence = np.mean(confidences) if confidences else 0.0
+    confidence_variance = np.var(confidences) if len(confidences) > 1 else 0.0
+    
+    # Log results - fix the f-string format issue
+    if criterion is not None:
+        logger.info(f'Global Model Accuracy: {acc_global:.2f}% | Loss: {avg_loss:.4f}')
+    else:
+        logger.info(f'Global Model Accuracy: {acc_global:.2f}%')
+        
+    # Return all metrics in a dictionary
+    metrics = {
+        'acc': acc_global / 100.0,  # Return as fraction for easier processing
+        'balanced_acc': balanced_acc / 100.0,
+        'per_class_acc': {k: v / 100.0 for k, v in per_class_acc.items()},
+        'avg_confidence': avg_confidence,
+        'confidence_var': confidence_variance,
+        'evaluated_samples': total
     }
+    
+    # Add loss to metrics if calculated
+    if avg_loss is not None:
+        metrics['loss'] = avg_loss
+        
+    return metrics
 
 
 def evaluate_personalized_clients(trainer, testloader, device, num_clients=None):
@@ -332,143 +295,134 @@ def track_trust_scores(trainer, num_clients=None):
     return stats
 
 
-def evaluate_personalization_benefits(args, model, testloader, device, max_samples=1000, criterion=None):
-    """Evaluate benefits of personalization compared to global model"""
-    if not hasattr(model, 'personalized_head') and not hasattr(model, 'use_personalized_head'):
-        return {"bop": 0.0, "class_bop": {}}
+def evaluate_personalization_benefits(args, model, test_loader, device, criterion=None):
+    """Evaluate the benefits of personalization compared to global model"""
+    if not (hasattr(model, 'enable_personalized_mode') and hasattr(model, 'disable_personalized_mode')):
+        return {
+            "bop": 0.0,
+            "global_acc": 0.0,
+            "personalized_acc": 0.0,
+            "acc_global": 0.0,
+            "acc_personalized": 0.0
+        }
     
+    # Setup
     model.eval()
-    
-    # Set lower batch size to avoid OOM
-    reduced_batch_size = 32
-    
-    # Limit the total samples to evaluate to avoid OOM
-    sample_count = 0
-    max_samples = min(max_samples, len(testloader.dataset))
-    
-    # Copy model for global evaluation
-    global_model = copy.deepcopy(model)
-    if hasattr(global_model, 'use_personalized_head'):
-        global_model.use_personalized_head = False
-    
-    # Move models to device
-    global_model = global_model.to(device)
-    model = model.to(device)
-    
-    # Make sure personalized head is used for personalized evaluation
-    if hasattr(model, 'use_personalized_head'):
-        model.use_personalized_head = True
-    
-    # Clear cache to free memory
-    torch.cuda.empty_cache()
-    
-    correct_global = 0
-    correct_personalized = 0
+    global_loss, personalized_loss = 0.0, 0.0
+    global_correct, personalized_correct = 0, 0
+    global_preds, personalized_preds, all_labels = [], [], []
     total = 0
     
-    # For loss calculation
-    global_loss = 0
-    personalized_loss = 0
+    # Limit samples to avoid OOM
+    max_samples = getattr(args.trainer.eval, 'max_samples', 500)
     
-    # Track per-class performance
+    # Evaluate global model first
+    model.disable_personalized_mode()
+    
+    # Prepare class accuracy tracking
     class_correct_global = defaultdict(int)
     class_correct_personalized = defaultdict(int)
     class_total = defaultdict(int)
     
+    # Track confidences
+    global_confs, personalized_confs = [], []
+    
     with torch.no_grad():
-        for images, labels in testloader:
-            # Check if we've processed enough samples
-            if sample_count >= max_samples:
+        for batch_idx, (inputs, targets) in enumerate(test_loader):
+            # Limit evaluation samples
+            if total >= max_samples:
                 break
                 
-            # Process in smaller chunks to avoid OOM
-            for i in range(0, len(images), reduced_batch_size):
-                batch_images = images[i:i+reduced_batch_size].to(device)
-                batch_labels = labels[i:i+reduced_batch_size].to(device)
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            # Global model evaluation
+            model.disable_personalized_mode()
+            outputs_global = model(inputs)
+            if isinstance(outputs_global, dict):
+                outputs_global = outputs_global.get('logit', outputs_global.get('global_logit', list(outputs_global.values())[0]))
+            
+            # Calculate loss if criterion provided
+            if criterion is not None:
+                loss = criterion(outputs_global, targets)
+                global_loss += loss.item()
                 
-                # Global model evaluation
-                global_output = global_model(batch_images)
-                if isinstance(global_output, dict):
-                    global_logits = global_output["logit"] if "logit" in global_output else global_output["global_logit"]
-                else:
-                    global_logits = global_output
+            # Global model predictions
+            global_probs = F.softmax(outputs_global, dim=1)
+            global_conf, global_pred = torch.max(global_probs, 1)
+            global_correct += global_pred.eq(targets).sum().item()
+            global_confs.extend(global_conf.cpu().numpy())
+            global_preds.extend(global_pred.cpu().numpy())
+            
+            # Personalized model evaluation
+            model.enable_personalized_mode()
+            outputs_personalized = model(inputs)
+            if isinstance(outputs_personalized, dict):
+                outputs_personalized = outputs_personalized.get('logit', outputs_personalized.get('personalized_logit', list(outputs_personalized.values())[0]))
+            
+            # Calculate loss if criterion provided
+            if criterion is not None:
+                loss = criterion(outputs_personalized, targets)
+                personalized_loss += loss.item()
                 
-                # Personalized model evaluation
-                personalized_output = model(batch_images)
-                if isinstance(personalized_output, dict):
-                    personalized_logits = personalized_output["logit"] if "logit" in personalized_output else personalized_output["personalized_logit"]
-                else:
-                    personalized_logits = personalized_output
+            # Personalized model predictions
+            pers_probs = F.softmax(outputs_personalized, dim=1)
+            pers_conf, pers_pred = torch.max(pers_probs, 1)
+            personalized_correct += pers_pred.eq(targets).sum().item()
+            personalized_confs.extend(pers_conf.cpu().numpy())
+            personalized_preds.extend(pers_pred.cpu().numpy())
+            
+            # Track labels for later analysis
+            all_labels.extend(targets.cpu().numpy())
+            total += targets.size(0)
+            
+            # Track class-wise accuracy
+            for label in torch.unique(targets):
+                label_idx = (targets == label)
+                label_val = label.item()
                 
-                # Calculate prediction accuracy
-                _, global_predicted = torch.max(global_logits, 1)
-                _, personalized_predicted = torch.max(personalized_logits, 1)
-                
-                batch_size = batch_labels.size(0)
-                total += batch_size
-                sample_count += batch_size
-                
-                global_correct = (global_predicted == batch_labels).float()
-                personalized_correct = (personalized_predicted == batch_labels).float()
-                
-                correct_global += global_correct.sum().item()
-                correct_personalized += personalized_correct.sum().item()
-                
-                # Calculate loss if criterion is provided
-                if criterion is not None:
-                    global_loss += criterion(global_logits, batch_labels).item()
-                    personalized_loss += criterion(personalized_logits, batch_labels).item()
-                
-                # Track per-class accuracy
-                for i, label in enumerate(batch_labels):
-                    label_item = label.item()
-                    class_total[label_item] += 1
-                    class_correct_global[label_item] += global_correct[i].item()
-                    class_correct_personalized[label_item] += personalized_correct[i].item()
-                
-                # Clear intermediate tensors to free memory
-                del batch_images, batch_labels, global_output, personalized_output
-                del global_logits, personalized_logits, global_predicted, personalized_predicted
-                torch.cuda.empty_cache()
+                class_total[label_val] += label_idx.sum().item()
+                class_correct_global[label_val] += ((global_pred == targets) & label_idx).sum().item()
+                class_correct_personalized[label_val] += ((pers_pred == targets) & label_idx).sum().item()
     
-    # Calculate overall accuracy
-    global_acc = 100 * correct_global / total if total > 0 else 0
-    personalized_acc = 100 * correct_personalized / total if total > 0 else 0
-    benefit_of_personalization = personalized_acc - global_acc
+    # Calculate final metrics
+    global_acc = global_correct / total if total > 0 else 0.0
+    personalized_acc = personalized_correct / total if total > 0 else 0.0
     
-    # Calculate loss
-    avg_global_loss = global_loss / (len(testloader) if len(testloader) > 0 else 1)
-    avg_personalized_loss = personalized_loss / (len(testloader) if len(testloader) > 0 else 1)
+    # Calculate average loss if criterion was provided
+    avg_global_loss = global_loss / len(test_loader) if criterion is not None else None
+    avg_personalized_loss = personalized_loss / len(test_loader) if criterion is not None else None
     
-    # Calculate per-class benefits
+    # Calculate per-class accuracies and benefit of personalization
     class_bop = {}
-    min_class_bop = 0
+    for cls in class_total:
+        if class_total[cls] > 0:
+            global_cls_acc = class_correct_global[cls] / class_total[cls]
+            pers_cls_acc = class_correct_personalized[cls] / class_total[cls]
+            class_bop[cls] = max(0, pers_cls_acc - global_cls_acc)  # BOP can't be negative
     
-    for class_idx in range(len(class_total)):
-        if class_total[class_idx] > 0:
-            global_class_acc = 100 * class_correct_global[class_idx] / class_total[class_idx]
-            personalized_class_acc = 100 * class_correct_personalized[class_idx] / class_total[class_idx]
-            class_bop[class_idx] = personalized_class_acc - global_class_acc
-            min_class_bop = min(min_class_bop, class_bop[class_idx])
+    # Benefit of personalization (improvement in accuracy)
+    bop = max(0, personalized_acc - global_acc)
     
-    # Print accuracy, loss and benefit of personalization
-    logger.info(f"Global Model Accuracy: {global_acc:.4f}%, Personalized Model Accuracy: {personalized_acc:.4f}%")
+    # Log results with proper formatting
     if criterion is not None:
-        logger.info(f"Global Loss: {avg_global_loss:.4f}, Personalized Loss: {avg_personalized_loss:.4f}")
-    logger.info(f"Min Class BoP: {min_class_bop:.4f} (worst performing class)")
+        logger.info(f'Global Model Acc: {global_acc*100:.2f}% | Loss: {avg_global_loss:.4f}')
+        logger.info(f'Personalized Model Acc: {personalized_acc*100:.2f}% | Loss: {avg_personalized_loss:.4f}')
+    else:
+        logger.info(f'Global Model Acc: {global_acc*100:.2f}%')
+        logger.info(f'Personalized Model Acc: {personalized_acc*100:.2f}%')
     
-    # Clean up to free memory
-    del global_model
+    logger.info(f'Benefit of Personalization: {bop*100:.2f}%')
+    
+    # Clear GPU memory
     torch.cuda.empty_cache()
     
     return {
-        "bop": benefit_of_personalization,
+        "bop": bop,
         "global_acc": global_acc,
-        "acc_global": global_acc,  # Add alias for backward compatibility
         "personalized_acc": personalized_acc,
-        "acc_personalized": personalized_acc,  # Add alias for backward compatibility
+        "acc_global": global_acc,
+        "acc_personalized": personalized_acc,
         "class_bop": class_bop,
-        "min_class_bop": min_class_bop,
-        "global_loss": avg_global_loss if criterion is not None else 0,
-        "personalized_loss": avg_personalized_loss if criterion is not None else 0
+        "global_loss": avg_global_loss if criterion is not None else None,
+        "personalized_loss": avg_personalized_loss if criterion is not None else None
     }

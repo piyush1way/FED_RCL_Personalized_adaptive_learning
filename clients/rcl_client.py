@@ -12,6 +12,7 @@ import logging
 from utils import *
 from utils.loss import KL_u_p_loss, RelaxedContrastiveLoss
 from utils.metrics import evaluate
+from utils.helper import setup_adaptive_learning_rate
 from models import build_encoder
 from utils.logging_utils import AverageMeter
 from clients.build import CLIENT_REGISTRY
@@ -24,6 +25,7 @@ class RCLClient(Client):
     def __init__(self, args, client_index, model):
         self.args = args
         self.client_index = client_index
+        self.client_id = client_index  # client_id for logging purposes
         self.loader = None
         self.use_amp = getattr(args, 'use_amp', False)
 
@@ -52,6 +54,12 @@ class RCLClient(Client):
         self.base_lr = getattr(args.client, "base_lr", 0.001)
         self.max_lr = getattr(args.client, "max_lr", 0.1)
         self.step_size = getattr(args.client, "step_size", 10)
+        self.local_lr = getattr(args.client, "local_lr", 0.01)  # Default local learning rate
+        self.local_lr_type = getattr(args.client, "lr_type", "fixed")  # Type of learning rate schedule
+        self.momentum = getattr(args.client, "momentum", 0.9)  # Momentum for SGD
+        self.weight_decay = getattr(args.client, "weight_decay", 1e-5)  # Weight decay for optimizer
+        self.max_epochs = getattr(args.trainer, "global_rounds", 100)  # Max epochs for LR scheduling
+        self.enable_adaptive_lr = getattr(args.client, "adaptive_lr", True)  # Enable adaptive LR based on trust
         
         # Regularization options
         self.enable_fedprox = getattr(args.client, "fedprox", True)
@@ -110,6 +118,7 @@ class RCLClient(Client):
         self.device = device
         self.rounds_trained += 1
         self.trainer = trainer  # Store trainer reference
+        self.local_lr = local_lr  # Store the local_lr parameter
         
         # Initialize models if None
         if self.model is None and hasattr(trainer, 'model'):

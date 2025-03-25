@@ -48,6 +48,7 @@ class RCLClient(Client):
 
         # Trust-based adaptive learning rate
         self.enable_cyclical_lr = getattr(args.client, "cyclical_lr", True)
+        self.enable_trust_lr = getattr(args.client, "trust_lr", False)
         self.base_lr = getattr(args.client, "base_lr", 0.001)
         self.max_lr = getattr(args.client, "max_lr", 0.1)
         self.step_size = getattr(args.client, "step_size", 10)
@@ -686,18 +687,30 @@ class RCLClient(Client):
         self.model.train()
         
         # Setup cyclical learning rate if enabled
-        if self.enable_cyclic_lr:
-            self.setup_cyclic_lr(epoch)
+        if hasattr(self, 'enable_cyclical_lr') and self.enable_cyclical_lr:
+            if hasattr(self, 'setup_cyclical_lr'):
+                self.setup_cyclical_lr(epoch)
+            else:
+                logger.warning(f"Client {self.client_index}: setup_cyclical_lr method not found")
             
         # Setup trust-based learning rate if enabled
-        if self.enable_trust_lr and hasattr(self, 'trust_score'):
-            self.setup_trust_lr(self.trust_score)
+        if hasattr(self, 'enable_trust_lr') and self.enable_trust_lr and hasattr(self, 'trust_score'):
+            if hasattr(self, 'setup_trust_lr'):
+                self.setup_trust_lr(self.trust_score)
+            else:
+                logger.warning(f"Client {self.client_index}: setup_trust_lr method not found")
+        
+        # Check if we have local_epochs defined, otherwise use default
+        local_epochs = getattr(self, 'local_epochs', 1)
+        if local_epochs <= 0:
+            local_epochs = 1
+            logger.warning(f"Client {self.client_index}: Invalid local_epochs value, using default (1)")
             
         # Track batches processed
         batches_processed = 0
             
         # Train for local epochs
-        for local_epoch in range(self.local_epochs):
+        for local_epoch in range(local_epochs):
             batch_loss = []
             
             # Track labels seen this epoch for contrastive learning
@@ -858,8 +871,8 @@ class RCLClient(Client):
             metrics['trust_score'] = self.compute_trust_score()
         
         # Log final epoch metrics
-        metrics['loss'] /= self.local_epochs
-        metrics['acc'] /= self.local_epochs
+        metrics['loss'] /= local_epochs
+        metrics['acc'] /= local_epochs
         metrics['trust_score'] = self.compute_trust_score()
         
         # Create state_dict dictionary to return - only include non-personalized parameters
@@ -964,4 +977,105 @@ class RCLClient(Client):
             else:
                 # Return empty tensor as last resort
                 return torch.zeros((images.size(0), 128), device=self.device)
+
+    def setup_cyclical_lr(self, epoch):
+        """Setup cyclical learning rate for the current epoch"""
+        if not hasattr(self, 'optimizer'):
+            logger.warning(f"Client {self.client_index}: Cannot setup cyclical LR without optimizer")
+            return
+            
+        try:
+            # Get trust score history for smoother adaptation
+            trust_history = self.trust_score_history[-5:] if hasattr(self, 'trust_score_history') and self.trust_score_history else [0.8]
+            
+            # Calculate moving average of trust scores for stability
+            trust_avg = float(sum(trust_history)) / float(len(trust_history))
+            
+            # Cyclical component: sine wave with period of 2*step_size
+            cycle_position = self.rounds_trained % (2 * self.step_size)
+            cycle_ratio = cycle_position / self.step_size
+            
+            if cycle_position < self.step_size:
+                # Increasing phase
+                cycle_factor = 0.5 * (1 + np.sin(np.pi * (cycle_ratio - 0.5)))
+            else:
+                # Decreasing phase
+                cycle_factor = 0.5 * (1 + np.sin(np.pi * (cycle_ratio + 0.5)))
+            
+            # Adaptive learning rate range based on trust
+            # Higher trust → wider LR range (more exploration)
+            # Lower trust → narrower LR range (more conservative)
+            trust_adjusted_max_lr = self.base_lr + (self.max_lr - self.base_lr) * trust_avg
+            
+            # Apply cycle to the trust-adjusted range
+            current_lr = self.base_lr + (trust_adjusted_max_lr - self.base_lr) * cycle_factor
+            
+            # Add warmup phase for first few rounds
+            if self.rounds_trained <= 3:
+                warmup_factor = min(1.0, self.rounds_trained / 3)
+                current_lr = self.base_lr + (current_lr - self.base_lr) * warmup_factor
+            
+            # Set learning rate in optimizer
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = current_lr
+                
+            logger.info(f"[C{self.client_index}] Trust-based Cyclical LR: {current_lr:.6f} (trust={trust_avg:.3f}, cycle={cycle_factor:.2f})")
+        except Exception as e:
+            logger.error(f"Error setting up cyclical LR: {str(e)}")
+            # Fallback to base learning rate
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.base_lr
+            
+    def setup_trust_lr(self, trust_score):
+        """Setup trust-based learning rate"""
+        if not hasattr(self, 'optimizer'):
+            logger.warning(f"Client {self.client_index}: Cannot setup trust LR without optimizer")
+            return
+            
+        try:
+            # Scale learning rate based on trust score
+            # Higher trust means higher learning rate (more aggressive updates)
+            # Lower trust means lower learning rate (more conservative updates)
+            trust_factor = max(0.5, min(1.5, trust_score * 2))
+            current_lr = self.base_lr * trust_factor
+            
+            # Set learning rate in optimizer
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = current_lr
+                
+            logger.info(f"[C{self.client_index}] Trust-based LR: {current_lr:.6f} (trust={trust_score:.3f})")
+        except Exception as e:
+            logger.error(f"Error setting up trust LR: {str(e)}")
+            # Fallback to base learning rate
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.base_lr
+
+    def setup_optimizer(self):
+        """Initialize the optimizer if it doesn't exist"""
+        if hasattr(self, 'model') and self.model is not None:
+            # Default optimizer parameters
+            lr = getattr(self, 'base_lr', 0.01)
+            weight_decay = 1e-5
+            momentum = 0.9
+            
+            try:
+                self.optimizer = torch.optim.SGD(
+                    self.model.parameters(),
+                    lr=lr,
+                    momentum=momentum,
+                    weight_decay=weight_decay
+                )
+                logger.info(f"Client {self.client_index}: Initialized optimizer with lr={lr}")
+            except Exception as e:
+                logger.error(f"Error initializing optimizer: {str(e)}")
+                # Try simpler optimizer as fallback
+                try:
+                    self.optimizer = torch.optim.SGD(
+                        self.model.parameters(),
+                        lr=lr
+                    )
+                except Exception as nested_e:
+                    logger.error(f"Failed to initialize fallback optimizer: {str(nested_e)}")
+        else:
+            logger.error(f"Client {self.client_index}: Cannot setup optimizer without model")
 

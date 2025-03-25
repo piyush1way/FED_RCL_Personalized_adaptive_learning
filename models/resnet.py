@@ -514,11 +514,13 @@ class ResNet(nn.Module):
         out = F.adaptive_avg_pool2d(out, 1)
         features = out.view(out.size(0), -1)
         
-        features_normalized = F.normalize(features, p=2, dim=1) if self.l2_norm else features
+        # Apply L2 normalization to features for more stable representation
+        features_normalized = F.normalize(features, p=2, dim=1)
         
+        projection_features = None
         if get_projection:
             projection_features = self.projection_head(features)
-            results["projection"] = F.normalize(projection_features, p=2, dim=1)
+            projection_features = F.normalize(projection_features, p=2, dim=1)
         
         if get_multi_level:
             results['multi_level_projections'] = {
@@ -526,8 +528,9 @@ class ResNet(nn.Module):
                 for layer_name in ['layer1', 'layer2', 'layer3']
             }
         
+        # Apply personalized features with normalized features for more stable learning
         global_logit = self.fc(features)
-        personalized_logit = self.personalized_head(features)
+        personalized_logit = self.personalized_head(features_normalized)
         default_logit = personalized_logit if self.use_personalized_head else global_logit
         
         results.update({
@@ -540,6 +543,9 @@ class ResNet(nn.Module):
             "temperature": self.temperature,
             "trust_score": self.trust_score
         })
+        
+        if projection_features is not None:
+            results["projection"] = projection_features
         
         if return_feature:
             return results, {"pooled": features}

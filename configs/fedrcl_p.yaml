@@ -1,22 +1,22 @@
-# fedrcl_p.yaml
+# fedrcl_p.yaml - Optimized for Kaggle GPU
 #################### Default Setup ####################
 wandb: False
-seed: 42  # Changed for better initialization
+seed: 42  # Fixed seed for reproducibility
 enable_benchmark: True
-use_amp: True
-multiprocessing: False
+use_amp: True  # Use automatic mixed precision for faster training
+multiprocessing: False  # Kaggle has limited CPU cores
 main_gpu: '0'
-num_workers: 2
+num_workers: 2  # Limit workers for Kaggle
 pin_memory: True
 refactoring: True
 verbose: False
-remark: "personalized"
+remark: "kaggle"
 
 checkpoint_path: './checkpoints'
-exp_name: "FedRCL-P"
+exp_name: "FedRCL-P-Kaggle"
 output_model_path: 'fedrcl_p_model.pt'
 save_freq: 10
-batch_size: 32  # Reduced from 64 to save memory
+batch_size: 16  # Reduced batch size for Kaggle GPU memory constraints
 save_test: True
 
 ## Resume options
@@ -36,8 +36,8 @@ split:
   overlap_ratio: 0.0
   create_client_dataset: False
   share_balanced_subset: true  # Share balanced data across clients
-  samples_per_class: 20  # Reduced from 50 to save memory
-  samples_per_client: 10  # Reduced from 20 to save memory
+  samples_per_class: 10  # Reduced from 20 for Kaggle memory constraints
+  samples_per_client: 5  # Reduced from 10 for Kaggle memory constraints
 
 #################### Optimizer ####################
 optimizer:
@@ -48,8 +48,8 @@ optimizer:
 #################### Eval ####################
 eval:
   freq: 5  # Evaluate every 5 rounds
-  batch_size: 32  # Reduced from 128 to save memory
-  max_samples: 1000  # Limit evaluation to 1000 samples to save memory
+  batch_size: 16  # Reduced from 32 for Kaggle GPU memory
+  max_samples: 500  # Further limit evaluation to 500 samples for Kaggle speed
 
 #################### Trust-Based Client Filtering ####################
 trust_filtering:
@@ -61,33 +61,36 @@ trust_filtering:
 #################### Personalization Settings ####################
 personalization:
   enable: true
-  layers: 1  # Reduced from 2 to 1 personalized layer to save memory and improve stability
+  layers: 1  # Single personalized layer for memory efficiency
   knowledge_distillation: true
-  kd_temperature: 2.0  # Reduced from 3.0 to 2.0 for better calibration
+  kd_temperature: 2.0
 
 #################### Adaptive Learning Rate ####################
 adaptive_lr:
   enable: true
-  base_lr: 0.01  # Increased from 0.001 to 0.01 for faster initial learning
-  max_lr: 0.05  # Reduced from 0.1 to 0.05 for more stability
+  base_lr: 0.01
+  max_lr: 0.05
 
 #################### Multi-Level Contrastive Learning ####################
 contrastive:
   multi_level: true
-  layer_weights: [0.2, 0.2, 0.3, 0.3]  # Simplified and reduced weight layers
+  layer_weights: [0.3, 0.3, 0.4]  # Simplified weights for efficiency
 
 #################### Memory Management ####################
 memory:
-  max_split_size_mb: 256  # Set PyTorch CUDA memory split size to avoid fragmentation
-  empty_cache_freq: 5  # Empty CUDA cache every 5 rounds to prevent OOM
+  max_split_size_mb: 128  # Reduced from 256 for Kaggle
+  empty_cache_freq: 1  # Empty CUDA cache every round for Kaggle
+  gc_freq: 1  # Run garbage collection every round
 
 #################### Training Settings ####################
 trainer:
-  global_rounds: 200  # Total rounds of training
-  local_epochs: 3  # Epochs per round (reduced from 5 to save computation)
-  min_clients_per_round: 3  # Ensure at least 3 clients participate
+  global_rounds: 100  # Reduced from 200 for Kaggle time constraints
+  local_epochs: 1  # Reduced from 3 for Kaggle time constraints
+  min_clients_per_round: 2  # Reduced min clients for faster iterations
   participation_rate: 0.03  # Fraction of clients to select per round
-  num_clients: 100  # Total number of clients
+  num_clients: 20  # Reduced from 100 for Kaggle memory constraints
+  eval_every: 5  # Evaluate every 5 rounds
+  local_lr: 0.01
 
 #################### Analysis Settings ####################
 analysis: True  # Enable analysis to track personalization benefits
@@ -96,8 +99,8 @@ analysis: True  # Enable analysis to track personalization benefits
 defaults:
   - _self_
   - trainer: personalized
-  - client: personalized
+  - client: fedrcl
   - evaler: base
-  - dataset: cifar10  # Changed to CIFAR-10 to match error message
+  - dataset: cifar10  # Using CIFAR-10 dataset
   - server: personalized
   - model: personalized_resnet18

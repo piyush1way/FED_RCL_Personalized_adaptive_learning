@@ -4,6 +4,7 @@ import time
 import json
 import numpy as np
 import copy
+import gc
 
 import torch
 from torch.utils.data import DataLoader
@@ -36,7 +37,9 @@ def main(args: DictConfig) -> None:
     # Configure CUDA memory management to avoid fragmentation
     if torch.cuda.is_available():
         try:
+            # Clear CUDA cache and collect garbage
             torch.cuda.empty_cache()
+            gc.collect()
             torch.cuda.ipc_collect()
             
             # Apply memory split size if specified in config
@@ -44,11 +47,19 @@ def main(args: DictConfig) -> None:
                 torch.backends.cuda.max_split_size_mb = args.memory.max_split_size_mb
                 logger.info(f"Set CUDA max_split_size_mb to {args.memory.max_split_size_mb}")
             else:
-                # Default to 256MB if not specified
-                torch.backends.cuda.max_split_size_mb = 256
-                logger.info("Set CUDA max_split_size_mb to default (256MB)")
+                # Default to 128MB for Kaggle
+                torch.backends.cuda.max_split_size_mb = 128
+                logger.info("Set CUDA max_split_size_mb to default (128MB) for Kaggle")
                 
+            # Set other performance options
+            torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for faster computation
+            torch.backends.cudnn.allow_tf32 = True
+            
             device = torch.device("cuda:0")
+            # Print GPU info for debugging
+            logger.info(f"CUDA Device: {torch.cuda.get_device_name(0)}")
+            logger.info(f"CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+            logger.info(f"CUDA Capability: {torch.cuda.get_device_capability()}")
         except Exception as e:
             logger.warning(f"CUDA initialization failed: {e}. Falling back to CPU.")
             device = torch.device("cpu")
@@ -170,13 +181,36 @@ def main(args: DictConfig) -> None:
     }
 
     try:
+        # Run garbage collection before training
+        gc.collect()
+        
         # Train the model
         trained_model, metrics = trainer.train()
         if metrics:
             training_metrics.update(metrics)
     except RuntimeError as e:
         logger.error(f"Training Failed: {e}")
-        raise e
+        # Try to recover from CUDA OOM by clearing cache
+        if 'CUDA out of memory' in str(e):
+            logger.warning("CUDA OOM detected - attempting recovery")
+            torch.cuda.empty_cache()
+            gc.collect()
+            # Try to continue with reduced batch size if possible
+            if hasattr(args, 'batch_size') and args.batch_size > 8:
+                args.batch_size = args.batch_size // 2
+                logger.info(f"Reduced batch size to {args.batch_size}")
+                # Try one more time
+                try:
+                    trained_model, metrics = trainer.train()
+                    if metrics:
+                        training_metrics.update(metrics)
+                except Exception as retry_e:
+                    logger.error(f"Retry failed: {retry_e}")
+                    raise retry_e
+            else:
+                raise e
+        else:
+            raise e
     
     logger.info("Training completed. Running final evaluation...")
     final_results = trainer.evaluate(round_idx=args.trainer.global_rounds-1)

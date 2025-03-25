@@ -108,9 +108,14 @@ class Server:
             trusted_weights = {}
             trusted_stats = {}
             
+            # Calculate average trust score for reference
+            all_trust_scores = [stats.get('trust_score', 0.5) for client_id, stats in client_stats.items() 
+                               if client_id in client_models]
+            avg_trust_score = sum(all_trust_scores) / len(all_trust_scores) if all_trust_scores else 0.5
+            
             for client_id, stats in client_stats.items():
                 if client_id in client_models:
-                    trust_score = stats.get('trust_score', 1.0)
+                    trust_score = stats.get('trust_score', 0.5)
                     self.trust_scores[client_id] = trust_score
                     
                     # Track client trust history
@@ -120,14 +125,27 @@ class Server:
                     if len(self.client_history[client_id]) > 10:
                         self.client_history[client_id].pop(0)
                     
+                    # Dynamic trust threshold based on average score
+                    dynamic_threshold = max(0.3, min(0.7, avg_trust_score * 0.8))
+                    
                     # Apply soft or hard filtering based on configuration
                     if self.soft_filtering:
                         # Soft filtering: use client with adjusted weight based on trust
                         trusted_clients[client_id] = client_models[client_id]
+                        
                         if client_weights:
-                            trusted_weights[client_id] = client_weights.get(client_id, 1.0) * max(0.2, trust_score)
+                            base_weight = client_weights.get(client_id, 1.0)
+                            # Sigmoid function to make weights more representative of trust differences
+                            # This creates more separation between high and low trust clients
+                            trust_factor = 1.0 / (1.0 + np.exp(-10 * (trust_score - dynamic_threshold)))
+                            adjusted_weight = base_weight * max(0.2, trust_factor)
+                            trusted_weights[client_id] = adjusted_weight
+                            
+                            # Log significant weight adjustments
+                            if trust_factor < 0.5:
+                                logger.info(f"Client {client_id} weight reduced to {trust_factor:.2f} (trust={trust_score:.3f}, threshold={dynamic_threshold:.3f})")
+                        
                         trusted_stats[client_id] = stats
-                        logger.info(f"Client {client_id} weighted by trust score {trust_score:.4f}")
                     else:
                         # Hard filtering: only include clients above threshold
                         if trust_score >= self.trust_threshold:
@@ -138,6 +156,10 @@ class Server:
                             logger.info(f"Client {client_id} trusted with score {trust_score:.4f}")
                         else:
                             logger.info(f"Client {client_id} filtered out with score {trust_score:.4f}")
+            
+            # Log trust distribution statistics
+            if all_trust_scores:
+                logger.info(f"Trust scores - Avg: {avg_trust_score:.3f}, Min: {min(all_trust_scores):.3f}, Max: {max(all_trust_scores):.3f}")
             
             # Ensure minimum number of clients for aggregation
             if len(trusted_clients) < self.min_trusted_clients:
@@ -159,6 +181,10 @@ class Server:
                             trusted_stats[cid] = client_stats[cid]
                 
                 logger.warning(f"Only {len(trusted_clients)-self.min_trusted_clients} trusted clients (min: {self.min_trusted_clients}). Added additional clients.")
+            
+            # Log participation statistics
+            participation_rate = len(trusted_clients) / len(client_models) if client_models else 0
+            logger.info(f"Client participation: {len(trusted_clients)}/{len(client_models)} ({participation_rate:.2%})")
             
             client_models = trusted_clients
             if client_weights:

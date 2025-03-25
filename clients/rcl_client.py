@@ -791,21 +791,29 @@ class RCLClient(Client):
                             for i in range(0, len(images), chunk_size):
                                 # Extract features for this chunk
                                 with torch.cuda.amp.autocast(enabled=self.use_amp):
-                                    chunk_features = self.extract_features_safely(images[i:i+chunk_size])
-                                features_list.append(chunk_features)
+                                    chunk_features = self.model(images[i:i+chunk_size])
+                                    if isinstance(chunk_features, dict) and "feature" in chunk_features:
+                                        chunk_proj = self.model.projection_head(chunk_features["feature"])
+                                        features_list.append(chunk_proj)
                                 # Clear cache after each chunk
                                 torch.cuda.empty_cache()
                             
-                            proj_features = torch.cat(features_list)
+                            if features_list:
+                                proj_features = torch.cat(features_list)
+                            else:
+                                proj_features = None
                         else:
-                            # Regular feature extraction
-                            with torch.cuda.amp.autocast(enabled=self.use_amp):
-                                proj_features = self.extract_features_safely(images)
+                            # Regular feature extraction - directly use the model output
+                            outputs = self.model(images)
+                            if isinstance(outputs, dict) and "feature" in outputs:
+                                proj_features = self.model.projection_head(outputs["feature"])
+                            else:
+                                proj_features = None
                     else:
                         proj_features = None
                         
                 except Exception as e:
-                    logger.error(f"Error in feature extraction: {e}")
+                    logger.error(f"Error in feature extraction: {str(e)}")
                     # Skip contrastive loss if feature extraction fails
                     proj_features = None
                 
@@ -837,9 +845,13 @@ class RCLClient(Client):
                 
                 # 4. Contrastive loss for feature alignment
                 if proj_features is not None:
-                    contrastive_loss = self.calculate_contrastive_loss(proj_features, labels)
+                    try:
+                        contrastive_loss = self.calculate_contrastive_loss(proj_features, labels)
+                    except Exception as e:
+                        logger.error(f"Error calculating contrastive loss: {str(e)}")
+                        contrastive_loss = torch.tensor(0.0, device=self.device)
                 else:
-                    contrastive_loss = torch.tensor(0.0).to(self.device)
+                    contrastive_loss = torch.tensor(0.0, device=self.device)
                 
                 # Combine losses with dynamic weighting
                 trust_score = getattr(self.model, 'trust_score', 0.8)  # Default to 0.8 if not set
@@ -938,38 +950,24 @@ class RCLClient(Client):
             self.model.eval()  # Temporarily set to eval mode for feature extraction
             
             with torch.no_grad():  # No gradients needed for feature extraction
-                # Use a dedicated forward hook to get intermediate features
-                features = None
-                
-                def hook_fn(module, input, output):
-                    nonlocal features
-                    features = output.detach()
-                
-                # Register hook on the feature extractor layer (adjust depending on your model)
-                if hasattr(self.model, 'layer4'):
-                    hook = self.model.layer4.register_forward_hook(hook_fn)
-                elif hasattr(self.model, 'features'):
-                    hook = self.model.features.register_forward_hook(hook_fn)
+                # Direct feature extraction through forward pass
+                outputs = self.model(images)
+                if isinstance(outputs, dict) and "feature" in outputs:
+                    features = outputs["feature"]
+                    
+                    # Apply projection if available
+                    if hasattr(self.model, 'projection_head') and self.model.projection_head is not None:
+                        features = self.model.projection_head(features)
                 else:
-                    # Fallback to using the get_contrastive_features method
+                    # Fallback to get_contrastive_features if it exists
                     self.model.train()  # Restore train mode
                     return self.model.get_contrastive_features(images)
-                
-                # Just do a forward pass to trigger the hook
-                _ = self.model(images)
-                
-                # Remove the hook
-                hook.remove()
-                
-                # Apply projection if available
-                if hasattr(self.model, 'projection_head') and self.model.projection_head is not None:
-                    features = self.model.projection_head(features)
             
             self.model.train()  # Restore train mode
             return features
             
         except Exception as e:
-            logger.error(f"Error in safe feature extraction: {e}")
+            logger.error(f"Error in safe feature extraction: {str(e)}")
             self.model.train()  # Make sure to restore train mode
             # Fallback to original method if available
             if hasattr(self.model, 'get_contrastive_features'):

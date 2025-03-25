@@ -9,6 +9,7 @@ from utils.metrics import evaluate, track_trust_scores, evaluate_personalization
 from utils.helper import save_dict_to_json, setup_adaptive_learning_rate
 import os
 import time
+from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
 
@@ -180,11 +181,25 @@ class PersonalizedTrainer(BaseTrainer):
         else:
             return super().select_clients(round_idx)
     
-    def save_model(self, filename):
+    def save_model(self, suffix=None):
         """Save model checkpoint with training metadata"""
         try:
+            if suffix is None:
+                suffix = "final"
+            
+            # Ensure we have a log_dir
+            if not hasattr(self.args, 'log_dir'):
+                self.args.log_dir = './checkpoints'
+                os.makedirs(self.args.log_dir, exist_ok=True)
+            
+            # Create filename from suffix
+            filename = f"{suffix}.pt"
             save_path = os.path.join(self.args.log_dir, filename)
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            
+            # Check for global_round attribute
+            if not hasattr(self, 'global_round'):
+                self.global_round = getattr(self, 'current_round', 0)
             
             checkpoint = {
                 'model_state': self.model.state_dict(),
@@ -196,7 +211,7 @@ class PersonalizedTrainer(BaseTrainer):
                 'timestamp': time.strftime("%Y%m%d-%H%M%S")
             }
             
-            if self.personalization_metrics:
+            if hasattr(self, 'personalization_metrics') and self.personalization_metrics:
                 checkpoint['personalization_metrics'] = self.personalization_metrics
             
             torch.save(checkpoint, save_path)
@@ -204,8 +219,8 @@ class PersonalizedTrainer(BaseTrainer):
             
             metadata = {
                 'round': self.global_round,
-                'accuracy': self.best_acc,
-                'personalized_accuracy': self.best_personalized_acc,
+                'accuracy': float(self.best_acc),  # Convert tensors to float for JSON
+                'personalized_accuracy': float(self.best_personalized_acc),
                 'timestamp': checkpoint['timestamp']
             }
             metadata_path = os.path.join(os.path.dirname(save_path), 'model_metadata.json')
@@ -220,7 +235,7 @@ class PersonalizedTrainer(BaseTrainer):
         """Initialize training by setting up models and optimizer"""
         # Set up model and optimizer
         if torch.cuda.is_available():
-            torch.backends.cudnn.benchmark = self.args.enable_benchmark
+            torch.backends.cudnn.benchmark = getattr(self.args, 'enable_benchmark', True)
         
         # Initialize model with personalization support
         if hasattr(self.model, 'enable_personalized_mode') and self.enable_personalization:
@@ -228,8 +243,15 @@ class PersonalizedTrainer(BaseTrainer):
             logger.info("Personalized mode enabled for training")
         
         # Initialize server with the model
-        self.server.setup(self.model)
-        self.global_model = self.server.get_global_model()
+        if self.server and hasattr(self.server, 'setup'):
+            self.server.setup(self.model)
+            self.global_model = self.server.get_global_model() if hasattr(self.server, 'get_global_model') else copy.deepcopy(self.model)
+        else:
+            self.global_model = copy.deepcopy(self.model)
+        
+        # Move models to the right device
+        self.model = self.model.to(self.device)
+        self.global_model = self.global_model.to(self.device)
         
         # Set up evaluation metrics
         self.best_acc = 0.
@@ -238,17 +260,46 @@ class PersonalizedTrainer(BaseTrainer):
         self.round_accs = []
         self.round_personalized_accs = []
         
-        # Initialize client data distribution
-        self.client_data_distributions = self._init_client_data_distribution()
+        # Get important training parameters from config
+        self.num_clients = self.args.trainer.num_clients
+        self.batch_size = getattr(self.args, 'batch_size', 32)
+        self.local_epochs = getattr(self.args.trainer, 'local_epochs', 3)
+        self.local_lr = getattr(self.args.trainer, 'local_lr', 0.01)
         
-        # Create client datasets with additional balanced subset for regularization if enabled
-        if hasattr(self.args.split, 'share_balanced_subset') and self.args.split.share_balanced_subset:
-            self._create_balanced_subset()
+        # Setup trust-based weighting 
+        self.trust_based_weighting = getattr(self.args.client.trust_filtering, 'enable', False) if hasattr(self.args.client, 'trust_filtering') else False
+        
+        # Initialize client data loaders
+        self.trainloaders = {}
+        for client_idx in range(self.num_clients):
+            if client_idx in self.trainset and len(self.trainset[client_idx]) > 0:
+                self.trainloaders[client_idx] = DataLoader(
+                    self.trainset[client_idx],
+                    batch_size=min(self.batch_size, len(self.trainset[client_idx])),
+                    shuffle=True,
+                    num_workers=getattr(self.args, 'num_workers', 2),
+                    pin_memory=getattr(self.args, 'pin_memory', True),
+                    drop_last=False
+                )
+        
+        # Initialize client data distribution information
+        self.client_data_distributions = {}
+        for client_idx in range(self.num_clients):
+            if client_idx in self.trainset:
+                # Count labels in the dataset
+                label_counts = {}
+                for _, label in self.trainset[client_idx]:
+                    label_val = label.item() if hasattr(label, 'item') else label
+                    label_counts[label_val] = label_counts.get(label_val, 0) + 1
+                self.client_data_distributions[client_idx] = {
+                    'total_samples': len(self.trainset[client_idx]),
+                    'label_counts': label_counts
+                }
         
         # Track trust scores if using trust-based client selection
         self.trust_scores = {}
         self.client_performances = {client_idx: {"global_acc": [], "personalized_acc": []} 
-                                   for client_idx in range(self.num_clients)}
+                                  for client_idx in range(self.num_clients)}
 
     def _train_clients(self, selected_clients):
         """Train selected clients and return updated models and metrics"""
@@ -344,11 +395,17 @@ class PersonalizedTrainer(BaseTrainer):
         # Adjust learning rate based on round
         self.current_round = round_idx
         
+        # Ensure we have num_clients defined
+        if not hasattr(self, 'num_clients'):
+            self.num_clients = self.args.trainer.num_clients
+        
         # Perform adaptive layer freezing if enabled
         if self.enable_personalization and hasattr(self.model, 'setup_adaptive_freezing'):
             if self.adaptive_freezing:
+                # Get global rounds from config
+                global_rounds = self.args.trainer.global_rounds
                 # Gradually unfreeze more layers as training progresses
-                freeze_ratio = max(0.0, self.freeze_ratio - (round_idx / (self.global_rounds * 2)))
+                freeze_ratio = max(0.0, self.freeze_ratio - (round_idx / (global_rounds * 2)))
                 self.model.setup_adaptive_freezing(freeze_ratio=freeze_ratio)
                 logger.info(f"Adaptive freezing ratio: {freeze_ratio:.3f}")
         
@@ -388,3 +445,72 @@ class PersonalizedTrainer(BaseTrainer):
             
             # Save metrics
             self._save_metrics(round_idx, metrics)
+
+    def _save_metrics(self, round_idx, metrics):
+        """Save metrics to disk and update histories"""
+        try:
+            # Ensure we have log_dir
+            if not hasattr(self.args, 'log_dir'):
+                self.args.log_dir = './checkpoints'
+                os.makedirs(self.args.log_dir, exist_ok=True)
+            
+            # Initialize tracking dictionaries if they don't exist
+            if not hasattr(self, 'round_accs'):
+                self.round_accs = []
+            if not hasattr(self, 'round_personalized_accs'):
+                self.round_personalized_accs = []
+            if not hasattr(self, 'personalization_metrics'):
+                self.personalization_metrics = {}
+            
+            # Update tracking
+            if 'acc' in metrics:
+                self.round_accs.append(float(metrics['acc']))
+            
+            if 'acc_personalized' in metrics:
+                self.round_personalized_accs.append(float(metrics['acc_personalized']))
+            
+            # Handle saving the metrics files
+            try:
+                # Convert tensors to Python types for JSON serialization
+                clean_metrics = {}
+                for k, v in metrics.items():
+                    if isinstance(v, torch.Tensor):
+                        clean_metrics[k] = v.item() if v.numel() == 1 else v.tolist()
+                    elif isinstance(v, np.ndarray):
+                        clean_metrics[k] = v.item() if v.size == 1 else v.tolist()
+                    elif isinstance(v, dict):
+                        clean_metrics[k] = {
+                            kk: vv.item() if isinstance(vv, torch.Tensor) and vv.numel() == 1 else 
+                               vv.tolist() if isinstance(vv, torch.Tensor) else vv
+                            for kk, vv in v.items()
+                        }
+                    else:
+                        clean_metrics[k] = v
+                
+                # Save to individual round files
+                save_dict_to_json(clean_metrics, os.path.join(self.args.log_dir, f"metrics_round_{round_idx}.json"))
+                
+                # Save history
+                if hasattr(self, 'round_accs') and self.round_accs:
+                    history = {
+                        'global_acc': self.round_accs,
+                        'personalized_acc': self.round_personalized_accs if hasattr(self, 'round_personalized_accs') else []
+                    }
+                    save_dict_to_json(history, os.path.join(self.args.log_dir, "metrics_history.json"))
+                
+                # Save client performance if available
+                if hasattr(self, 'client_performances'):
+                    save_dict_to_json(self.client_performances, os.path.join(self.args.log_dir, "client_performance.json"))
+                
+                # Save personalization metrics if available
+                if 'personalization' in metrics:
+                    self.personalization_metrics[round_idx+1] = metrics['personalization']
+                    save_dict_to_json(self.personalization_metrics, os.path.join(self.args.log_dir, "personalization_metrics.json"))
+                
+            except Exception as e:
+                logger.warning(f"Error saving metrics files: {str(e)}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save metrics: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())

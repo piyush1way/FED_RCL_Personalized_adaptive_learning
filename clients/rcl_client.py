@@ -176,45 +176,56 @@ class RCLClient(Client):
                 if len(images) > 1:
                     self.ewc_batch = (images.to(self.device), labels.to(self.device))
         
-        # Calculate trust score for learning rate adjustment if enabled
+        # Calculate trust score for learning rate adjustment
         trust_score = self.compute_trust_score() if self.enable_trust_filtering else 0.8
         
-        # Setup optimizer with trust-based adaptive learning rate
+        # Enhanced trust-based cyclical learning rate
         if self.enable_cyclical_lr:
-            # Adapt learning rate based on trust score if available
-            if hasattr(self, 'trust_score_history') and len(self.trust_score_history) > 0:
-                # Use trust score to adjust learning rate
-                trust_avg = np.mean(self.trust_score_history[-3:]) if len(self.trust_score_history) >= 3 else trust_score
-                
-                # Base learning rate on trust score - higher trust = higher LR
-                trust_adjusted_lr = self.base_lr + (self.max_lr - self.base_lr) * trust_avg
-                
-                # Apply cyclical pattern based on rounds trained
-                cycle = np.sin(np.pi * (self.rounds_trained % self.step_size) / self.step_size)
-                cycle_factor = 0.5 * (1 + cycle)
-                
-                # Combine trust adjustment with cycle
-                current_lr = self.base_lr + (trust_adjusted_lr - self.base_lr) * cycle_factor
-                
-                logger.info(f"[C{self.client_index}] Trust-adjusted LR: {current_lr:.6f} (trust={trust_avg:.3f}, cycle={cycle_factor:.2f})")
-            else:
-                # Default cyclical LR if no trust score history
-                cycle = np.sin(np.pi * (self.rounds_trained % self.step_size) / self.step_size)
-                cycle_factor = 0.5 * (1 + cycle)
-                current_lr = self.base_lr + (self.max_lr - self.base_lr) * cycle_factor
-                logger.info(f"[C{self.client_index}] Cyclical LR: {current_lr:.6f} (cycle={cycle_factor:.2f})")
-        else:
-            # No cyclical LR, use constant rate
-            current_lr = local_lr
-            logger.info(f"[C{self.client_index}] Fixed LR: {current_lr:.6f}")
+            # Get trust score history for smoother adaptation
+            trust_history = self.trust_score_history[-5:] if hasattr(self, 'trust_score_history') and self.trust_score_history else [trust_score]
             
+            # Calculate moving average of trust scores for stability
+            trust_avg = sum(trust_history) / len(trust_history)
+            
+            # Cyclical component: sine wave with period of 2*step_size
+            cycle_position = self.rounds_trained % (2 * self.step_size)
+            cycle_ratio = cycle_position / self.step_size
+            
+            if cycle_position < self.step_size:
+                # Increasing phase
+                cycle_factor = 0.5 * (1 + np.sin(np.pi * (cycle_ratio - 0.5)))
+            else:
+                # Decreasing phase
+                cycle_factor = 0.5 * (1 + np.sin(np.pi * (cycle_ratio + 0.5)))
+            
+            # Adaptive learning rate range based on trust
+            # Higher trust → wider LR range (more exploration)
+            # Lower trust → narrower LR range (more conservative)
+            trust_adjusted_max_lr = self.base_lr + (self.max_lr - self.base_lr) * trust_avg
+            
+            # Apply cycle to the trust-adjusted range
+            current_lr = self.base_lr + (trust_adjusted_max_lr - self.base_lr) * cycle_factor
+            
+            # Add warmup phase for first few rounds
+            if self.rounds_trained <= 3:
+                warmup_factor = min(1.0, self.rounds_trained / 3)
+                current_lr = self.base_lr + (current_lr - self.base_lr) * warmup_factor
+            
+            logger.info(f"[C{self.client_index}] Trust-based Cyclical LR: {current_lr:.6f} (trust={trust_avg:.3f}, cycle={cycle_factor:.2f})")
+        else:
+            # Use fixed learning rate
+            current_lr = local_lr
+        
+        # Add learning rate annealing for later rounds to improve convergence
+        if hasattr(self.args.trainer, 'global_rounds') and self.rounds_trained > 0.7 * self.args.trainer.global_rounds:
+            # Gradual annealing in final 30% of training
+            remaining_portion = (self.args.trainer.global_rounds - self.rounds_trained) / (0.3 * self.args.trainer.global_rounds)
+            current_lr *= max(0.1, remaining_portion)  # Don't go below 10% of base LR
+            logger.info(f"[C{self.client_index}] Applying LR annealing: {current_lr:.6f}")
+        
         # Ensure learning rate is reasonable
         current_lr = max(1e-5, min(current_lr, 0.1))
         
-        # Special case for early rounds to prevent cold start
-        if self.rounds_trained <= 2:
-            current_lr = min(current_lr * 1.5, 0.1)  # Slightly higher LR at the start
-
         self.local_epochs = kwargs.get('local_ep', 5)
         self.optimizer = torch.optim.SGD(
             self.model.parameters(),
@@ -223,7 +234,7 @@ class RCLClient(Client):
             weight_decay=kwargs.get('weight_decay', 1e-5)
         )
         
-        # Reset scheduler for each round of training
+        # Use cosine annealing within each round for better convergence
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, 
             T_max=self.local_epochs
@@ -253,40 +264,32 @@ class RCLClient(Client):
         return self.fedprox_mu * proximal_term / 2
 
     def compute_distillation_loss(self, student_logits, teacher_logits, features=None, teacher_features=None):
-        """
-        Compute distillation loss between teacher and student models.
-        Improved to prevent overfitting to the teacher model.
-        """
-        # Logit-based distillation with temperature scaling
-        temp = self.distillation_temp
-        soft_targets = F.softmax(teacher_logits / temp, dim=1)
-        log_probs = F.log_softmax(student_logits / temp, dim=1)
+        """Compute knowledge distillation loss between student and teacher models"""
+        if not self.enable_distillation:
+            return torch.tensor(0.0).to(self.device)
         
-        # Apply temperature scaling and normalize
-        kd_loss = F.kl_div(log_probs, soft_targets, reduction='batchmean') * (temp * temp)
+        # Compute KL divergence loss for logits
+        T = self.distillation_temp
+        distillation_loss = F.kl_div(
+            F.log_softmax(student_logits / T, dim=1),
+            F.softmax(teacher_logits / T, dim=1),
+            reduction='batchmean'
+        ) * (T * T)
         
-        # Feature distillation (optional)
-        feature_loss = 0.0
+        # Feature-level distillation if features are provided
         if features is not None and teacher_features is not None:
-            # Normalize features
-            student_features = F.normalize(features, p=2, dim=1)
-            teacher_features = F.normalize(teacher_features, p=2, dim=1)
+            # Normalize features for more stable distillation
+            student_norm = F.normalize(features, p=2, dim=1)
+            teacher_norm = F.normalize(teacher_features, p=2, dim=1)
             
-            # Apply L2 loss with a smaller weight for feature distillation
-            feature_loss = F.mse_loss(student_features, teacher_features) * 0.1
+            # Compute cosine similarity loss
+            cosine_loss = 1.0 - F.cosine_similarity(student_norm, teacher_norm, dim=1).mean()
+            
+            # Combine logit and feature distillation
+            combined_loss = distillation_loss * 0.7 + cosine_loss * 0.3
+            return combined_loss
         
-        # Combine losses with a safeguard to prevent overfitting to teacher
-        # Dynamically reduce distillation impact as training progresses
-        distillation_weight_factor = max(0.2, 1.0 - 0.05 * self.rounds_trained)
-        combined_loss = (kd_loss + feature_loss) * distillation_weight_factor
-        
-        # Add a safeguard against excessive distillation
-        if self.rounds_trained > 10 and hasattr(self, 'distillation_loss_avg') and self.distillation_loss_avg > 0:
-            if combined_loss > 2.0 * self.distillation_loss_avg:
-                combined_loss = self.distillation_loss_avg
-                logger.warning(f"[C{self.client_index}] Limiting excessive distillation loss")
-                
-        return combined_loss
+        return distillation_loss
 
     def compute_ewc_loss(self):
         """Compute EWC regularization loss with device consistency"""
@@ -304,58 +307,151 @@ class RCLClient(Client):
         return self.ewc_lambda * loss
 
     def compute_trust_score(self):
-        """Compute trust score based on update magnitude and consistency"""
-        if self.previous_model_state is None:
-            return 0.8  # Initialize with a neutral score instead of 1.0
+        """Compute trust score based on multiple metrics"""
+        trust_score = 0.8  # Default trust score
         
-        current_state = self.model.state_dict()
-        
-        update_norm = 0.0
-        param_count = 0
-        
-        for key in current_state:
-            if 'personalized_head' not in key and key in self.previous_model_state:
-                current_param = current_state[key].to(self.device).float()
-                prev_param = self.previous_model_state[key].to(self.device).float()
-                diff = current_param - prev_param
-                update_norm += torch.norm(diff).item() ** 2
-                param_count += diff.numel()
-        
-        if param_count > 0:
-            update_norm = (update_norm / param_count) ** 0.5
-        
-        # Ensure we have a more dynamic update history
-        self.update_history.append(update_norm)
-        if len(self.update_history) > 5:
-            self.update_history.pop(0)
+        # Only compute trust if we have previous model state and current model
+        if self.previous_model_state is not None and hasattr(self.model, 'state_dict'):
+            # 1. Gradient consistency with previous updates
+            if len(self.gradient_history) > 0:
+                current_state = self.model.state_dict()
+                current_grads = {}
+                
+                # Compute current gradient
+                for key in current_state:
+                    if key in self.previous_model_state:
+                        # Skip personalized layers in gradient consistency check
+                        if 'personalized_head' in key:
+                            continue
+                        current_grads[key] = current_state[key] - self.previous_model_state[key]
+                
+                # Compare with gradient history
+                grad_sim_scores = []
+                for past_grad in self.gradient_history[-3:]:  # Compare with last 3 gradients
+                    sim_score = 0.0
+                    num_layers = 0
+                    
+                    for key in current_grads:
+                        if key in past_grad:
+                            flat_current = current_grads[key].flatten()
+                            flat_past = past_grad[key].flatten()
+                            
+                            # Compute cosine similarity if tensors are not empty
+                            if flat_current.shape[0] > 0 and flat_past.shape[0] > 0:
+                                cos_sim = F.cosine_similarity(flat_current.unsqueeze(0), flat_past.unsqueeze(0))
+                                # Convert from [-1, 1] to [0, 1] range
+                                sim_score += (cos_sim + 1) / 2
+                                num_layers += 1
+                
+                if num_layers > 0:
+                    avg_sim = sim_score / num_layers
+                    grad_sim_scores.append(avg_sim.item())
+                
+                # Update gradient history
+                if len(current_grads) > 0:
+                    # Limit history size
+                    if len(self.gradient_history) >= 5:
+                        self.gradient_history.pop(0)
+                    self.gradient_history.append(current_grads)
+                
+                # Compute final gradient consistency score
+                if len(grad_sim_scores) > 0:
+                    grad_consistency = sum(grad_sim_scores) / len(grad_sim_scores)
+                    # Low consistency should not completely zero out trust,
+                    # so we scale from 0.3 to 1.0
+                    grad_trust = 0.3 + 0.7 * grad_consistency
+                else:
+                    grad_trust = 0.8  # Default if no history
+            else:
+                # First round, initialize gradient history
+                current_state = self.model.state_dict()
+                current_grads = {}
+                
+                for key in current_state:
+                    if key in self.previous_model_state:
+                        current_grads[key] = current_state[key] - self.previous_model_state[key]
+                
+                if len(current_grads) > 0:
+                    self.gradient_history.append(current_grads)
+                
+                grad_trust = 0.8  # Default for first round
             
-        # Add small epsilon to prevent division by zero
-        update_variance = np.var(self.update_history) if len(self.update_history) > 1 else 0.0
+            # 2. Model agreement with global model
+            if hasattr(self, 'local_dataset') and hasattr(self, 'global_model'):
+                # Evaluate on a small subset of local data
+                model_agreement = self.evaluate_model_agreement()
+                
+                # Scale from 0.4 to 1.0 (even low agreement should have some trust)
+                model_trust = 0.4 + 0.6 * model_agreement
+            else:
+                model_trust = 0.8  # Default if can't evaluate
+            
+            # 3. Consider training stability
+            stability_trust = 1.0
+            if hasattr(self, 'ce_loss_avg') and self.ce_loss_avg > 0:
+                # High loss may indicate unstable training
+                stability_trust = min(1.0, 2.0 / (1.0 + self.ce_loss_avg))
+            
+            # Combine trust factors with appropriate weights
+            # Gradient consistency is important but should not dominate
+            trust_score = 0.4 * grad_trust + 0.4 * model_trust + 0.2 * stability_trust
+            
+            # Add slight trust increase for older clients to avoid cold start issues
+            rounds_bonus = min(0.1, 0.01 * self.rounds_trained)
+            trust_score = min(1.0, trust_score + rounds_bonus)
+            
+            # Track trust score history
+            self.trust_score_history.append(trust_score)
+            if len(self.trust_score_history) > 10:
+                self.trust_score_history.pop(0)
+            
+            # Update model's trust score attribute if it exists
+            if hasattr(self.model, 'trust_score'):
+                self.model.trust_score = trust_score
         
-        # Compute trust score components with improved scaling
-        magnitude_score = 1.0 / (1.0 + 10.0 * update_norm)  # Adjust sensitivity
-        consistency_score = 1.0 / (1.0 + 5.0 * update_variance)  # Adjust sensitivity
+        return trust_score
+
+    def evaluate_model_agreement(self):
+        """Evaluate the agreement between local model and global model on local data"""
+        if not hasattr(self, 'local_dataset') or not hasattr(self, 'global_model'):
+            return 0.8  # Default score if components are missing
         
-        # Dynamic weighting based on training progress
-        mag_weight = max(0.5, min(0.8, 0.8 - 0.01 * self.rounds_trained))  # Reduce weight over time
-        cons_weight = 1.0 - mag_weight
+        # Use a subset of local data to evaluate agreement
+        batch_size = min(32, len(self.local_dataset))
+        eval_loader = DataLoader(self.local_dataset, batch_size=batch_size, shuffle=True)
         
-        # Combine scores with dynamic weights
-        trust_score = mag_weight * magnitude_score + cons_weight * consistency_score
+        self.model.eval()
+        self.global_model.eval()
         
-        # Add random noise to break any potential plateaus
-        trust_score += np.random.normal(0, 0.02)  # Small random noise
+        agreement = 0.0
+        total_samples = 0
         
-        # Save current state for next round
-        self.previous_model_state = {k: v.detach().clone().to(self.device) for k, v in current_state.items()}
+        with torch.no_grad():
+            for batch_idx, (data, target) in enumerate(eval_loader):
+                # Only evaluate on a single batch
+                if batch_idx > 0:
+                    break
+                    
+                data, target = data.to(self.device), target.to(self.device)
+                
+                # Get local model predictions
+                local_output = self.model(data)
+                local_preds = torch.argmax(local_output["logit"], dim=1)
+                
+                # Get global model predictions
+                global_output = self.global_model(data)
+                global_preds = torch.argmax(global_output["logit"], dim=1)
+                
+                # Calculate agreement ratio
+                agreement += (local_preds == global_preds).float().sum().item()
+                total_samples += data.size(0)
         
-        # Add to history for tracking
-        self.trust_score_history.append(trust_score)
-        if len(self.trust_score_history) > 10:
-            self.trust_score_history.pop(0)
+        self.model.train()
         
-        # Ensure the trust score is within [0.1, 1.0] to avoid getting stuck
-        return max(0.1, min(1.0, trust_score))
+        if total_samples > 0:
+            return agreement / total_samples
+        else:
+            return 0.8  # Default if no samples
 
     def compute_fisher_information(self):
         """Compute Fisher Information Matrix for EWC regularization"""
@@ -397,39 +493,86 @@ class RCLClient(Client):
         self.model.train()
     
     def compute_multi_level_rcl_loss(self, output, labels):
-        """Compute RCL loss across multiple feature levels"""
-        if not self.multi_level_rcl or not isinstance(output, dict):
-            return 0.0
-                
-        total_loss = 0.0
+        """Compute multi-level relaxed contrastive loss across different layers
         
-        # Get features from different layers
-        layer_features = []
-        for i in range(5):  # Assuming 5 layers (0-4)
-            layer_key = f"layer{i}"
-            if layer_key in output:
-                layer_features.append(output[layer_key])
-                
-        # If no layer features found, return 0
-        if not layer_features:
-            return 0.0
-                
-        # Apply RCL to each layer with weights
-        for i, features in enumerate(layer_features):
-            if i < len(self.layer_weights):
-                weight = self.layer_weights[i]
-                # Reshape features if needed
-                if len(features.shape) > 2:
-                    # Global average pooling for conv features
-                    features = F.adaptive_avg_pool2d(features, 1).view(features.size(0), -1)
-                
-                # Apply L2 normalization
-                features = F.normalize(features, p=2, dim=1)
-                
-                # Compute RCL loss for this layer
-                layer_loss = self.relaxed_contrastive_loss(features, labels)
-                total_loss += weight * layer_loss
-                
+        This enhanced implementation computes contrastive loss at different feature levels
+        and combines them using adaptive weighting based on trust score and training progress.
+        """
+        if not self.multi_level_rcl or not hasattr(output, 'get') or 'multi_level_projections' not in output:
+            # Fallback to single-level contrastive loss
+            features = output.get('feature_normalized', None)
+            if features is None:
+                return torch.tensor(0.0).to(self.device)
+            return self.calculate_contrastive_loss(features, labels)
+        
+        # Get feature representations from different levels
+        multi_level_features = output.get('multi_level_projections', {})
+        final_features = output.get('feature_normalized', None)
+        
+        if not multi_level_features or final_features is None:
+            return torch.tensor(0.0).to(self.device)
+        
+        # Calculate contrastive loss at each level
+        level_losses = {}
+        level_weights = {}
+        
+        # Process intermediate layers
+        for layer_name, features in multi_level_features.items():
+            level_losses[layer_name] = self.calculate_contrastive_loss(features, labels)
+        
+        # Process final layer
+        level_losses['final'] = self.calculate_contrastive_loss(final_features, labels)
+        
+        # Dynamically adjust weights based on training progress
+        # Early in training, focus more on lower layers (broader features)
+        # Later in training, shift focus to higher layers (more specific features)
+        if hasattr(self.args.trainer, 'global_rounds') and self.rounds_trained > 0:
+            progress = min(1.0, self.rounds_trained / self.args.trainer.global_rounds)
+            
+            # Earlier layers get more weight early in training
+            level_weights['layer1'] = max(0.05, 0.3 * (1 - progress))
+            level_weights['layer2'] = max(0.1, 0.3 * (1 - progress/2))
+            level_weights['layer3'] = 0.2 + 0.1 * progress
+            level_weights['final'] = 0.2 + 0.3 * progress
+        else:
+            # Default weights if we can't calculate progress
+            level_weights = {
+                'layer1': 0.2,
+                'layer2': 0.2,
+                'layer3': 0.2,
+                'final': 0.4
+            }
+        
+        # Adjust weights based on trust score if available
+        # High trust clients can focus more on higher layers (personalization)
+        # Low trust clients need to focus more on lower layers (generalization)
+        if hasattr(self, 'trust_score_history') and self.trust_score_history:
+            trust_avg = sum(self.trust_score_history[-3:]) / min(3, len(self.trust_score_history))
+            
+            # Slightly shift weight from final to lower layers for low-trust clients
+            trust_adjustment = max(0.0, 0.2 * (1.0 - trust_avg))
+            
+            if 'final' in level_weights:
+                level_weights['final'] = max(0.2, level_weights['final'] - trust_adjustment)
+            if 'layer1' in level_weights and 'layer1' in level_losses:
+                level_weights['layer1'] = min(0.4, level_weights['layer1'] + trust_adjustment * 0.5)
+            if 'layer2' in level_weights and 'layer2' in level_losses:
+                level_weights['layer2'] = min(0.4, level_weights['layer2'] + trust_adjustment * 0.5)
+        
+        # Compute weighted sum of losses
+        total_loss = 0.0
+        total_weight = 0.0
+        
+        for layer_name, loss in level_losses.items():
+            if layer_name in level_weights:
+                weight = level_weights[layer_name]
+                total_loss += weight * loss
+                total_weight += weight
+        
+        # Normalize by total weight
+        if total_weight > 0:
+            total_loss = total_loss / total_weight
+        
         return total_loss
     
     def detect_and_fix_catastrophic_forgetting(self, loss_value, current_epoch, early_stop_patience=3):

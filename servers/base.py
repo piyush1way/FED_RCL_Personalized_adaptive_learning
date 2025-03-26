@@ -130,6 +130,45 @@ class Server:
         if trust_scores is None:
             trust_scores = {client_id: 1.0 for client_id in client_ids}
         
+        # Apply soft trust-based filtering if enabled
+        if self.enable_trust_filtering and self.soft_filtering:
+            # Apply sigmoid-based soft weighting
+            for client_id in client_ids:
+                if client_id in trust_scores:
+                    # Convert raw trust score to a weight using sigmoid function
+                    # This creates a smoother transition between trusted and untrusted
+                    # Move threshold center to self.trust_threshold (default 0.5)
+                    centered_score = trust_scores[client_id] - self.trust_threshold
+                    # Apply sigmoid with steepness factor (higher = sharper cutoff)
+                    steepness = 8.0
+                    sigmoid_weight = 1.0 / (1.0 + np.exp(-steepness * centered_score))
+                    # Scale sigmoid to ensure minimum weight is 0.1 
+                    # (still consider low-trust clients, but with minimal impact)
+                    trust_scores[client_id] = 0.1 + 0.9 * sigmoid_weight
+                    
+            # Log the applied weights
+            weight_info = [f"{cid}:{trust_scores[cid]:.2f}" for cid in client_ids 
+                          if cid in trust_scores]
+            logger.info(f"Soft trust weights: {', '.join(weight_info)}")
+        # Apply hard trust-based filtering if enabled but soft filtering is disabled
+        elif self.enable_trust_filtering and not self.soft_filtering:
+            # Count trusted clients
+            trusted_clients = [cid for cid in client_ids 
+                             if cid in trust_scores and trust_scores[cid] >= self.trust_threshold]
+            
+            # Use all clients if there are not enough trusted ones
+            if len(trusted_clients) < self.min_trusted_clients:
+                logger.warning(f"Only {len(trusted_clients)} trusted clients, using all clients")
+            else:
+                logger.info(f"Using {len(trusted_clients)}/{len(client_ids)} trusted clients")
+                # Filter to only trusted clients
+                filtered_indices = [i for i, cid in enumerate(client_ids) 
+                                 if cid in trusted_clients]
+                local_weights = [local_weights[i] for i in filtered_indices]
+                client_ids = [client_ids[i] for i in filtered_indices]
+                trust_scores = {cid: trust_scores[cid] for cid in client_ids 
+                               if cid in trust_scores}
+        
         # Calculate trust score sum for normalization
         trust_sum = sum(trust_scores.get(client_id, 1.0) for client_id in client_ids)
         if trust_sum == 0:

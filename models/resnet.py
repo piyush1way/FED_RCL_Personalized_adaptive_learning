@@ -121,6 +121,10 @@ class ResNet(nn.Module):
                     nn.init.normal_(m.weight, mean=0.0, std=0.02)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
+                        
+        # Hybrid head for combining global and personalized knowledge
+        self.hybrid_factor = nn.Parameter(torch.tensor(0.5))  # Learnable hybridization factor
+        self.hybrid_mode = False  # Toggle for hybrid mode
 
     def _create_projection_head(self):
         return nn.Sequential(
@@ -191,11 +195,15 @@ class ResNet(nn.Module):
         global_logit = self.fc(features)
         
         # Personalized logits from normalized features for more stable learning
-        # This helps prevent overfitting and convergence issues
         personalized_logit = self.personalized_head(features_normalized)
         
-        # Use personalized head if enabled, otherwise use global head
-        default_logit = personalized_logit if self.use_personalized_head else global_logit
+        # Hybrid mode combines global and personalized logits using a learnable factor
+        if self.hybrid_mode:
+            hybrid_factor = torch.sigmoid(self.hybrid_factor)  # Convert to [0,1] range
+            default_logit = hybrid_factor * personalized_logit + (1 - hybrid_factor) * global_logit
+        else:
+            # Use personalized head if enabled, otherwise use global head
+            default_logit = personalized_logit if self.use_personalized_head else global_logit
         
         results.update({
             "feature": features,
@@ -305,6 +313,16 @@ class ResNet(nn.Module):
     def update_trust_score(self, new_score):
         self.trust_score = new_score
         logger.debug(f"Updated trust score to {self.trust_score}")
+
+    def enable_hybrid_mode(self):
+        """Enable hybrid mode that combines global and personalized heads"""
+        self.hybrid_mode = True
+        logger.info("Enabled hybrid personalized head mode")
+        
+    def disable_hybrid_mode(self):
+        """Disable hybrid mode"""
+        self.hybrid_mode = False
+        logger.info("Disabled hybrid personalized head mode")
 
 @ENCODER_REGISTRY.register()
 class ResNet18(ResNet):

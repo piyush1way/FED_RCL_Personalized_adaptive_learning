@@ -164,6 +164,12 @@ class RCLClient(Client):
                 
             if hasattr(model_module, 'enable_personalized_mode'):
                 model_module.enable_personalized_mode()
+                
+                # Enable hybrid mode if configured
+                hybrid_mode_enabled = self._get_config('personalization.hybrid_mode', False)
+                if hybrid_mode_enabled and hasattr(model_module, 'enable_hybrid_mode'):
+                    model_module.enable_hybrid_mode()
+                    logger.info(f"Client {self.client_index}: Enabled hybrid mode for personalized head")
             elif hasattr(model_module, 'use_personalized_head'):
                 model_module.use_personalized_head = True
                 
@@ -618,373 +624,103 @@ class RCLClient(Client):
         return True
 
     def local_train(self, global_epoch):
-        """Perform local training for a client with additional measurement of client metrics"""
+        """Main training loop for the client"""
         self.global_epoch = global_epoch
-        self.rounds_trained = getattr(self, 'rounds_trained', 0) + 1
         
-        # Save previous model state before training
-        self.previous_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
-        
-        # Initialize metrics trackers
-        ce_losses = AverageMeter('CE Loss', ':.4f')
-        rcl_losses = AverageMeter('RCL Loss', ':.4f')
-        accs = AverageMeter('Acc', ':.4f')
-        
-        # Check model for NaN parameters and reset if necessary
-        has_nan = False
-        for name, param in self.model.named_parameters():
-            if torch.isnan(param).any():
-                has_nan = True
-                logger.warning(f"Client {self.client_id}: Found NaN in model parameters before training")
-                break
-                
-        if has_nan and self.previous_model_state is not None:
-            logger.warning(f"Client {self.client_id}: Resetting NaN parameters using previous state")
-            self.model.load_state_dict(self.previous_model_state)
-        
-        # Set up optimizer with trust-based learning rate if enabled
-        if hasattr(self, 'enable_adaptive_lr') and self.enable_adaptive_lr and hasattr(self, 'trust_score'):
-            # Calculate base lr using cyclical or adaptive approach
-            if self.local_lr_type == 'cyclic':
-                trust_weight = getattr(self, 'trust_score', 0.7)
-                base_lr = setup_adaptive_learning_rate(
-                    0.001, 0.01,  # Min and max LR
-                    global_epoch, self.max_epochs,
-                    trust_weight=trust_weight,
-                    client_id=self.client_id
-                )
-                logger.info(f"[C{self.client_id}] Trust-based Cyclical LR: {base_lr:.6f} (trust={trust_weight:.3f}, cycle={global_epoch/self.max_epochs:.2f})")
-            else:
-                # Standard adaptive LR based on trust
-                base_lr = self.local_lr * min(1.0, 0.5 + getattr(self, 'trust_score', 0.5))
+        # Update trust score and setup adaptive learning rate
+        if hasattr(self, 'trust_score'):
+            trust_score = getattr(self, 'trust_score', 1.0)
+            local_lr = self.get_adaptive_learning_rate(global_epoch, trust_score)
+            logger.info(f"Client {self.client_index} - Trust: {trust_score:.2f}, LR: {local_lr:.6f}")
         else:
-            base_lr = self.local_lr
+            local_lr = self.get_adaptive_learning_rate(global_epoch)
             
-        # Create optimizer with the determined learning rate
-        optimizer = torch.optim.SGD(
+        # Setup optimizer with updated learning rate
+        self.optimizer = self.setup_optimizer()
+        
+        # Rest of local_train method...
+
+    def setup_cyclical_lr(self, epoch):
+        """Set up cyclical learning rate that varies between base_lr and max_lr"""
+        if not self.enable_cyclical_lr:
+            return self.local_lr
+            
+        cycle = np.floor(1 + epoch / (2 * self.step_size))
+        x = np.abs(epoch / self.step_size - 2 * cycle + 1)
+        lr = self.base_lr + (self.max_lr - self.base_lr) * np.maximum(0, (1 - x))
+        
+        # Add warmup for the first 5 epochs
+        if epoch < 5:
+            warmup_factor = min(1.0, epoch / 5.0)
+            lr = self.base_lr + warmup_factor * (lr - self.base_lr)
+            
+        return lr
+
+    def setup_trust_lr(self, trust_score):
+        """Set up learning rate based on trust score"""
+        if not self.enable_trust_lr:
+            return self.local_lr
+            
+        # Map trust score (0-1) to learning rate range
+        # Higher trust → higher learning rate (can learn faster)
+        # Lower trust → lower learning rate (more conservative updates)
+        scaled_trust = min(max(trust_score, 0.1), 1.0)  # Clamp to [0.1, 1.0]
+        
+        # Apply sigmoid scaling to make transitions smoother
+        sigmoid_trust = 1.0 / (1.0 + np.exp(-10 * (scaled_trust - 0.5)))
+        
+        # Map to learning rate range: trust 0.1→0.2*base_lr, trust 1.0→max_lr
+        lr = self.base_lr + sigmoid_trust * (self.max_lr - self.base_lr)
+        
+        return lr
+        
+    def get_adaptive_learning_rate(self, epoch, trust_score=None):
+        """Combines cyclical LR and trust-based LR for optimal learning rate selection"""
+        if not self.enable_adaptive_lr:
+            return self.local_lr
+            
+        # Get cyclical learning rate
+        cyclical_lr = self.setup_cyclical_lr(epoch)
+        
+        # Get trust-based learning rate if trust score is available
+        if trust_score is not None and self.enable_trust_lr:
+            trust_lr = self.setup_trust_lr(trust_score)
+            
+            # Combine using harmonic mean for smoother transitions
+            # This gives more weight to the smaller of the two rates
+            # to prevent overfitting in low-trust situations
+            combined_lr = 2 * cyclical_lr * trust_lr / (cyclical_lr + trust_lr + 1e-8)
+            
+            # Ensure we don't go below a minimum threshold
+            combined_lr = max(combined_lr, 0.1 * self.base_lr)
+            
+            return combined_lr
+        else:
+            return cyclical_lr
+            
+    def setup_optimizer(self):
+        """Set up the optimizer with the appropriate learning rate"""
+        if hasattr(self, 'optimizer') and self.optimizer is not None:
+            del self.optimizer
+            
+        # Use the current trust score for setting the learning rate
+        trust_score = getattr(self, 'trust_score', 1.0)
+        local_lr = self.get_adaptive_learning_rate(self.global_epoch, trust_score)
+        
+        # Log the learning rate
+        if hasattr(self, 'client_index'):
+            logger.info(f"Client {self.client_index} - Learning Rate: {local_lr:.6f}")
+        
+        # Set up the optimizer with the new learning rate
+        self.optimizer = torch.optim.SGD(
             self.model.parameters(),
-            lr=base_lr,
+            lr=local_lr,
             momentum=self.momentum,
             weight_decay=self.weight_decay
         )
         
-        # Training loop
-        self.model.train()
-        epoch_metrics = {}
-        
-        for epoch in range(1, self.local_epochs + 1):
-            # Set up learning rate for this epoch
-            if self.local_lr_type == 'cyclic':
-                # Adjust LR within epoch using cycle
-                epoch_fraction = (global_epoch + epoch / self.local_epochs) / self.max_epochs
-                trust_score = getattr(self, 'trust_score', 0.7)
-                current_lr = setup_adaptive_learning_rate(
-                    0.001, 0.01,  # Min and max LR
-                    epoch_fraction * self.max_epochs, 
-                    self.max_epochs,
-                    trust_weight=trust_score,
-                    client_id=self.client_id
-                )
-                # Update optimizer learning rate
-                for g in optimizer.param_groups:
-                    g['lr'] = current_lr
-                if epoch == 1:
-                    logger.info(f"[C{self.client_id}] Trust-based Cyclical LR: {current_lr:.6f} (trust={trust_score:.3f}, cycle={epoch_fraction:.2f})")
-            
-            # Train for one epoch
-            batch_metrics = self._train_epoch(optimizer, epoch)
-            
-            # Update metrics
-            ce_losses.update(batch_metrics.get('ce_loss', 0))
-            rcl_losses.update(batch_metrics.get('rcl_loss', 0))
-            accs.update(batch_metrics.get('acc', 0))
-            
-            # Log every few epochs or at the end
-            if epoch == self.local_epochs or epoch % 5 == 0:
-                logger.debug(f"Client {self.client_id}, Epoch {epoch}/{self.local_epochs}, "
-                          f"CE Loss: {ce_losses.avg:.4f}, RCL Loss: {rcl_losses.avg:.4f}, "
-                          f"Acc: {accs.avg:.4f}")
-        
-        # Calculate gradient norm for monitoring
-        grad_norm = 0.0
-        for param in self.model.parameters():
-            if param.grad is not None:
-                grad_norm += param.grad.norm(2).item() ** 2
-        grad_norm = grad_norm ** 0.5
-        
-        # Save average metrics
-        epoch_metrics.update({
-            'ce_loss': ce_losses.avg,
-            'rcl_loss': rcl_losses.avg,
-            'acc': accs.avg,
-            'grad_norm': grad_norm,
-        })
-        
-        # Store loss average for stability evaluation
-        self.ce_loss_avg = ce_losses.avg
-        
-        # Update trust score based on training performance
-        trust_score = self.update_trust_score(epoch_metrics)
-        epoch_metrics['trust_score'] = trust_score
-        
-        # Return updated model and metrics
-        return self.model.state_dict(), epoch_metrics
+        return self.optimizer
 
-    def _train_epoch(self, optimizer, epoch):
-        """Train for one epoch
-        
-        Args:
-            optimizer: optimizer to use for training
-            epoch: current epoch number
-            
-        Returns:
-            dict: metrics for the epoch
-        """
-        batch_time = AverageMeter('Time', ':6.3f')
-        data_time = AverageMeter('Data', ':6.3f')
-        losses = AverageMeter('Loss', ':.4f')
-        ce_losses = AverageMeter('CE Loss', ':.4f')
-        rcl_losses = AverageMeter('RCL Loss', ':.4f')
-        distill_losses = AverageMeter('Distill Loss', ':.4f')
-        proximal_losses = AverageMeter('Proximal Loss', ':.4f')
-        top1 = AverageMeter('Acc@1', ':6.2f')
-        
-        # Training mode
-        self.model.train()
-        
-        # Initialize metrics
-        end = time.time()
-        metrics = {}
-        
-        # Ensure trainloader exists
-        if not hasattr(self, 'trainloader') or self.trainloader is None:
-            logger.warning(f"Client {self.client_id}: No trainloader available for training")
-            return {
-                'loss': 0.0,
-                'ce_loss': 0.0,
-                'rcl_loss': 0.0,
-                'acc': 0.0
-            }
-        
-        # Training loop
-        for batch_idx, (images, labels) in enumerate(self.trainloader):
-            # Measure data loading time
-            data_time.update(time.time() - end)
-            
-            # Move to device
-            images, labels = images.to(self.device), labels.to(self.device)
-            
-            # Zero gradients
-            optimizer.zero_grad()
-            
-            # Forward pass with amp support
-            if self.use_amp:
-                with autocast():
-                    outputs = self.model(images)
-                    
-                    # Extract logits from outputs
-                    if isinstance(outputs, dict):
-                        logits = outputs.get('logit', outputs.get('global_logit', None))
-                        if logits is None:
-                            for key in ['output', 'pred', 'prediction', 'logits']:
-                                if key in outputs:
-                                    logits = outputs[key]
-                                    break
-                    else:
-                        logits = outputs
-                    
-                    # Classification loss
-                    ce_loss = self.criterion(logits, labels)
-                    
-                    # Relaxed contrastive loss if enabled
-                    if self.enable_contrastive and 'feature_normalized' in outputs:
-                        rcl_loss = self.compute_multi_level_rcl_loss(outputs, labels)
-                    else:
-                        rcl_loss = torch.tensor(0.0).to(self.device)
-                    
-                    # Distillation loss if enabled
-                    if self.enable_distillation and hasattr(self, 'global_model'):
-                        with torch.no_grad():
-                            global_outputs = self.global_model(images)
-                            
-                        if isinstance(global_outputs, dict):
-                            global_logits = global_outputs.get('logit', global_outputs.get('global_logit', None))
-                        else:
-                            global_logits = global_outputs
-                            
-                        # Ensure global logits exist
-                        if global_logits is not None:
-                            distill_loss = self.compute_distillation_loss(logits, global_logits)
-                        else:
-                            distill_loss = torch.tensor(0.0).to(self.device)
-                    else:
-                        distill_loss = torch.tensor(0.0).to(self.device)
-                    
-                    # FedProx loss for regularization
-                    proximal_loss = self.compute_fedprox_term() if self.enable_fedprox else torch.tensor(0.0).to(self.device)
-                    
-                    # EWC loss for continual learning
-                    ewc_loss = self.compute_ewc_loss() if self.ewc_enabled else torch.tensor(0.0).to(self.device)
-                    
-                    # Combine losses with appropriate weights
-                    rcl_weight = 1.0 if self.enable_contrastive else 0.0
-                    distill_weight = self.distillation_weight if self.enable_distillation else 0.0
-                    
-                    # Total loss
-                    loss = ce_loss + rcl_weight * rcl_loss + distill_weight * distill_loss + proximal_loss + ewc_loss
-            else:
-                # Standard forward pass without amp
-                outputs = self.model(images)
-                
-                # Extract logits from outputs
-                if isinstance(outputs, dict):
-                    logits = outputs.get('logit', outputs.get('global_logit', None))
-                    if logits is None:
-                        for key in ['output', 'pred', 'prediction', 'logits']:
-                            if key in outputs:
-                                logits = outputs[key]
-                                break
-                else:
-                    logits = outputs
-                
-                # Classification loss
-                ce_loss = self.criterion(logits, labels)
-                
-                # Relaxed contrastive loss if enabled
-                if self.enable_contrastive and 'feature_normalized' in outputs:
-                    rcl_loss = self.compute_multi_level_rcl_loss(outputs, labels)
-                else:
-                    rcl_loss = torch.tensor(0.0).to(self.device)
-                
-                # Distillation loss if enabled
-                if self.enable_distillation and hasattr(self, 'global_model'):
-                    with torch.no_grad():
-                        global_outputs = self.global_model(images)
-                        
-                    if isinstance(global_outputs, dict):
-                        global_logits = global_outputs.get('logit', global_outputs.get('global_logit', None))
-                    else:
-                        global_logits = global_outputs
-                        
-                    # Ensure global logits exist
-                    if global_logits is not None:
-                        distill_loss = self.compute_distillation_loss(logits, global_logits)
-                    else:
-                        distill_loss = torch.tensor(0.0).to(self.device)
-                else:
-                    distill_loss = torch.tensor(0.0).to(self.device)
-                
-                # FedProx loss for regularization
-                proximal_loss = self.compute_fedprox_term() if self.enable_fedprox else torch.tensor(0.0).to(self.device)
-                
-                # EWC loss for continual learning
-                ewc_loss = self.compute_ewc_loss() if self.ewc_enabled else torch.tensor(0.0).to(self.device)
-                
-                # Combine losses with appropriate weights
-                rcl_weight = 1.0 if self.enable_contrastive else 0.0
-                distill_weight = self.distillation_weight if self.enable_distillation else 0.0
-                
-                # Total loss
-                loss = ce_loss + rcl_weight * rcl_loss + distill_weight * distill_loss + proximal_loss + ewc_loss
-            
-            # Check for NaN loss
-            if torch.isnan(loss):
-                logger.warning(f"Client {self.client_id}: NaN loss detected, skipping batch")
-                continue
-                
-            # Also check if loss is too high (could indicate numerical instability)
-            if loss.item() > 1000:
-                logger.warning(f"Client {self.client_id}: Extremely high loss detected ({loss.item():.1f}), skipping batch")
-                continue
-            
-            # Backward pass and optimize with amp support
-            if self.use_amp:
-                scaler = GradScaler()
-                scaler.scale(loss).backward()
-                
-                # Apply gradient clipping before optimizer step
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-                
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                
-                # Apply gradient clipping before optimizer step
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-                
-                optimizer.step()
-            
-            # Optional learning rate scheduler step - MOVED AFTER optimizer.step()
-            if hasattr(self, 'scheduler'):
-                self.scheduler.step()
-            
-            # Calculate accuracy
-            _, predicted = logits.max(1)
-            correct = predicted.eq(labels).sum().item()
-            acc = 100. * correct / labels.size(0)
-            
-            # Update metrics
-            losses.update(loss.item(), images.size(0))
-            ce_losses.update(ce_loss.item(), images.size(0))
-            rcl_losses.update(rcl_loss.item() if not torch.isnan(rcl_loss) else 0.0, images.size(0))
-            distill_losses.update(distill_loss.item(), images.size(0))
-            proximal_losses.update(proximal_loss.item(), images.size(0))
-            top1.update(acc, images.size(0))
-            
-            # Measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
-            
-            # Apply EMA to loss history for stability tracking
-            self.ce_loss_avg = ce_loss.item() if not hasattr(self, 'ce_loss_avg') else 0.9 * self.ce_loss_avg + 0.1 * ce_loss.item()
-            self.rcl_loss_avg = rcl_loss.item() if not hasattr(self, 'rcl_loss_avg') else 0.9 * self.rcl_loss_avg + 0.1 * rcl_loss.item()
-        
-        # Return metrics dictionary
-        metrics = {
-            'loss': losses.avg,
-            'ce_loss': ce_losses.avg,
-            'rcl_loss': rcl_losses.avg,
-            'distill_loss': distill_losses.avg,
-            'proximal_loss': proximal_losses.avg,
-            'acc': top1.avg / 100.0,  # Convert back to [0,1] range
-        }
-        
-        return metrics
-
-    def update_trust_score(self, metrics):
-        """Update trust score based on training metrics"""
-        if hasattr(self, 'enable_trust_filtering') and self.enable_trust_filtering:
-            # Get trust score based on training metrics
-            trust_score = self.compute_trust_score(self.model, metrics)
-            
-            # Stabilize trust score with exponential moving average
-            if not hasattr(self, 'trust_score') or self.trust_score is None:
-                self.trust_score = trust_score
-            else:
-                # Smooth trust score changes
-                momentum = 0.7  # Higher value = slower changes
-                self.trust_score = momentum * self.trust_score + (1 - momentum) * trust_score
-            
-            # Ensure trust score is within valid range
-            self.trust_score = min(max(self.trust_score, 0.1), 1.0)
-            
-            # Update model attribute if available
-            if hasattr(self.model, 'trust_score'):
-                self.model.trust_score = self.trust_score
-            
-            # Track history
-            if not hasattr(self, 'trust_score_history'):
-                self.trust_score_history = []
-            self.trust_score_history.append(self.trust_score)
-            if len(self.trust_score_history) > 10:
-                self.trust_score_history.pop(0)
-                
-            return self.trust_score
-        else:
-            # Default trust score if filtering not enabled
-            return 0.8
-            
     def _compute_model_similarity(self):
         """Compute similarity between client model and global model"""
         if not hasattr(self, 'global_model') or self.global_model is None:
@@ -1083,104 +819,20 @@ class RCLClient(Client):
                 # Return empty tensor as last resort
                 return torch.zeros((images.size(0), 128), device=self.device)
 
-    def setup_cyclical_lr(self, epoch):
-        """Setup cyclical learning rate for the current epoch"""
-        if not hasattr(self, 'optimizer'):
-            logger.warning(f"Client {self.client_index}: Cannot setup cyclical LR without optimizer")
-            return
-            
+    def _get_config(self, path, default=None):
+        """Safely get a configuration value from args using a dot-separated path"""
+        parts = path.split('.')
+        value = self.args
         try:
-            # Get trust score history for smoother adaptation
-            trust_history = self.trust_score_history[-5:] if hasattr(self, 'trust_score_history') and self.trust_score_history else [0.8]
-            
-            # Calculate moving average of trust scores for stability
-            trust_avg = float(sum(trust_history)) / float(len(trust_history))
-            
-            # Cyclical component: sine wave with period of 2*step_size
-            cycle_position = self.rounds_trained % (2 * self.step_size)
-            cycle_ratio = cycle_position / self.step_size
-            
-            if cycle_position < self.step_size:
-                # Increasing phase
-                cycle_factor = 0.5 * (1 + np.sin(np.pi * (cycle_ratio - 0.5)))
-            else:
-                # Decreasing phase
-                cycle_factor = 0.5 * (1 + np.sin(np.pi * (cycle_ratio + 0.5)))
-            
-            # Adaptive learning rate range based on trust
-            # Higher trust → wider LR range (more exploration)
-            # Lower trust → narrower LR range (more conservative)
-            trust_adjusted_max_lr = self.base_lr + (self.max_lr - self.base_lr) * trust_avg
-            
-            # Apply cycle to the trust-adjusted range
-            current_lr = self.base_lr + (trust_adjusted_max_lr - self.base_lr) * cycle_factor
-            
-            # Add warmup phase for first few rounds
-            if self.rounds_trained <= 3:
-                warmup_factor = min(1.0, self.rounds_trained / 3)
-                current_lr = self.base_lr + (current_lr - self.base_lr) * warmup_factor
-            
-            # Set learning rate in optimizer
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = current_lr
-                
-            logger.info(f"[C{self.client_index}] Trust-based Cyclical LR: {current_lr:.6f} (trust={trust_avg:.3f}, cycle={cycle_factor:.2f})")
+            for part in parts:
+                if hasattr(value, part):
+                    value = getattr(value, part)
+                elif isinstance(value, dict) and part in value:
+                    value = value[part]
+                else:
+                    return default
+            return value
         except Exception as e:
-            logger.error(f"Error setting up cyclical LR: {str(e)}")
-            # Fallback to base learning rate
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = self.base_lr
-            
-    def setup_trust_lr(self, trust_score):
-        """Setup trust-based learning rate"""
-        if not hasattr(self, 'optimizer'):
-            logger.warning(f"Client {self.client_index}: Cannot setup trust LR without optimizer")
-            return
-            
-        try:
-            # Scale learning rate based on trust score
-            # Higher trust means higher learning rate (more aggressive updates)
-            # Lower trust means lower learning rate (more conservative updates)
-            trust_factor = max(0.5, min(1.5, trust_score * 2))
-            current_lr = self.base_lr * trust_factor
-            
-            # Set learning rate in optimizer
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = current_lr
-                
-            logger.info(f"[C{self.client_index}] Trust-based LR: {current_lr:.6f} (trust={trust_score:.3f})")
-        except Exception as e:
-            logger.error(f"Error setting up trust LR: {str(e)}")
-            # Fallback to base learning rate
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = self.base_lr
-
-    def setup_optimizer(self):
-        """Initialize the optimizer if it doesn't exist"""
-        if hasattr(self, 'model') and self.model is not None:
-            # Default optimizer parameters
-            lr = getattr(self, 'base_lr', 0.01)
-            weight_decay = 1e-5
-            momentum = 0.9
-            
-            try:
-                self.optimizer = torch.optim.SGD(
-                    self.model.parameters(),
-                    lr=lr,
-                    momentum=momentum,
-                    weight_decay=weight_decay
-                )
-                logger.info(f"Client {self.client_index}: Initialized optimizer with lr={lr}")
-            except Exception as e:
-                logger.error(f"Error initializing optimizer: {str(e)}")
-                # Try simpler optimizer as fallback
-                try:
-                    self.optimizer = torch.optim.SGD(
-                        self.model.parameters(),
-                        lr=lr
-                    )
-                except Exception as nested_e:
-                    logger.error(f"Failed to initialize fallback optimizer: {str(nested_e)}")
-        else:
-            logger.error(f"Client {self.client_index}: Cannot setup optimizer without model")
+            logger.warning(f"Error accessing config at {path}: {e}")
+            return default
 

@@ -1,0 +1,108 @@
+# fedrcl_personalized.yaml - Novel FedRCL configuration with personalization
+#################### Default Setup ####################
+wandb: True
+seed: 42  # Fixed seed for reproducibility
+enable_benchmark: True
+use_amp: True  # Use automatic mixed precision for faster training
+main_gpu: '0'
+num_workers: 4
+pin_memory: True
+refactoring: True
+verbose: False
+remark: "novel_personalized"
+
+checkpoint_path: './checkpoints'
+exp_name: "FedRCL-Personalized-Novel"
+output_model_path: 'fedrcl_personalized_model.pt'
+save_freq: 10
+batch_size: 32
+save_test: True
+
+## Resume options
+load_model_path: False
+wandb_resume_id: False
+
+###### wandb && logging ######
+project: "FedRCL-Personalized-Novel"
+log_dir: './checkpoints'
+
+#################### Data Split ####################
+split:
+  mode: 'dirichlet'  # Options: 'iid', 'dirichlet', 'skew'
+  alpha: 0.3  # Lower alpha = more non-IID
+  class_per_client: 0  # Only for skew mode
+  unbalanced: False
+  overlap_ratio: 0.0
+  create_client_dataset: False
+  share_balanced_subset: true  # Share balanced data across clients
+  samples_per_class: 20
+  samples_per_client: 10
+
+#################### Optimizer ####################
+optimizer:
+  name: sgd
+  momentum: 0.9
+  wd: 1e-4
+
+#################### Eval ####################
+eval:
+  freq: 5  # Evaluate every 5 rounds
+  batch_size: 32
+  max_samples: 1000
+
+#################### Trust-Based Client Filtering ####################
+trust_filtering:
+  enable: true
+  threshold: 0.5
+  min_trusted_clients: 2
+  soft_filtering: true  # NOVEL: Use soft weighting instead of hard filtering
+
+#################### Personalization Settings ####################
+personalization:
+  enable: true
+  layers: 2  # Two-layer personalized head
+  knowledge_distillation: true
+  kd_temperature: 2.0
+  hybrid_mode: true  # NOVEL: Enable hybrid personalized head mode
+
+#################### Adaptive Learning Rate ####################
+adaptive_lr:
+  enable: true
+  base_lr: 0.01
+  max_lr: 0.05
+  trust_lr: true  # NOVEL: Enable trust-based adaptive learning rate
+  cyclical_lr: true  # NOVEL: Enable cyclical learning rate
+
+#################### Multi-Level Contrastive Learning ####################
+contrastive:
+  multi_level: true
+  layer_weights: [0.2, 0.3, 0.5]
+
+#################### Memory Management ####################
+memory:
+  max_split_size_mb: 256
+  empty_cache_freq: 1
+  gc_freq: 1
+
+#################### Training Settings ####################
+trainer:
+  global_rounds: 200
+  local_epochs: 2
+  min_clients_per_round: 5
+  participation_rate: 0.1  # Fraction of clients to select per round
+  num_clients: 100
+  eval_every: 5
+  local_lr: 0.01
+
+#################### Analysis Settings ####################
+analysis: True  # Enable analysis to track personalization benefits
+
+#################### Default Configurations ####################
+defaults:
+  - _self_
+  - trainer: personalized
+  - client: fedrcl
+  - evaler: base
+  - dataset: cifar10
+  - server: personalized
+  - model: personalized_resnet18 

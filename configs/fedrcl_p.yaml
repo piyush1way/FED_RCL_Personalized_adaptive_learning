@@ -1,5 +1,5 @@
 # fedrcl_p.yaml - Optimized for Kaggle GPU
-#################### Default Setup ####################
+#################### Default Setup ###################
 wandb: False
 seed: 42  # Fixed seed for reproducibility
 enable_benchmark: True

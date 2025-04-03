@@ -447,11 +447,13 @@ class PersonalizedTrainer(BaseTrainer):
                     local_dataset=self.trainloaders[client_idx].dataset,
                     global_epoch=self.current_round,
                     local_lr=self.local_lr,
-                    local_ep=self.local_epochs,
-                    local_bs=self.batch_size,
                     trainer=self,
-                    num_workers=self.args.num_workers,
-                    pin_memory=self.args.pin_memory
+                    **{
+                        'local_ep': self.local_epochs,
+                        'local_bs': self.batch_size,
+                        'num_workers': self.args.num_workers,
+                        'pin_memory': self.args.pin_memory
+                    }
                 )
             except Exception as e:
                 logger.error(f"Error setting up client {client_idx}: {str(e)}")
@@ -466,7 +468,19 @@ class PersonalizedTrainer(BaseTrainer):
             # Train the client
             try:
                 start_time = time.time()
-                updated_model, client_metrics = self.clients[client_idx].local_train(self.current_round)
+                train_result = self.clients[client_idx].local_train(self.current_round)
+                
+                # Handle case where local_train returns None
+                if train_result is None:
+                    logger.error(f"Client {client_idx} local_train returned None")
+                    continue
+                    
+                # Unpack results, handle potential format issues
+                if isinstance(train_result, tuple) and len(train_result) == 2:
+                    updated_model, client_metrics = train_result
+                else:
+                    logger.error(f"Client {client_idx} local_train returned invalid format: {train_result}")
+                    continue
                 
                 training_time = time.time() - start_time
                 if client_metrics is not None:
@@ -491,6 +505,8 @@ class PersonalizedTrainer(BaseTrainer):
         # Check if any models were updated
         if not updated_models:
             logger.warning("No updated models received from clients")
+        else:
+            logger.info(f"Successfully trained {len(updated_models)} clients")
             
         return updated_models, client_stats
 
